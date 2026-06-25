@@ -1,58 +1,72 @@
 import aiosqlite
 
-DB_NAME = "tracker.db"
+from config import DATABASE_NAME
 
 
-async def create_database():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+class Database:
+
+    async def connect(self):
+        self.db = await aiosqlite.connect(DATABASE_NAME)
+
+        await self.db.execute("""
         CREATE TABLE IF NOT EXISTS products(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             url TEXT NOT NULL UNIQUE,
             website TEXT NOT NULL,
-            status TEXT DEFAULT 'unknown'
+            stock INTEGER DEFAULT 0
         )
         """)
 
-        await db.commit()
+        await self.db.commit()
 
 
-async def add_product(name, url, website):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO products(name,url,website) VALUES(?,?,?)",
+    async def add_product(self, name, url, website):
+        await self.db.execute(
+            """
+            INSERT INTO products(name,url,website)
+            VALUES(?,?,?)
+            """,
             (name, url, website)
         )
-        await db.commit()
+
+        await self.db.commit()
 
 
-async def get_products():
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "SELECT id,name,url,website,status FROM products"
+    async def get_products(self):
+
+        cursor = await self.db.execute(
+            """
+            SELECT id,name,url,website,stock
+            FROM products
+            """
         )
 
-        rows = await cursor.fetchall()
-
-        return rows
+        return await cursor.fetchall()
 
 
-async def remove_product(product_id):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "DELETE FROM products WHERE id=?",
+    async def delete_product(self, product_id):
+
+        await self.db.execute(
+            """
+            DELETE FROM products
+            WHERE id=?
+            """,
             (product_id,)
         )
 
-        await db.commit()
+        await self.db.commit()
 
 
-async def update_status(product_id, status):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE products SET status=? WHERE id=?",
-            (status, product_id)
+    async def update_stock(self, product_id, stock):
+
+        await self.db.execute(
+            """
+            UPDATE products
+            SET stock=?
+            WHERE id=?
+            """,
+            (stock, product_id)
         )
 
-        await db.commit()
+        await self.db.commit()
