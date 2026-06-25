@@ -1,139 +1,71 @@
-from aiogram import Router
+from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
-
-from config import OWNER_ID
-from database import Database
-from states import AddProductState, RemoveProductState
+from states import AddProduct
+from database import add_product, get_user_products, remove_product
+from stock_checker import detect_platform
 
 router = Router()
-db = Database()
-
-
-def detect_website(url: str):
-    url = url.lower()
-
-    if "amazon" in url:
-        return "Amazon"
-
-    if "flipkart" in url:
-        return "Flipkart"
-
-    if "zepto" in url:
-        return "Zepto"
-
-    if "bigbasket" in url:
-        return "BigBasket"
-
-    return "Unknown"
-
 
 @router.message(Command("start"))
-async def start(message: Message):
-
-    if message.from_user.id != OWNER_ID:
-        return
-
-    await message.answer(
-        "✅ Tracker Alert Bot Started\n\n"
-        "/add\n"
-        "/list\n"
-        "/remove"
+async def cmd_start(message: types.Message):
+    welcome_text = (
+        "Welcome to Stock Alert Bot! 🛒\n\n"
+        "**Available Commands:**\n"
+        "/add - Add a new product to track\n"
+        "/list - View your tracked products\n"
+        "/remove <id> - Remove a product from tracking"
     )
-
+    await message.answer(welcome_text)
 
 @router.message(Command("add"))
-async def add_product(message: Message, state: FSMContext):
+async def cmd_add(message: types.Message, state: FSMContext):
+    await message.answer("What is the name of the product you want to track?")
+    await state.set_state(AddProduct.waiting_for_name)
 
-    if message.from_user.id != OWNER_ID:
+@router.message(AddProduct.waiting_for_name)
+async def process_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Great! Now send me the product link (Supports Amazon, Flipkart, Zepto, or BigBasket).")
+    await state.set_state(AddProduct.waiting_for_link)
+
+@router.message(AddProduct.waiting_for_link)
+async def process_link(message: types.Message, state: FSMContext):
+    url = message.text
+    platform = detect_platform(url)
+    
+    if platform == 'unknown':
+        await message.answer("❌ Unsupported link! Please provide a link from Amazon, Flipkart, Zepto, or BigBasket.")
         return
 
-    await state.set_state(AddProductState.waiting_for_name)
-
-    await message.answer("📦 Product Name?")
-
-
-@router.message(AddProductState.waiting_for_name)
-async def product_name(message: Message, state: FSMContext):
-
-    await state.update_data(name=message.text)
-
-    await state.set_state(AddProductState.waiting_for_link)
-
-    await message.answer("🔗 Product Link?")
-
-
-@router.message(AddProductState.waiting_for_link)
-async def product_link(message: Message, state: FSMContext):
-
-    data = await state.get_data()
-
-    name = data["name"]
-    url = message.text
-
-    website = detect_website(url)
-
-    try:
-        await db.add_product(name, url, website)
-
-        await message.answer(
-            f"✅ Product Added\n\n"
-            f"📦 {name}\n"
-            f"🌐 {website}"
-        )
-
-    except Exception:
-        await message.answer("❌ Product already exists.")
-
+    user_data = await state.get_data()
+    name = user_data['name']
+    
+    add_product(message.from_user.id, name, url, platform)
+    await message.answer(f"✅ Product **{name}** added successfully! I will notify you when it's in stock on {platform.title()}.")
     await state.clear()
-
 
 @router.message(Command("list"))
-async def list_products(message: Message):
-
-    if message.from_user.id != OWNER_ID:
-        return
-
-    products = await db.get_products()
-
+async def cmd_list(message: types.Message):
+    products = get_user_products(message.from_user.id)
     if not products:
-        await message.answer("No products added.")
+        await message.answer("You are not tracking any products right now. Use /add to get started.")
         return
-
-    text = "📋 Product List\n\n"
-
-    for product in products:
-        text += (
-            f"{product[0]}. {product[1]}\n"
-            f"🌐 {product[3]}\n\n"
-        )
-
-    await message.answer(text)
-
+    
+    text = "📦 **Your Tracked Products:**\n\n"
+    for p in products:
+        status = "🟢 In Stock" if p[4] else "🔴 Out of Stock / Waiting"
+        text += f"**ID:** `{p[0]}`\n**Name:** {p[1]}\n**Platform:** {p[3].title()}\n**Status:** {status}\n🔗 [Product Link]({p[2]})\n\n"
+    
+    await message.answer(text, disable_web_page_preview=True)
 
 @router.message(Command("remove"))
-async def remove_product(message: Message, state: FSMContext):
-
-    if message.from_user.id != OWNER_ID:
+async def cmd_remove(message: types.Message):
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer("⚠️ Please provide the Product ID to remove.\nExample: `/remove 1`\n\nUse `/list` to find your product IDs.")
         return
-
-    await state.set_state(RemoveProductState.waiting_for_product_id)
-
-    await message.answer("Enter Product ID")
-
-
-@router.message(RemoveProductState.waiting_for_product_id)
-async def delete_product(message: Message, state: FSMContext):
-
-    try:
-        product_id = int(message.text)
-
-        await db.delete_product(product_id)
-
-        await message.answer("✅ Product Removed")
-
-    except Exception:
-        await message.answer("❌ Invalid Product ID")
-
-    await state.clear()
+    
+    product_id = int(args[1])
+    remove_product(message.from_user.id, product_id)
+    await message.answer(f"🗑️ Product ID `{product_id}` removed (if it existed in your list).")
