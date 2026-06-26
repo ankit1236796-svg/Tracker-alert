@@ -1,11 +1,20 @@
 import os
+from dotenv import load_dotenv
 
-# Replace with your actual Telegram Bot Token from BotFather
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+load_dotenv()
 
-# SQLite Database Name
-DB_NAME = "stock_alerts.db"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+DB_PATH = os.getenv("DB_PATH", "stock_alerts.db")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds (5 min default)
 
-# Interval to check stock (in seconds) - Default: 5 minutes
-CHECK_INTERVAL = 300 
- 
+# Playwright settings
+PLAYWRIGHT_HEADLESS = True
+PLAYWRIGHT_TIMEOUT = 30000  # ms
+
+# Supported sites
+SUPPORTED_SITES = {
+    "amazon": ["amazon.in", "amazon.com"],
+    "flipkart": ["flipkart.com"],
+    "zepto": ["zeptonow.com"],
+    "bigbasket": ["bigbasket.com"],
+}
