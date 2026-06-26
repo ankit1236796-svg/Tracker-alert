@@ -1,3 +1,9 @@
+"""
+stock_checker.py
+~~~~~~~~~~~~~~~~
+Lightweight stock detection using httpx + BeautifulSoup.
+"""
+
 import logging
 import asyncio
 from urllib.parse import urlparse
@@ -17,6 +23,8 @@ HEADERS = {
     ),
     "Accept-Language": "en-IN,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 
@@ -29,60 +37,68 @@ def detect_site(url: str) -> str | None:
     return None
 
 
-def _check_amazon(soup: BeautifulSoup) -> bool:
-    atc = soup.find("input", {"id": "add-to-cart-button"})
-    if atc:
-        return True
-    buy_now = soup.find("input", {"id": "buy-now-button"})
-    if buy_now:
-        return True
+def _check_amazon(soup: BeautifulSoup, html: str) -> bool:
     avail = soup.find("div", {"id": "availability"})
     if avail:
-        text = avail.get_text().strip().lower()
-        if "in stock" in text or "available" in text:
-            return True
+        text = avail.get_text(" ", strip=True).lower()
+        logger.info(f"[amazon] availability text: {text}")
         if "currently unavailable" in text or "out of stock" in text:
             return False
-    price = soup.find("span", {"class": "a-price-whole"})
-    return price is not None
-
-
-def _check_flipkart(soup: BeautifulSoup) -> bool:
-    oos = soup.find(string=lambda t: t and "out of stock" in t.lower())
-    if oos:
-        return False
-    buttons = soup.find_all("button")
-    for btn in buttons:
-        txt = btn.get_text().strip().lower()
-        if "add to cart" in txt or "buy now" in txt:
+        if "in stock" in text or "available" in text:
             return True
+
+    oos_div = soup.find("div", {"id": "outOfStock"})
+    if oos_div:
+        return False
+
+    html_lower = html.lower()
+    if "currently unavailable" in html_lower:
+        return False
+    if "add to cart" in html_lower or "add-to-cart" in html_lower:
+        return True
+    if "buy now" in html_lower:
+        return True
+
+    price = soup.find("span", {"class": "a-price-whole"})
+    if price:
+        return True
+
+    return False
+
+
+def _check_flipkart(soup: BeautifulSoup, html: str) -> bool:
+    html_lower = html.lower()
+    if "out of stock" in html_lower or "sold out" in html_lower:
+        return False
+    if "add to cart" in html_lower or "buy now" in html_lower:
+        return True
     price = soup.find("div", {"class": "_30jeq3"})
     return price is not None
 
 
-def _check_zepto(soup: BeautifulSoup) -> bool:
-    body = soup.get_text().lower()
-    if "out of stock" in body or "not available" in body:
+def _check_zepto(soup: BeautifulSoup, html: str) -> bool:
+    html_lower = html.lower()
+    if "out of stock" in html_lower or "not available" in html_lower:
+        return False
+    if '"in_stock":true' in html or '"inStock":true' in html:
+        return True
+    if '"in_stock":false' in html or '"inStock":false' in html:
         return False
     buttons = soup.find_all("button")
     for btn in buttons:
         if "add" in btn.get_text().strip().lower():
             return True
-    price = soup.find(attrs={"class": lambda c: c and "price" in c.lower()})
-    return price is not None
+    return False
 
 
-def _check_bigbasket(soup: BeautifulSoup) -> bool:
-    body = soup.get_text().lower()
-    notify = soup.find("button", string=lambda t: t and "notify me" in t.lower())
-    if notify:
+def _check_bigbasket(soup: BeautifulSoup, html: str) -> bool:
+    html_lower = html.lower()
+    if "notify me" in html_lower:
         return False
-    if "out of stock" in body:
+    if "out of stock" in html_lower:
         return False
-    buttons = soup.find_all("button")
-    for btn in buttons:
-        if "add" in btn.get_text().strip().lower():
-            return True
+    if "add to cart" in html_lower or '"in_stock": true' in html:
+        return True
     price = soup.find(attrs={"class": lambda c: c and "price" in c.lower()})
     return price is not None
 
@@ -108,10 +124,13 @@ async def check_stock(url: str, site: str) -> bool:
         ) as client:
             response = await client.get(url)
             response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        result = checker(soup)
+
+        html = response.text
+        soup = BeautifulSoup(html, "html.parser")
+        result = checker(soup, html)
         logger.info(f"[{site}] {url} → {'IN STOCK' if result else 'OUT OF STOCK'}")
         return result
+
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error {e.response.status_code} for {url}")
         return False
