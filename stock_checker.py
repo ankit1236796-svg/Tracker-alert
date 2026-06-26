@@ -2,19 +2,25 @@ import logging
 import asyncio
 from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
+import httpx
+from bs4 import BeautifulSoup
 
-from config import PLAYWRIGHT_HEADLESS, PLAYWRIGHT_TIMEOUT, SUPPORTED_SITES
+from config import SUPPORTED_SITES
 
 logger = logging.getLogger(__name__)
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
-# ---------------------------------------------------------------------------
-# Site detection
-# ---------------------------------------------------------------------------
 
 def detect_site(url: str) -> str | None:
-    """Return a canonical site key ('amazon', 'flipkart', …) or None."""
     host = urlparse(url).netloc.lower().replace("www.", "")
     for site_key, domains in SUPPORTED_SITES.items():
         for domain in domains:
@@ -23,95 +29,61 @@ def detect_site(url: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Per-site checkers
-# ---------------------------------------------------------------------------
-
-async def _check_amazon(page: Page, url: str) -> bool:
-    await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
-
-    # "Add to Cart" or "Buy Now" present → in stock
-    add_to_cart = await page.query_selector("#add-to-cart-button")
-    buy_now = await page.query_selector("#buy-now-button")
-    if add_to_cart or buy_now:
-        return True
-
-    # Explicit OOS text
-    oos_sel = "#outOfStock, .a-color-price:has-text('Currently unavailable')"
-    oos = await page.query_selector(oos_sel)
-    if oos:
-        return False
-
-    # Look for availability text in the page
-    availability = await page.query_selector("#availability span")
-    if availability:
-        text = (await availability.inner_text()).strip().lower()
-        return "in stock" in text or "available" in text
-
-    return False
-
-
-async def _check_flipkart(page: Page, url: str) -> bool:
-    await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
-
-    # "Add to Cart" button
-    atc = await page.query_selector("button._2KpZ6l._2U9uOA._3v1-ww, button._2KpZ6l")
+def _check_amazon(soup: BeautifulSoup) -> bool:
+    atc = soup.find("input", {"id": "add-to-cart-button"})
     if atc:
-        text = (await atc.inner_text()).strip().lower()
-        if "add to cart" in text or "buy now" in text:
+        return True
+    buy_now = soup.find("input", {"id": "buy-now-button"})
+    if buy_now:
+        return True
+    avail = soup.find("div", {"id": "availability"})
+    if avail:
+        text = avail.get_text().strip().lower()
+        if "in stock" in text or "available" in text:
             return True
+        if "currently unavailable" in text or "out of stock" in text:
+            return False
+    price = soup.find("span", {"class": "a-price-whole"})
+    return price is not None
 
-    # Out-of-stock banner
-    oos = await page.query_selector("._16FRp0")  # Flipkart OOS class
+
+def _check_flipkart(soup: BeautifulSoup) -> bool:
+    oos = soup.find(string=lambda t: t and "out of stock" in t.lower())
     if oos:
         return False
-
-    # Generic sold-out text
-    body_text = (await page.inner_text("body")).lower()
-    if "sold out" in body_text or "out of stock" in body_text:
-        return False
-
-    # If we found a price, assume in stock
-    price = await page.query_selector("._30jeq3")
+    buttons = soup.find_all("button")
+    for btn in buttons:
+        txt = btn.get_text().strip().lower()
+        if "add to cart" in txt or "buy now" in txt:
+            return True
+    price = soup.find("div", {"class": "_30jeq3"})
     return price is not None
 
 
-async def _check_zepto(page: Page, url: str) -> bool:
-    await page.goto(url, wait_until="networkidle", timeout=PLAYWRIGHT_TIMEOUT)
-
-    # Zepto uses "Add" button on product cards
-    add_btn = await page.query_selector("button:has-text('Add')")
-    if add_btn:
-        return True
-
-    body_text = (await page.inner_text("body")).lower()
-    if "out of stock" in body_text or "not available" in body_text:
+def _check_zepto(soup: BeautifulSoup) -> bool:
+    body = soup.get_text().lower()
+    if "out of stock" in body or "not available" in body:
         return False
-
-    # Fallback: price element present
-    price = await page.query_selector("[class*='price']")
+    buttons = soup.find_all("button")
+    for btn in buttons:
+        if "add" in btn.get_text().strip().lower():
+            return True
+    price = soup.find(attrs={"class": lambda c: c and "price" in c.lower()})
     return price is not None
 
 
-async def _check_bigbasket(page: Page, url: str) -> bool:
-    await page.goto(url, wait_until="networkidle", timeout=PLAYWRIGHT_TIMEOUT)
-
-    # BigBasket "Add" button
-    add_btn = await page.query_selector("button[class*='add-btn'], button:has-text('Add')")
-    if add_btn:
-        return True
-
-    # "Notify Me" → out of stock
-    notify = await page.query_selector("button:has-text('Notify Me')")
+def _check_bigbasket(soup: BeautifulSoup) -> bool:
+    body = soup.get_text().lower()
+    notify = soup.find("button", string=lambda t: t and "notify me" in t.lower())
     if notify:
         return False
-
-    body_text = (await page.inner_text("body")).lower()
-    if "out of stock" in body_text:
+    if "out of stock" in body:
         return False
-
-    # Last resort: presence of a price
-    price = await page.query_selector("[class*='discnt-price'], [class*='price']")
+    buttons = soup.find_all("button")
+    for btn in buttons:
+        if "add" in btn.get_text().strip().lower():
+            return True
+    price = soup.find(attrs={"class": lambda c: c and "price" in c.lower()})
     return price is not None
 
 
@@ -123,50 +95,35 @@ _CHECKER_MAP = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 async def check_stock(url: str, site: str) -> bool:
-    """
-    Launch a browser, navigate to *url*, apply the appropriate checker,
-    and return True if the item is in stock.
-    """
     checker = _CHECKER_MAP.get(site)
     if checker is None:
-        logger.warning(f"No checker for site '{site}' – defaulting to False.")
+        logger.warning(f"No checker for site '{site}'")
         return False
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await context.new_page()
-        try:
-            result = await checker(page, url)
-            logger.info(f"[{site}] {url} → {'IN STOCK' if result else 'OUT OF STOCK'}")
-            return result
-        except PWTimeout:
-            logger.error(f"Timeout checking {url}")
-            return False
-        except Exception as exc:
-            logger.error(f"Error checking {url}: {exc}")
-            return False
-        finally:
-            await browser.close()
+    try:
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            follow_redirects=True,
+            timeout=20.0,
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        result = checker(soup)
+        logger.info(f"[{site}] {url} → {'IN STOCK' if result else 'OUT OF STOCK'}")
+        return result
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error {e.response.status_code} for {url}")
+        return False
+    except Exception as exc:
+        logger.error(f"Error checking {url}: {exc}")
+        return False
 
 
 async def batch_check(products: list[dict]) -> list[tuple[dict, bool]]:
-    """Check multiple products one at a time (avoids hammering servers)."""
     results = []
     for product in products:
         in_stock = await check_stock(product["url"], product["site"])
         results.append((product, in_stock))
-        await asyncio.sleep(2)  # polite delay between requests
+        await asyncio.sleep(2)
     return results
