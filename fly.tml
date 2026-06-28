@@ -1,0 +1,13 @@
+app = "tracker-alert"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BOT_TOKEN = ""
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
