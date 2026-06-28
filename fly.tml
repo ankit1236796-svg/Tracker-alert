@@ -2,7 +2,7 @@ app = "tracker-alert"
 primary_region = "bom"
 
 [build]
-  dockerfile = "Dockerfile"
+  builder = "nixpacks"
 
 [[vm]]
   memory = "512mb"
