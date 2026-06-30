@@ -44,6 +44,26 @@ def _auto_name(url: str, site: str) -> str:
     return f"{site.capitalize()}: {slug}"
 
 
+def _parse_bulk_lines(text: str) -> list[tuple[str, str]]:
+    """
+    Parse lines of the form "product name | URL".
+    Returns only lines that have a non-empty name and a valid http(s) URL.
+    Returns an empty list if fewer than one valid entry is found (so caller
+    falls back to the normal single-name flow when the user just types a name).
+    """
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        name_part, _, url_part = line.partition("|")
+        name_part = name_part.strip()
+        url_part = url_part.strip()
+        if name_part and url_part.startswith(("http://", "https://")):
+            entries.append((name_part, url_part))
+    return entries
+
+
 def _pins_keyboard(pins: list[str]) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=f"🗑 Remove {p}", callback_data=f"pin_remove:{p}")]
@@ -69,7 +89,7 @@ async def cmd_start(message: Message):
         "I monitor products on Amazon, Flipkart, Zepto, and BigBasket "
         "and alert you the moment they come back in stock.\n\n"
         "<b>Commands:</b>\n"
-        "  /add    – Track product(s) — paste one URL per line to add many at once\n"
+        "  /add    – Track product(s); bulk format: <code>Name | URL</code> one per line\n"
         "  /list   – View your tracked products\n"
         "  /remove – Stop tracking a product\n"
         "  /check  – Manually check stock of a tracked product\n"
@@ -88,8 +108,11 @@ async def cmd_add(message: Message, state: FSMContext):
     await state.set_state(AddProductStates.waiting_for_name)
     await message.answer(
         "📦 <b>Add product(s)</b>\n\n"
-        "Step 1 of 2 — Send me the <b>product name</b>.\n"
-        "<i>Tip: in Step 2 you can paste multiple URLs (one per line) to bulk-add.</i>\n\n"
+        "<b>Option A — Bulk (one per line):</b>\n"
+        "<code>Watch | https://amazon.in/…\n"
+        "Shirt | https://flipkart.com/…</code>\n\n"
+        "<b>Option B — Single:</b> just send the product name, "
+        "then the URL in the next step.\n\n"
         "Type /cancel to abort.",
         parse_mode="HTML",
     )
@@ -104,15 +127,40 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 @router.message(AddProductStates.waiting_for_name)
 async def receive_name(message: Message, state: FSMContext):
-    name = message.text.strip()
-    if not name:
-        await message.answer("Product name cannot be empty. Please try again.")
+    raw = message.text.strip()
+    if not raw:
+        await message.answer("Input cannot be empty. Please try again.")
         return
 
-    await state.update_data(product_name=name)
+    # ── Bulk format: lines of "name | URL" ──────────────────────────────────
+    bulk_entries = _parse_bulk_lines(raw)
+    if bulk_entries:
+        await state.clear()
+        user_id = message.from_user.id
+        results = []
+        for name, url in bulk_entries:
+            site = detect_site(url)
+            if site is None:
+                results.append(f"❌ Unsupported site — <b>{name}</b>: <code>{url[:60]}</code>")
+                continue
+            ok, msg = add_product(user_id, name, url, site)
+            if ok:
+                results.append(f"✅ <b>{name}</b> [{site.capitalize()}]")
+            else:
+                results.append(f"⚠️ {msg} — <b>{name}</b>")
+
+        summary = "\n".join(results)
+        await message.answer(
+            f"📦 <b>Bulk add results ({len(bulk_entries)} items):</b>\n\n{summary}",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Single flow: treat input as the product name ─────────────────────────
+    await state.update_data(product_name=raw)
     await state.set_state(AddProductStates.waiting_for_link)
     await message.answer(
-        f"✅ Name saved: <b>{name}</b>\n\n"
+        f"✅ Name saved: <b>{raw}</b>\n\n"
         "Step 2 of 2 — Send me the <b>product URL</b>.\n"
         "Paste <b>multiple URLs (one per line)</b> to add several products at once.\n"
         f"Supported: {_SUPPORTED_SITES_TEXT}",
