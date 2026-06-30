@@ -2,7 +2,7 @@ import logging
 from urllib.parse import urlparse
 
 from aiogram import Router, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     Message,
@@ -64,6 +64,28 @@ def _parse_bulk_lines(text: str) -> list[tuple[str, str]]:
     return entries
 
 
+async def _process_bulk(message: Message, entries: list[tuple[str, str]]) -> None:
+    """Add a list of (name, url) pairs and send a summary reply."""
+    user_id = message.from_user.id
+    results = []
+    for name, url in entries:
+        site = detect_site(url)
+        if site is None:
+            results.append(f"❌ Unsupported site — <b>{name}</b>: <code>{url[:60]}</code>")
+            continue
+        ok, msg = add_product(user_id, name, url, site)
+        if ok:
+            results.append(f"✅ <b>{name}</b> [{site.capitalize()}]")
+        else:
+            results.append(f"⚠️ {msg} — <b>{name}</b>")
+
+    await message.answer(
+        f"📦 <b>Bulk add results ({len(entries)} item{'s' if len(entries) != 1 else ''}):</b>\n\n"
+        + "\n".join(results),
+        parse_mode="HTML",
+    )
+
+
 def _pins_keyboard(pins: list[str]) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=f"🗑 Remove {p}", callback_data=f"pin_remove:{p}")]
@@ -104,7 +126,15 @@ async def cmd_start(message: Message):
 # ---------------------------------------------------------------------------
 
 @router.message(Command("add"))
-async def cmd_add(message: Message, state: FSMContext):
+async def cmd_add(message: Message, state: FSMContext, command: CommandObject):
+    # Inline bulk: /add followed by "Name | URL" lines in the same message
+    if command.args:
+        entries = _parse_bulk_lines(command.args)
+        if entries:
+            await state.clear()
+            await _process_bulk(message, entries)
+            return
+
     await state.set_state(AddProductStates.waiting_for_name)
     await message.answer(
         "📦 <b>Add product(s)</b>\n\n"
@@ -136,24 +166,7 @@ async def receive_name(message: Message, state: FSMContext):
     bulk_entries = _parse_bulk_lines(raw)
     if bulk_entries:
         await state.clear()
-        user_id = message.from_user.id
-        results = []
-        for name, url in bulk_entries:
-            site = detect_site(url)
-            if site is None:
-                results.append(f"❌ Unsupported site — <b>{name}</b>: <code>{url[:60]}</code>")
-                continue
-            ok, msg = add_product(user_id, name, url, site)
-            if ok:
-                results.append(f"✅ <b>{name}</b> [{site.capitalize()}]")
-            else:
-                results.append(f"⚠️ {msg} — <b>{name}</b>")
-
-        summary = "\n".join(results)
-        await message.answer(
-            f"📦 <b>Bulk add results ({len(bulk_entries)} items):</b>\n\n{summary}",
-            parse_mode="HTML",
-        )
+        await _process_bulk(message, bulk_entries)
         return
 
     # ── Single flow: treat input as the product name ─────────────────────────
