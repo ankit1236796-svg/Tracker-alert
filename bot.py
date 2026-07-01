@@ -21,12 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 def _log_startup_checks():
-    key = os.environ.get("SCRAPERAPI_KEY", "")
+    key = os.environ.get("SCRAPEDO_KEY", "")
     if key:
         masked = key[:4] + "*" * (len(key) - 4)
-        logger.info(f"SCRAPERAPI_KEY loaded: {masked}")
+        logger.info(f"SCRAPEDO_KEY loaded: {masked}")
     else:
-        logger.warning("SCRAPERAPI_KEY is NOT set — ScraperAPI calls will fail")
+        logger.warning("SCRAPEDO_KEY is NOT set — Scrape.do calls will fail")
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ from config import SUPPORTED_SITES
 
 logger = logging.getLogger(__name__)
 
-SCRAPER_API_URL = "https://api.scraperapi.com/"
+SCRAPEDO_API_URL = "https://api.scrape.do/"
 
 HEADERS = {
     "User-Agent": (
@@ -32,12 +32,12 @@ def detect_site(url: str) -> str | None:
 def build_scraper_url(url: str, render_js: bool = False) -> str:
     # Read at call time so Railway's runtime env var is always used,
     # regardless of when this module was first imported.
-    api_key = os.environ.get("SCRAPERAPI_KEY", "")
+    token = os.environ.get("SCRAPEDO_KEY", "")
     params = {
-        "api_key": api_key,
+        "token": token,
         "url": url,
-        "country_code": "in",
+        "geoCode": "in",
     }
     if render_js:
         params["render"] = "true"
-    return f"{SCRAPER_API_URL}?{urlencode(params)}"
+    return f"{SCRAPEDO_API_URL}?{urlencode(params)}"
