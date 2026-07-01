@@ -174,3 +174,13 @@ def list_pin_codes(user_id: int) -> list[str]:
             (user_id,),
         ).fetchall()
     return [row["pin_code"] for row in rows]
+
+
+def get_user_primary_pincode(user_id: int) -> str | None:
+    """Return the user's first saved pin code, or None if they have none."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT pin_code FROM pin_codes WHERE user_id = ? ORDER BY created_at ASC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row["pin_code"] if row else None

@@ -23,6 +23,7 @@ from database import (
     list_pin_codes,
     get_product_by_id_for_user,
     update_stock_status,
+    get_user_primary_pincode,
 )
 from stock_checker import detect_site, check_stock
 from config import SUPPORTED_SITES
@@ -122,13 +123,17 @@ async def _run_search(target: Message | CallbackQuery, user_id: int, keyword: st
     )
 
 
-async def _parallel_check(products: list[dict], concurrency: int = 3) -> list[tuple[dict, bool]]:
+async def _parallel_check(
+    products: list[dict],
+    pincode: str | None = None,
+    concurrency: int = 3,
+) -> list[tuple[dict, bool]]:
     """Check multiple products concurrently, limited to `concurrency` at a time."""
     sem = asyncio.Semaphore(concurrency)
 
     async def _one(p: dict) -> tuple[dict, bool]:
         async with sem:
-            result = await check_stock(p["url"], p["site"])
+            result = await check_stock(p["url"], p["site"], pincode=pincode)
             update_stock_status(p["id"], result)
             return p, result
 
@@ -505,7 +510,8 @@ async def cmd_check(message: Message):
 @router.callback_query(F.data == "check_all_now")
 async def callback_check_all_now(call: CallbackQuery):
     """Check every tracked product in parallel."""
-    products = list_products(call.from_user.id)
+    user_id = call.from_user.id
+    products = list_products(user_id)
     if not products:
         await call.answer("No products to check!", show_alert=True)
         return
@@ -517,7 +523,7 @@ async def callback_check_all_now(call: CallbackQuery):
     )
     await call.answer()
 
-    results = await _parallel_check(products)
+    results = await _parallel_check(products, pincode=get_user_primary_pincode(user_id))
     await call.message.edit_text(
         _format_check_results(results),
         parse_mode="HTML",
@@ -601,7 +607,8 @@ async def callback_check(call: CallbackQuery):
     )
     await call.answer()
 
-    in_stock = await check_stock(product["url"], product["site"])
+    pincode = get_user_primary_pincode(call.from_user.id)
+    in_stock = await check_stock(product["url"], product["site"], pincode=pincode)
     update_stock_status(product_id, in_stock)
 
     status_emoji = "✅" if in_stock else "❌"
@@ -660,7 +667,8 @@ async def callback_sel_toggle(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "sel_check_all", SelectStates.selecting)
 async def callback_sel_check_all(call: CallbackQuery, state: FSMContext):
-    products = list_products(call.from_user.id)
+    user_id = call.from_user.id
+    products = list_products(user_id)
     if not products:
         await call.answer("No products to check!", show_alert=True)
         return
@@ -670,7 +678,7 @@ async def callback_sel_check_all(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await call.answer()
-    results = await _parallel_check(products)
+    results = await _parallel_check(products, pincode=get_user_primary_pincode(user_id))
     await call.message.edit_text(
         _format_check_results(results),
         parse_mode="HTML",
@@ -681,12 +689,13 @@ async def callback_sel_check_all(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "sel_check_selected", SelectStates.selecting)
 async def callback_sel_check_selected(call: CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
     data = await state.get_data()
     selected = set(data.get("selected_ids", []))
     if not selected:
         await call.answer("No items selected! Tap ⬜ to select items first.", show_alert=True)
         return
-    products = [p for p in list_products(call.from_user.id) if p["id"] in selected]
+    products = [p for p in list_products(user_id) if p["id"] in selected]
     if not products:
         await call.answer("Selected products not found.", show_alert=True)
         return
@@ -696,7 +705,7 @@ async def callback_sel_check_selected(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await call.answer()
-    results = await _parallel_check(products)
+    results = await _parallel_check(products, pincode=get_user_primary_pincode(user_id))
     await call.message.edit_text(
         _format_check_results(results),
         parse_mode="HTML",

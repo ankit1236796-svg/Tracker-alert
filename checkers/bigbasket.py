@@ -7,12 +7,28 @@ logger = logging.getLogger(__name__)
 NEEDS_JS = True
 
 _ADD_PATTERNS = ["add to cart", "add to basket", "buy now"]
-# "notify me" narrowed; "not available" removed (too broad)
 _OOS_PATTERNS = ["out of stock", "sold out", "currently unavailable", "notify me when available"]
+
+# When no delivery location is recognised, BigBasket shows a location gate.
+# These signals mean the stock result would be for an unknown location —
+# treat as unavailable rather than risking a false-positive alert.
+_LOCATION_GATE_SIGNALS = [
+    "enter your pincode",
+    "enter pincode",
+    "please select a delivery location",
+    "select delivery location",
+    "add a delivery address",
+    "service not available in your area",
+]
 
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
+
+    # ── Location gate (no delivery area set) ─────────────────────────────────
+    if any(sig in html_lower for sig in _LOCATION_GATE_SIGNALS):
+        logger.warning("[bigbasket] location gate detected — no delivery area set, returning OOS")
+        return False
 
     # ── JSON-LD ───────────────────────────────────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
@@ -61,7 +77,6 @@ def check(soup: BeautifulSoup, html: str) -> bool:
             return False
 
     # ── Price element (fallback — only reached if no OOS text found) ──────────
-    # Fixed lambda: c is a list of class strings in BS4, iterate instead of c.lower()
     price = soup.find(attrs={"class": lambda c: c and any("price" in cls.lower() for cls in c)})
     if price:
         return True

@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 from config import BOT_TOKEN, CHECK_INTERVAL
-from database import init_db, get_all_products, update_stock_status
+from database import init_db, get_all_products, update_stock_status, get_user_primary_pincode
 from handlers import router
 from stock_checker import check_stock
 
@@ -51,7 +51,8 @@ async def stock_checker_loop(bot: Bot):
                 async with sem:
                     try:
                         was_in_stock = bool(product["in_stock"])
-                        now_in_stock = await check_stock(product["url"], product["site"])
+                        pincode = get_user_primary_pincode(product["user_id"])
+                        now_in_stock = await check_stock(product["url"], product["site"], pincode=pincode)
                         update_stock_status(product["id"], now_in_stock)
                         if now_in_stock and not was_in_stock:
                             await send_stock_alert(bot, product)

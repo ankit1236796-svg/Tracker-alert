@@ -29,7 +29,7 @@ def detect_site(url: str) -> str | None:
     return None
 
 
-def build_scraper_url(url: str, render_js: bool = False) -> str:
+def build_scraper_url(url: str, render_js: bool = False, set_cookies: str | None = None) -> str:
     # Read at call time so Railway's runtime env var is always used,
     # regardless of when this module was first imported.
     token = os.environ.get("SCRAPEDO_KEY", "")
@@ -40,4 +40,6 @@ def build_scraper_url(url: str, render_js: bool = False) -> str:
     }
     if render_js:
         params["render"] = "true"
+    if set_cookies:
+        params["setCookies"] = set_cookies
     return f"{SCRAPEDO_API_URL}?{urlencode(params)}"

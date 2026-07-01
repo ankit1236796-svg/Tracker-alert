@@ -7,12 +7,27 @@ logger = logging.getLogger(__name__)
 NEEDS_JS = True
 
 _ADD_PATTERNS = ["add to cart", "add to bag", "add item"]
-# "not available" and "notify me" removed — too broad; match in-product UI only
 _OOS_PATTERNS = ["out of stock", "sold out", "currently unavailable", "notify me when available"]
+
+# Blinkit shows a location gate when no delivery area is set.
+# Without a valid location the stock shown could be for the wrong dark store.
+_LOCATION_GATE_SIGNALS = [
+    "enter your pincode",
+    "enter pincode",
+    "select your location",
+    "select delivery location",
+    "add a delivery address",
+    "not serviceable",
+]
 
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
+
+    # ── Location gate (no delivery area set) ─────────────────────────────────
+    if any(sig in html_lower for sig in _LOCATION_GATE_SIGNALS):
+        logger.warning("[blinkit] location gate detected — no delivery area set, returning OOS")
+        return False
 
     # ── JSON-LD ───────────────────────────────────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
@@ -32,7 +47,6 @@ def check(soup: BeautifulSoup, html: str) -> bool:
             pass
 
     # ── Embedded JSON — stock-specific keys only ──────────────────────────────
-    # Excluded: "available" (fires on delivery-slot data), "serviceable" (delivery area flag)
     for key in ('"in_stock":true', '"inStock":true', '"is_available":true', '"inventory":1'):
         if key in html:
             return True

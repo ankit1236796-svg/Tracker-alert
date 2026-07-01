@@ -7,13 +7,33 @@ logger = logging.getLogger(__name__)
 NEEDS_JS = True
 
 _ADD_PATTERNS = ["add to cart", "add item", "add to bag"]
-# "not available"/"item not available" removed (too broad); "notify me" narrowed
-# "enabled" removed entirely — it's a feature-flag key, not a stock key
 _OOS_PATTERNS = ["out of stock", "sold out", "currently unavailable", "notify me when available"]
+
+# Swiggy Instamart uses a full delivery-address session for availability.
+# A simple pincode cookie is insufficient — true pincode-specific checking
+# would require a session with a resolved delivery address. Until that is
+# implemented, results reflect Scrape.do's IP geolocation. These signals
+# detect a location gate page to prevent false-positive alerts.
+_LOCATION_GATE_SIGNALS = [
+    "enter your pincode",
+    "enter pincode",
+    "select your location",
+    "add delivery address",
+    "add a delivery address",
+    "select a location to see",
+]
 
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
+
+    # ── Location gate (no delivery address resolved) ──────────────────────────
+    if any(sig in html_lower for sig in _LOCATION_GATE_SIGNALS):
+        logger.warning(
+            "[instamart] location gate detected — pincode-specific stock unavailable "
+            "(Instamart requires a full delivery address session); returning OOS"
+        )
+        return False
 
     # ── JSON-LD ───────────────────────────────────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
@@ -33,7 +53,6 @@ def check(soup: BeautifulSoup, html: str) -> bool:
             pass
 
     # ── Embedded JSON — stock-specific keys only ──────────────────────────────
-    # Excluded: "available" (fires on delivery slots), "enabled" (feature flags)
     for key in ('"in_stock":true', '"inStock":true', '"is_available":true', '"isAvailable":true'):
         if key in html:
             return True

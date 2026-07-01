@@ -7,7 +7,6 @@ logger = logging.getLogger(__name__)
 NEEDS_JS = True
 
 _ADD_PATTERNS = ["add to cart", "buy now", "add to bag"]
-# "not available" removed (too broad); "notify me" narrowed
 _OOS_PATTERNS = [
     "out of stock", "sold out", "currently unavailable",
     "notify me when available", "coming soon",
@@ -19,7 +18,7 @@ _CART_CLASSES = ["add-to-cart", "addToCart", "btn-cart", "plp-add-to-cart"]
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
 
-    # ── JSON-LD ───────────────────────────────────────────────────────────────
+    # ── JSON-LD (most reliable — product-scoped) ──────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -36,16 +35,11 @@ def check(soup: BeautifulSoup, html: str) -> bool:
         except Exception:
             pass
 
-    # ── Embedded JSON — inStock keys only ────────────────────────────────────
-    # Excluded: "available" (fires on unrelated objects like payment/slot availability)
-    for key in ('"inStock":true', '"in_stock":true', '"isInStock":true'):
-        if key in html:
-            return True
-    for key in ('"inStock":false', '"in_stock":false', '"isInStock":false'):
-        if key in html:
-            return False
-
     # ── Cart button classes (positive signal) ─────────────────────────────────
+    # NOTE: We intentionally do NOT scan embedded JSON for `inStock:true` here.
+    # Croma product pages include related/recommended products whose JSON
+    # contains `inStock:true` even when the tracked product is OOS — this was
+    # the confirmed source of a false-positive alert.
     for cls in _CART_CLASSES:
         if soup.find(attrs={"class": lambda c: c and cls.lower() in " ".join(c).lower()}):
             logger.info(f"[croma] cart class '{cls}' found")
@@ -74,8 +68,8 @@ def check(soup: BeautifulSoup, html: str) -> bool:
         if soup.find(attrs={"class": lambda c: c and cls in " ".join(c)}):
             return True
 
-    if "₹" in html and ("emi" in html_lower or "delivery" in html_lower):
-        return True
+    # NOTE: The `₹ + emi/delivery` fallback was removed — it fired on OOS pages
+    # because EMI/delivery text appears in recommended-product sections.
 
     logger.info("[croma] no signal, defaulting OUT OF STOCK")
     return False
