@@ -8,3 +8,7 @@ class AddProductStates(StatesGroup):
 
 class PinCodeStates(StatesGroup):
     waiting_for_pin = State()
+
+
+class SearchStates(StatesGroup):
+    waiting_for_keyword = State()

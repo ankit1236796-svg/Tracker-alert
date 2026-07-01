@@ -11,11 +11,12 @@ from aiogram.types import (
     CallbackQuery,
 )
 
-from states import AddProductStates, PinCodeStates
+from states import AddProductStates, PinCodeStates, SearchStates
 from database import (
     add_product,
     list_products,
     remove_product,
+    search_products,
     add_pin_code,
     remove_pin_code,
     list_pin_codes,
@@ -23,11 +24,15 @@ from database import (
     update_stock_status,
 )
 from stock_checker import detect_site, check_stock
+from config import SUPPORTED_SITES
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-_SUPPORTED_SITES_TEXT = "amazon.in / amazon.com · flipkart.com · zeptonow.com · bigbasket.com"
+_SUPPORTED_SITES_TEXT = (
+    "amazon.in · flipkart.com · zeptonow.com · bigbasket.com · "
+    "blinkit.com · croma.com · swiggy.com (Instamart) · myntra.com"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +53,8 @@ def _parse_bulk_lines(text: str) -> list[tuple[str, str]]:
     """
     Parse lines of the form "product name | URL".
     Returns only lines that have a non-empty name and a valid http(s) URL.
-    Returns an empty list if fewer than one valid entry is found (so caller
-    falls back to the normal single-name flow when the user just types a name).
+    Returns an empty list if no valid entries found (caller falls back to
+    the normal single-name flow when the user just types a name).
     """
     entries = []
     for line in text.splitlines():
@@ -86,6 +91,36 @@ async def _process_bulk(message: Message, entries: list[tuple[str, str]]) -> Non
     )
 
 
+async def _run_search(target: Message | CallbackQuery, user_id: int, keyword: str) -> None:
+    """Execute a keyword search and reply with results."""
+    send = target.answer if isinstance(target, Message) else target.message.answer
+    products = search_products(user_id, keyword)
+
+    if not products:
+        await send(
+            f"🔍 No products found matching <b>{keyword}</b>.\n"
+            "Try a different keyword.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = [f"🔍 <b>Results for \"{keyword}\"</b> ({len(products)} found)\n"]
+    for p in products:
+        stock_emoji = "✅" if p["in_stock"] else "❌"
+        checked = p["last_checked"] or "Never"
+        lines.append(
+            f"{stock_emoji} <b>{p['name']}</b> [{p['site'].capitalize()}]\n"
+            f"   🕒 Last checked: {checked}\n"
+            f"   🔗 <a href=\"{p['url']}\">View product</a>\n"
+        )
+
+    await send(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 def _pins_keyboard(pins: list[str]) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=f"🗑 Remove {p}", callback_data=f"pin_remove:{p}")]
@@ -100,6 +135,35 @@ def _pins_keyboard(pins: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def _check_store_filter_keyboard(products: list[dict]) -> InlineKeyboardMarkup:
+    """Keyboard shown as first step of /check — lets user pick a store to filter by."""
+    stores = sorted({p["site"] for p in products})
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"🏪 {site.capitalize()}",
+            callback_data=f"check_filter:{site}",
+        )]
+        for site in stores
+    ]
+    buttons.append(
+        [InlineKeyboardButton(text="📦 All Stores", callback_data="check_filter:all")]
+    )
+    buttons.append(
+        [InlineKeyboardButton(text="🔍 Search", callback_data="search_prompt")]
+    )
+    buttons.append(
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="check_filter:cancel")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _check_result_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard shown below a single-product check result."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Search products", callback_data="search_prompt")],
+    ])
+
+
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -108,14 +172,17 @@ def _pins_keyboard(pins: list[str]) -> InlineKeyboardMarkup:
 async def cmd_start(message: Message):
     await message.answer(
         "👋 <b>Welcome to Ankit's Stock Alert Bot!</b>\n\n"
-        "I monitor products on Amazon, Flipkart, Zepto, and BigBasket "
+        "I monitor products on Amazon, Flipkart, Zepto, BigBasket, "
+        "Blinkit, Croma, Instamart, and Myntra "
         "and alert you the moment they come back in stock.\n\n"
         "<b>Commands:</b>\n"
-        "  /add    – Track product(s); bulk format: <code>Name | URL</code> one per line\n"
-        "  /list   – View your tracked products\n"
-        "  /remove – Stop tracking a product\n"
-        "  /check  – Manually check stock of a tracked product\n"
-        "  /pins   – Manage your delivery pin codes\n\n"
+        "  /add     – Track product(s); bulk format: <code>Name | URL</code> one per line\n"
+        "  /list    – View your tracked products\n"
+        "  /remove  – Stop tracking a product\n"
+        "  /check   – Check stock (filter by store or all at once)\n"
+        "  /search  – Search your tracked products by name\n"
+        "  /stores  – List all supported stores\n"
+        "  /pins    – Manage your delivery pin codes\n\n"
         "Use /add to get started!",
         parse_mode="HTML",
     )
@@ -150,9 +217,10 @@ async def cmd_add(message: Message, state: FSMContext, command: CommandObject):
 
 @router.message(Command("cancel"), AddProductStates.waiting_for_name)
 @router.message(Command("cancel"), AddProductStates.waiting_for_link)
+@router.message(Command("cancel"), SearchStates.waiting_for_keyword)
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Cancelled. Nothing was saved.")
+    await message.answer("❌ Cancelled.")
 
 
 @router.message(AddProductStates.waiting_for_name)
@@ -348,7 +416,7 @@ async def callback_remove(call: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# /check  – manual on-demand stock check
+# /check  – step 1: store filter  →  step 2: product list  →  step 3: result
 # ---------------------------------------------------------------------------
 
 @router.message(Command("check"))
@@ -363,6 +431,38 @@ async def cmd_check(message: Message):
         )
         return
 
+    await message.answer(
+        "🏪 <b>Filter by store</b>\n\n"
+        "Pick a store to check, or check all at once:",
+        parse_mode="HTML",
+        reply_markup=_check_store_filter_keyboard(products),
+    )
+
+
+@router.callback_query(F.data.startswith("check_filter:"))
+async def callback_check_filter(call: CallbackQuery):
+    payload = call.data.split(":", 1)[1]
+
+    if payload == "cancel":
+        await call.message.edit_text("❌ Check cancelled.")
+        await call.answer()
+        return
+
+    user_id = call.from_user.id
+    products = list_products(user_id)
+
+    if payload != "all":
+        products = [p for p in products if p["site"] == payload]
+
+    if not products:
+        await call.message.edit_text(
+            f"📭 No products tracked for <b>{payload.capitalize()}</b>.",
+            parse_mode="HTML",
+        )
+        await call.answer()
+        return
+
+    store_label = payload.capitalize() if payload != "all" else "All Stores"
     buttons = [
         [
             InlineKeyboardButton(
@@ -373,14 +473,18 @@ async def cmd_check(message: Message):
         for p in products
     ]
     buttons.append(
+        [InlineKeyboardButton(text="🔍 Search", callback_data="search_prompt")]
+    )
+    buttons.append(
         [InlineKeyboardButton(text="❌ Cancel", callback_data="check:cancel")]
     )
 
-    await message.answer(
-        "🔍 <b>Which product do you want to check now?</b>",
+    await call.message.edit_text(
+        f"🔍 <b>Select a product to check</b> [{store_label}]:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("check:"))
@@ -420,6 +524,68 @@ async def callback_check(call: CallbackQuery):
         f"Status: <b>{status_text}</b>\n"
         f"Site: {product['site'].capitalize()}\n"
         f"🔗 <a href=\"{product['url']}\">View product</a>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=_check_result_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# /search  – keyword search across user's tracked products
+# ---------------------------------------------------------------------------
+
+@router.message(Command("search"))
+async def cmd_search(message: Message, state: FSMContext, command: CommandObject):
+    if command.args:
+        await state.clear()
+        await _run_search(message, message.from_user.id, command.args.strip())
+        return
+
+    await state.set_state(SearchStates.waiting_for_keyword)
+    await message.answer(
+        "🔍 <b>Search your tracked products</b>\n\n"
+        "Send me a keyword to search by product name:\n\n"
+        "Type /cancel to abort.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(SearchStates.waiting_for_keyword)
+async def receive_search_keyword(message: Message, state: FSMContext):
+    keyword = message.text.strip()
+    if not keyword:
+        await message.answer("Keyword cannot be empty. Please try again.")
+        return
+    await state.clear()
+    await _run_search(message, message.from_user.id, keyword)
+
+
+@router.callback_query(F.data == "search_prompt")
+async def callback_search_prompt(call: CallbackQuery, state: FSMContext):
+    await state.set_state(SearchStates.waiting_for_keyword)
+    await call.message.answer(
+        "🔍 <b>Search your tracked products</b>\n\n"
+        "Send me a keyword to search by product name:\n\n"
+        "Type /cancel to abort.",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# /stores  – list all supported stores from config
+# ---------------------------------------------------------------------------
+
+@router.message(Command("stores"))
+async def cmd_stores(message: Message):
+    lines = ["🏪 <b>Supported Stores</b>\n\n"
+             "We currently support tracking on these stores:\n"]
+    for site, domains in SUPPORTED_SITES.items():
+        domain_str = ", ".join(domains)
+        lines.append(f"• <b>{site.capitalize()}</b> — {domain_str}")
+
+    await message.answer(
+        "\n".join(lines),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )

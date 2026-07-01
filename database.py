@@ -118,6 +118,16 @@ def get_product_by_id(product_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def search_products(user_id: int, keyword: str) -> list[dict]:
+    """Case-insensitive partial match on product name, scoped to one user."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM products WHERE user_id = ? AND LOWER(name) LIKE ? ORDER BY created_at DESC",
+            (user_id, f"%{keyword.lower()}%"),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_product_by_id_for_user(product_id: int, user_id: int) -> Optional[dict]:
     with get_connection() as conn:
         row = conn.execute(
