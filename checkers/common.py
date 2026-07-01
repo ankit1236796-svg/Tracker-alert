@@ -1,13 +1,18 @@
 """Shared utilities for all site checkers."""
 
 import logging
+import os
 from urllib.parse import urlparse, urlencode
+
+from dotenv import load_dotenv
 
 from config import SUPPORTED_SITES
 
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 
-SCRAPER_API_KEY = "b0dd6db778e2c40c3f705c01e06125f2"
+SCRAPER_API_KEY = os.environ.get("SCRAPERAPI_KEY", "")
 SCRAPER_API_URL = "https://api.scraperapi.com/"
 
 HEADERS = {
