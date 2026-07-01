@@ -11,7 +11,10 @@ _OOS_PATTERNS = [
     "out of stock", "sold out", "currently unavailable",
     "notify me when available", "coming soon",
 ]
-_CART_CLASSES = ["add-to-cart", "addToCart", "btn-cart", "plp-add-to-cart"]
+# "btn-cart" removed — it matched Croma's persistent header cart icon on every page,
+# causing false positives once the lambda was using correct BS4 class membership.
+# "addToCart" kept — specific enough as an exact class name.
+_CART_CLASSES = ["add-to-cart", "addToCart", "plp-add-to-cart"]
 
 
 def _is_disabled(el) -> bool:
@@ -24,46 +27,91 @@ def _is_disabled(el) -> bool:
     return "disabled" in classes or "inactive" in classes
 
 
+def _offer_availability(offers) -> str:
+    """
+    Extract the first availability string from an 'offers' value that may be:
+      • a single Offer dict     {"availability": "https://schema.org/InStock"}
+      • an AggregateOffer dict  {"offers": [{"availability": "..."}], ...}
+      • a list of Offer dicts   [{"availability": "..."}, ...]
+    Returns "" when no availability can be found.
+    """
+    if isinstance(offers, dict):
+        avail = offers.get("availability", "")
+        if avail:
+            return str(avail)
+        # AggregateOffer: availability lives in the nested offers list
+        nested = offers.get("offers", [])
+        if isinstance(nested, list):
+            for o in nested:
+                if isinstance(o, dict):
+                    a = o.get("availability", "")
+                    if a:
+                        return str(a)
+        elif isinstance(nested, dict):
+            a = nested.get("availability", "")
+            if a:
+                return str(a)
+    elif isinstance(offers, list):
+        for o in offers:
+            if isinstance(o, dict):
+                a = o.get("availability", "")
+                if a:
+                    return str(a)
+    return ""
+
+
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
 
-    # ── JSON-LD (most reliable — product-scoped) ──────────────────────────────
+    # ── JSON-LD pass — OutOfStock trusted immediately; InStock deferred ────────
+    # Croma's structured data has been observed returning InStock for products
+    # that are actually out of stock (stale / incorrect data). Trusting it
+    # immediately caused every product to appear in-stock.
+    # Strategy: return False on OutOfStock right away (reliable negative signal),
+    # but hold any InStock signal and only confirm it after OOS text patterns
+    # have had a chance to contradict it.
+    json_ld_in_stock = False
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
             for item in (data if isinstance(data, list) else [data]):
                 if not isinstance(item, dict):
                     continue
-                avail = item.get("offers", {}).get("availability", "")
+                avail = _offer_availability(item.get("offers", {}))
+                if not avail:
+                    continue
                 if "InStock" in avail:
-                    logger.info("[croma] JSON-LD: InStock → True")
-                    return True
-                if "OutOfStock" in avail or "Discontinued" in avail:
+                    logger.info("[croma] JSON-LD: InStock (deferred — checking OOS text first)")
+                    json_ld_in_stock = True
+                elif "OutOfStock" in avail or "Discontinued" in avail:
                     logger.info("[croma] JSON-LD: OutOfStock/Discontinued → False")
                     return False
         except Exception:
             pass
 
-    # ── Negative signals (checked before buttons/attrs — related-product buttons
-    # without disabled attr can appear on OOS pages and would otherwise trigger
-    # a false positive) ────────────────────────────────────────────────────────
+    # ── OOS text patterns ─────────────────────────────────────────────────────
     for pattern in _OOS_PATTERNS:
         if pattern in html_lower:
-            logger.info(f"[croma] OOS signal: '{pattern}' → False")
+            logger.info(f"[croma] OOS text: '{pattern}' → False")
             return False
 
-    # ── Cart button classes — skip disabled elements ───────────────────────────
-    # NOTE: On OOS Croma pages the "Add to Cart" button is rendered with the same
-    # CSS class (e.g. "add-to-cart") but the element carries `disabled` /
-    # `aria-disabled="true"` / a "disabled" CSS class. We MUST filter these out
-    # or every OOS page looks like a false positive (recurring bug source).
+    # ── JSON-LD InStock confirmed (OOS text did not contradict it) ────────────
+    if json_ld_in_stock:
+        logger.info("[croma] JSON-LD InStock confirmed (no OOS text) → True")
+        return True
+
+    # ── Cart button classes (exact class membership via BS4 class_= filter) ───
+    # NOTE: Previously used attrs={"class": lambda c: cls in " ".join(c)} which
+    # is BROKEN — BS4 passes individual class strings to the lambda, so
+    # " ".join(str) character-joins rather than word-joins. Use class_=cls
+    # instead, which BS4 correctly resolves to exact class-membership testing.
     for cls in _CART_CLASSES:
-        el = soup.find(attrs={"class": lambda c: c and cls.lower() in " ".join(c).lower()})
-        if el and not _is_disabled(el):
-            logger.info(f"[croma] active cart class '{cls}' found → True")
+        for el in soup.find_all(class_=cls):
+            if _is_disabled(el):
+                logger.info(f"[croma] class '{cls}' on <{el.name}> is disabled — skipping")
+                continue
+            logger.info(f"[croma] active class '{cls}' on <{el.name}> → True")
             return True
-        elif el:
-            logger.info(f"[croma] cart class '{cls}' found but element is disabled — skipping")
 
     # ── Buttons — skip disabled ────────────────────────────────────────────────
     for btn in soup.find_all("button"):
@@ -74,20 +122,15 @@ def check(soup: BeautifulSoup, html: str) -> bool:
             logger.info(f"[croma] active button '{text[:40]}' → True")
             return True
 
-    # ── Attrs ─────────────────────────────────────────────────────────────────
+    # ── Attribute checks ──────────────────────────────────────────────────────
     for attr in ("data-testid", "aria-label", "id"):
         for el in soup.find_all(attrs={attr: True}):
             if _is_disabled(el):
                 continue
             val = (el.get(attr) or "").lower()
             if any(p in val for p in _ADD_PATTERNS):
-                logger.info(f"[croma] active attr {attr}='{val[:40]}' → True")
+                logger.info(f"[croma] active {attr}='{val[:40]}' → True")
                 return True
 
-    # NOTE: Price class fallback removed — Croma shows product price even when
-    # OOS (for reference), causing systematic false positives on OOS pages.
-    # NOTE: Embedded JSON `inStock:true` scan removed (prev fix) — fires on
-    # recommended product JSON embedded on OOS pages.
-
-    logger.info("[croma] no conclusive signal → defaulting OUT OF STOCK (False)")
+    logger.info("[croma] no conclusive signal → False")
     return False
