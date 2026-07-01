@@ -25,6 +25,8 @@ _LOCATION_GATE_SIGNALS = [
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
 
+    logger.info(f"[bigbasket] HTML length={len(html)}, first 200 chars: {html[:200]!r}")
+
     # ── Location gate (no delivery area set) ─────────────────────────────────
     if any(sig in html_lower for sig in _LOCATION_GATE_SIGNALS):
         logger.warning("[bigbasket] location gate detected — no delivery area set, returning OOS")
@@ -39,10 +41,10 @@ def check(soup: BeautifulSoup, html: str) -> bool:
                     continue
                 avail = item.get("offers", {}).get("availability", "")
                 if "InStock" in avail:
-                    logger.info("[bigbasket] JSON-LD: InStock")
+                    logger.info("[bigbasket] JSON-LD: InStock → True")
                     return True
                 if "OutOfStock" in avail:
-                    logger.info("[bigbasket] JSON-LD: OutOfStock")
+                    logger.info("[bigbasket] JSON-LD: OutOfStock → False")
                     return False
         except Exception:
             pass
@@ -50,35 +52,40 @@ def check(soup: BeautifulSoup, html: str) -> bool:
     # ── Embedded JSON — bigbasket's own stock field ───────────────────────────
     for key in ('"in_stock": true', '"in_stock":true', '"inStock":true'):
         if key in html:
+            logger.info(f"[bigbasket] embedded JSON key {key!r} → True")
             return True
     for key in ('"in_stock": false', '"in_stock":false', '"inStock":false'):
         if key in html:
+            logger.info(f"[bigbasket] embedded JSON key {key!r} → False")
             return False
 
     # ── Positive signals first ────────────────────────────────────────────────
     for btn in soup.find_all("button"):
         text = btn.get_text(strip=True).lower()
         if text in ("add", "+"):  # bigbasket's compact cart button
-            logger.info("[bigbasket] ADD/+ button found")
+            logger.info("[bigbasket] ADD/+ button found → True")
             return True
         if any(p in text for p in _ADD_PATTERNS):
+            logger.info(f"[bigbasket] add pattern in button '{text[:40]}' → True")
             return True
 
     for attr in ("data-testid", "aria-label", "id"):
         for el in soup.find_all(attrs={attr: True}):
             val = (el.get(attr) or "").lower()
             if "add-to-cart" in val or "addtocart" in val or any(p in val for p in _ADD_PATTERNS):
+                logger.info(f"[bigbasket] add pattern in {attr}='{val[:40]}' → True")
                 return True
 
     # ── Negative signals ──────────────────────────────────────────────────────
     for pattern in _OOS_PATTERNS:
         if pattern in html_lower:
-            logger.info(f"[bigbasket] OOS signal: '{pattern}'")
+            logger.info(f"[bigbasket] OOS signal: '{pattern}' → False")
             return False
 
     # ── Price element (fallback — only reached if no OOS text found) ──────────
     price = soup.find(attrs={"class": lambda c: c and any("price" in cls.lower() for cls in c)})
     if price:
+        logger.info("[bigbasket] price element found, no OOS signals → True")
         return True
 
     logger.info("[bigbasket] no signal, defaulting OUT OF STOCK")

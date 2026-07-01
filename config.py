@@ -13,12 +13,15 @@ PLAYWRIGHT_TIMEOUT = 30000  # ms
 
 # Supported sites
 SUPPORTED_SITES = {
-    "amazon":     ["amazon.in", "amazon.com"],
-    "flipkart":   ["flipkart.com"],
-    "zepto":      ["zeptonow.com"],
-    "bigbasket":  ["bigbasket.com"],
-    "blinkit":    ["blinkit.com"],
-    "croma":      ["croma.com"],
-    "instamart":  ["swiggy.com"],
-    "myntra":     ["myntra.com"],
+    "amazon":          ["amazon.in", "amazon.com"],
+    "flipkart":        ["flipkart.com"],
+    "zepto":           ["zeptonow.com"],
+    "bigbasket":       ["bigbasket.com"],
+    "blinkit":         ["blinkit.com"],
+    "croma":           ["croma.com"],
+    "instamart":       ["swiggy.com"],
+    "myntra":          ["myntra.com"],
+    "jiomart":         ["jiomart.com"],
+    "reliancedigital": ["reliancedigital.in"],
+    "apple":           ["apple.com"],
 }

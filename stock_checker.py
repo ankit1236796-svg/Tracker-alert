@@ -18,7 +18,10 @@ logger = logging.getLogger(__name__)
 __all__ = ["detect_site", "check_stock", "batch_check"]
 
 # Sites that need JS rendering
-_JS_SITES = {"flipkart", "zepto", "bigbasket", "blinkit", "croma", "instamart", "myntra"}
+_JS_SITES = {
+    "flipkart", "zepto", "bigbasket", "blinkit", "croma", "instamart", "myntra",
+    "jiomart", "reliancedigital",
+}
 
 # Quick-commerce sites where injecting a `pincode` cookie is attempted.
 # Scrape.do's setCookies parameter forwards the cookie to the target site.
@@ -44,7 +47,7 @@ async def check_stock(url: str, site: str, pincode: str | None = None) -> bool:
                 # Inject pincode as a cookie so the target site serves
                 # location-specific stock rather than IP-geolocated defaults.
                 set_cookies = f"pincode={pincode}"
-                logger.info(f"[{site}] injecting pincode cookie: {pincode}")
+                logger.info(f"[{site}] pincode={pincode!r} → setCookies={set_cookies!r}")
             else:
                 logger.warning(
                     f"[{site}] pincode {pincode} saved but {site} requires "
@@ -60,6 +63,7 @@ async def check_stock(url: str, site: str, pincode: str | None = None) -> bool:
 
     try:
         scraper_url = build_scraper_url(url, render_js=site in _JS_SITES, set_cookies=set_cookies)
+        logger.info(f"[{site}] scraper_url (truncated)={scraper_url[:120]!r}")
 
         async with httpx.AsyncClient(
             headers=HEADERS,
