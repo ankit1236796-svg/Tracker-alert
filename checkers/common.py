@@ -4,15 +4,10 @@ import logging
 import os
 from urllib.parse import urlparse, urlencode
 
-from dotenv import load_dotenv
-
 from config import SUPPORTED_SITES
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SCRAPER_API_KEY = os.environ.get("SCRAPERAPI_KEY", "")
 SCRAPER_API_URL = "https://api.scraperapi.com/"
 
 HEADERS = {
@@ -35,8 +30,11 @@ def detect_site(url: str) -> str | None:
 
 
 def build_scraper_url(url: str, render_js: bool = False) -> str:
+    # Read at call time so Railway's runtime env var is always used,
+    # regardless of when this module was first imported.
+    api_key = os.environ.get("SCRAPERAPI_KEY", "")
     params = {
-        "api_key": SCRAPER_API_KEY,
+        "api_key": api_key,
         "url": url,
         "country_code": "in",
     }

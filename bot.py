@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
@@ -16,6 +17,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _log_startup_checks():
+    key = os.environ.get("SCRAPERAPI_KEY", "")
+    if key:
+        masked = key[:4] + "*" * (len(key) - 4)
+        logger.info(f"SCRAPERAPI_KEY loaded: {masked}")
+    else:
+        logger.warning("SCRAPERAPI_KEY is NOT set — ScraperAPI calls will fail")
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +92,7 @@ async def send_stock_alert(bot: Bot, product: dict):
 # ---------------------------------------------------------------------------
 
 async def main():
+    _log_startup_checks()
     init_db()
 
     bot = Bot(
