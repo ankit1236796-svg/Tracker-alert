@@ -25,32 +25,29 @@ logger = logging.getLogger(__name__)
 async def stock_checker_loop(bot: Bot):
     """
     Runs every CHECK_INTERVAL seconds.
-    For each tracked product:
-      - Scrape the page
-      - If it just became IN STOCK → send Telegram alert
-      - Update DB record
+    Checks all tracked products in parallel (max 3 concurrent ScraperAPI calls).
+    Sends an alert when a product transitions from out-of-stock → in-stock.
     """
     logger.info("Stock checker loop started.")
     while True:
         try:
             products = get_all_products()
-            logger.info(f"Checking {len(products)} product(s)…")
+            logger.info(f"Checking {len(products)} product(s) in parallel…")
 
-            for product in products:
-                try:
-                    was_in_stock = bool(product["in_stock"])
-                    now_in_stock = await check_stock(product["url"], product["site"])
+            sem = asyncio.Semaphore(3)
 
-                    update_stock_status(product["id"], now_in_stock)
+            async def _check_one(product: dict):
+                async with sem:
+                    try:
+                        was_in_stock = bool(product["in_stock"])
+                        now_in_stock = await check_stock(product["url"], product["site"])
+                        update_stock_status(product["id"], now_in_stock)
+                        if now_in_stock and not was_in_stock:
+                            await send_stock_alert(bot, product)
+                    except Exception as exc:
+                        logger.error(f"Error processing product #{product['id']}: {exc}")
 
-                    # Alert only on transition: out-of-stock → in-stock
-                    if now_in_stock and not was_in_stock:
-                        await send_stock_alert(bot, product)
-
-                except Exception as exc:
-                    logger.error(
-                        f"Error processing product #{product['id']}: {exc}"
-                    )
+            await asyncio.gather(*[_check_one(p) for p in products])
 
         except Exception as exc:
             logger.error(f"Stock checker loop error: {exc}")

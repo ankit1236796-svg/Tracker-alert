@@ -12,3 +12,7 @@ class PinCodeStates(StatesGroup):
 
 class SearchStates(StatesGroup):
     waiting_for_keyword = State()
+
+
+class SelectStates(StatesGroup):
+    selecting = State()

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from urllib.parse import urlparse
 
@@ -11,7 +12,7 @@ from aiogram.types import (
     CallbackQuery,
 )
 
-from states import AddProductStates, PinCodeStates, SearchStates
+from states import AddProductStates, PinCodeStates, SearchStates, SelectStates
 from database import (
     add_product,
     list_products,
@@ -121,6 +122,39 @@ async def _run_search(target: Message | CallbackQuery, user_id: int, keyword: st
     )
 
 
+async def _parallel_check(products: list[dict], concurrency: int = 3) -> list[tuple[dict, bool]]:
+    """Check multiple products concurrently, limited to `concurrency` at a time."""
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(p: dict) -> tuple[dict, bool]:
+        async with sem:
+            result = await check_stock(p["url"], p["site"])
+            update_stock_status(p["id"], result)
+            return p, result
+
+    return list(await asyncio.gather(*[_one(p) for p in products]))
+
+
+def _format_check_results(results: list[tuple[dict, bool]]) -> str:
+    """Format parallel-check results into a readable summary."""
+    total = len(results)
+    in_stock = [(p, s) for p, s in results if s]
+    oos = [(p, s) for p, s in results if not s]
+    lines = [f"📊 <b>Check results ({total} item{'s' if total != 1 else ''}):</b>\n"]
+    if in_stock:
+        lines.append("✅ <b>In Stock:</b>")
+        for p, _ in in_stock:
+            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]")
+            lines.append(f"    <a href=\"{p['url']}\">View →</a>")
+    if oos:
+        if in_stock:
+            lines.append("")
+        lines.append("❌ <b>Out of Stock:</b>")
+        for p, _ in oos:
+            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]")
+    return "\n".join(lines)
+
+
 def _pins_keyboard(pins: list[str]) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=f"🗑 Remove {p}", callback_data=f"pin_remove:{p}")]
@@ -149,6 +183,9 @@ def _check_store_filter_keyboard(products: list[dict]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📦 All Stores", callback_data="check_filter:all")]
     )
     buttons.append(
+        [InlineKeyboardButton(text="⚡ Check All Now", callback_data="check_all_now")]
+    )
+    buttons.append(
         [InlineKeyboardButton(text="🔍 Search", callback_data="search_prompt")]
     )
     buttons.append(
@@ -162,6 +199,31 @@ def _check_result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Search products", callback_data="search_prompt")],
     ])
+
+
+def _select_keyboard(products: list[dict], selected_ids: set[int]) -> InlineKeyboardMarkup:
+    """Checkbox keyboard for item selection mode."""
+    buttons = []
+    for p in products:
+        mark = "✅" if p["id"] in selected_ids else "⬜"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{mark} {p['name']} [{p['site'].capitalize()}]",
+                callback_data=f"sel_toggle:{p['id']}",
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="🔍 Check All", callback_data="sel_check_all"),
+        InlineKeyboardButton(text="✅ Check Selected", callback_data="sel_check_selected"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🗑 Delete Selected", callback_data="sel_delete_selected"),
+        InlineKeyboardButton(text="🗑 Delete All", callback_data="sel_delete_all"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="❌ Cancel", callback_data="sel_cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +241,8 @@ async def cmd_start(message: Message):
         "  /add     – Track product(s); bulk format: <code>Name | URL</code> one per line\n"
         "  /list    – View your tracked products\n"
         "  /remove  – Stop tracking a product\n"
-        "  /check   – Check stock (filter by store or all at once)\n"
+        "  /check   – Check stock (filter by store, or check all at once)\n"
+        "  /select  – Select items to bulk-check or delete\n"
         "  /search  – Search your tracked products by name\n"
         "  /stores  – List all supported stores\n"
         "  /pins    – Manage your delivery pin codes\n\n"
@@ -439,6 +502,30 @@ async def cmd_check(message: Message):
     )
 
 
+@router.callback_query(F.data == "check_all_now")
+async def callback_check_all_now(call: CallbackQuery):
+    """Check every tracked product in parallel."""
+    products = list_products(call.from_user.id)
+    if not products:
+        await call.answer("No products to check!", show_alert=True)
+        return
+
+    await call.message.edit_text(
+        f"⏳ Checking all <b>{len(products)}</b> product(s) in parallel…\n"
+        "This may take a moment.",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+    results = await _parallel_check(products)
+    await call.message.edit_text(
+        _format_check_results(results),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=_check_result_keyboard(),
+    )
+
+
 @router.callback_query(F.data.startswith("check_filter:"))
 async def callback_check_filter(call: CallbackQuery):
     payload = call.data.split(":", 1)[1]
@@ -528,6 +615,185 @@ async def callback_check(call: CallbackQuery):
         disable_web_page_preview=True,
         reply_markup=_check_result_keyboard(),
     )
+
+
+# ---------------------------------------------------------------------------
+# /select  – checkbox selection for bulk check / delete
+# ---------------------------------------------------------------------------
+
+@router.message(Command("select"))
+async def cmd_select(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    products = list_products(user_id)
+    if not products:
+        await message.answer(
+            "📭 You have no tracked products yet.\n"
+            "Use /add to start tracking one!"
+        )
+        return
+    await state.set_state(SelectStates.selecting)
+    await state.update_data(selected_ids=[])
+    await message.answer(
+        "☑️ <b>Select items</b>\n\n"
+        "Tap to toggle ✅/⬜, then choose an action:",
+        parse_mode="HTML",
+        reply_markup=_select_keyboard(products, set()),
+    )
+
+
+@router.callback_query(F.data.startswith("sel_toggle:"), SelectStates.selecting)
+async def callback_sel_toggle(call: CallbackQuery, state: FSMContext):
+    product_id = int(call.data.split(":", 1)[1])
+    data = await state.get_data()
+    selected = set(data.get("selected_ids", []))
+    if product_id in selected:
+        selected.discard(product_id)
+    else:
+        selected.add(product_id)
+    await state.update_data(selected_ids=list(selected))
+    products = list_products(call.from_user.id)
+    await call.message.edit_reply_markup(
+        reply_markup=_select_keyboard(products, selected)
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "sel_check_all", SelectStates.selecting)
+async def callback_sel_check_all(call: CallbackQuery, state: FSMContext):
+    products = list_products(call.from_user.id)
+    if not products:
+        await call.answer("No products to check!", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"⏳ Checking all <b>{len(products)}</b> product(s) in parallel…\n"
+        "This may take a moment.",
+        parse_mode="HTML",
+    )
+    await call.answer()
+    results = await _parallel_check(products)
+    await call.message.edit_text(
+        _format_check_results(results),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data == "sel_check_selected", SelectStates.selecting)
+async def callback_sel_check_selected(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = set(data.get("selected_ids", []))
+    if not selected:
+        await call.answer("No items selected! Tap ⬜ to select items first.", show_alert=True)
+        return
+    products = [p for p in list_products(call.from_user.id) if p["id"] in selected]
+    if not products:
+        await call.answer("Selected products not found.", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"⏳ Checking <b>{len(products)}</b> selected product(s) in parallel…\n"
+        "This may take a moment.",
+        parse_mode="HTML",
+    )
+    await call.answer()
+    results = await _parallel_check(products)
+    await call.message.edit_text(
+        _format_check_results(results),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data == "sel_delete_selected", SelectStates.selecting)
+async def callback_sel_delete_selected(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = set(data.get("selected_ids", []))
+    if not selected:
+        await call.answer("No items selected! Tap ⬜ to select items first.", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"⚠️ <b>Delete {len(selected)} selected item(s)?</b>\n\nThis cannot be undone.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Yes, delete", callback_data="sel_confirm_delete:selected"),
+                InlineKeyboardButton(text="↩️ Go back", callback_data="sel_back"),
+            ]
+        ]),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "sel_delete_all", SelectStates.selecting)
+async def callback_sel_delete_all(call: CallbackQuery, state: FSMContext):
+    products = list_products(call.from_user.id)
+    count = len(products)
+    if not count:
+        await call.answer("No products to delete.", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"⚠️ <b>Delete all {count} tracked product(s)?</b>\n\nThis cannot be undone.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Yes, delete all", callback_data="sel_confirm_delete:all"),
+                InlineKeyboardButton(text="↩️ Go back", callback_data="sel_back"),
+            ]
+        ]),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("sel_confirm_delete:"), SelectStates.selecting)
+async def callback_sel_confirm_delete(call: CallbackQuery, state: FSMContext):
+    delete_type = call.data.split(":", 1)[1]
+    user_id = call.from_user.id
+    data = await state.get_data()
+
+    if delete_type == "selected":
+        selected = set(data.get("selected_ids", []))
+        deleted = sum(1 for pid in selected if remove_product(user_id, pid))
+        await call.message.edit_text(
+            f"✅ Deleted <b>{deleted}</b> product(s).",
+            parse_mode="HTML",
+        )
+    else:
+        products = list_products(user_id)
+        deleted = sum(1 for p in products if remove_product(user_id, p["id"]))
+        await call.message.edit_text(
+            f"✅ All <b>{deleted}</b> product(s) deleted.",
+            parse_mode="HTML",
+        )
+
+    await state.clear()
+    await call.answer()
+
+
+@router.callback_query(F.data == "sel_back", SelectStates.selecting)
+async def callback_sel_back(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = set(data.get("selected_ids", []))
+    products = list_products(call.from_user.id)
+    if not products:
+        await call.message.edit_text("📭 No products left to manage.")
+        await state.clear()
+        await call.answer()
+        return
+    await call.message.edit_text(
+        "☑️ <b>Select items</b>\n\n"
+        "Tap to toggle ✅/⬜, then choose an action:",
+        parse_mode="HTML",
+        reply_markup=_select_keyboard(products, selected),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "sel_cancel", SelectStates.selecting)
+async def callback_sel_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("❌ Selection cancelled.")
+    await call.answer()
 
 
 # ---------------------------------------------------------------------------

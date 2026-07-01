@@ -6,22 +6,19 @@ logger = logging.getLogger(__name__)
 
 NEEDS_JS = True
 
-_ADD_PATTERNS = ["add to cart", "add to basket", "add", "buy now"]
-_OOS_PATTERNS = [
-    "notify me", "out of stock", "sold out",
-    "currently unavailable", "not available",
-]
+_ADD_PATTERNS = ["add to cart", "add to basket", "buy now"]
+# "notify me" narrowed; "not available" removed (too broad)
+_OOS_PATTERNS = ["out of stock", "sold out", "currently unavailable", "notify me when available"]
 
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
 
-    # ── JSON-LD structured data ───────────────────────────────────────────────
+    # ── JSON-LD ───────────────────────────────────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
-            items = data if isinstance(data, list) else [data]
-            for item in items:
+            for item in (data if isinstance(data, list) else [data]):
                 if not isinstance(item, dict):
                     continue
                 avail = item.get("offers", {}).get("availability", "")
@@ -34,37 +31,40 @@ def check(soup: BeautifulSoup, html: str) -> bool:
         except Exception:
             pass
 
-    # ── Embedded JSON flags ───────────────────────────────────────────────────
-    for true_key in ('"in_stock": true', '"in_stock":true', '"inStock":true'):
-        if true_key in html:
+    # ── Embedded JSON — bigbasket's own stock field ───────────────────────────
+    for key in ('"in_stock": true', '"in_stock":true', '"inStock":true'):
+        if key in html:
             return True
-    for false_key in ('"in_stock": false', '"in_stock":false', '"inStock":false'):
-        if false_key in html:
+    for key in ('"in_stock": false', '"in_stock":false', '"inStock":false'):
+        if key in html:
             return False
 
-    # ── Explicit OOS text ─────────────────────────────────────────────────────
+    # ── Positive signals first ────────────────────────────────────────────────
+    for btn in soup.find_all("button"):
+        text = btn.get_text(strip=True).lower()
+        if text in ("add", "+"):  # bigbasket's compact cart button
+            logger.info("[bigbasket] ADD/+ button found")
+            return True
+        if any(p in text for p in _ADD_PATTERNS):
+            return True
+
+    for attr in ("data-testid", "aria-label", "id"):
+        for el in soup.find_all(attrs={attr: True}):
+            val = (el.get(attr) or "").lower()
+            if "add-to-cart" in val or "addtocart" in val or any(p in val for p in _ADD_PATTERNS):
+                return True
+
+    # ── Negative signals ──────────────────────────────────────────────────────
     for pattern in _OOS_PATTERNS:
         if pattern in html_lower:
             logger.info(f"[bigbasket] OOS signal: '{pattern}'")
             return False
 
-    # ── Button elements ───────────────────────────────────────────────────────
-    for btn in soup.find_all("button"):
-        text = btn.get_text(strip=True).lower()
-        if any(p in text for p in _ADD_PATTERNS):
-            return True
-
-    # ── data-testid / aria-label ──────────────────────────────────────────────
-    for attr in ("data-testid", "aria-label", "id"):
-        for el in soup.find_all(attrs={attr: True}):
-            val = (el.get(attr) or "").lower()
-            if any(p in val for p in _ADD_PATTERNS):
-                return True
-
-    # ── Price element present ─────────────────────────────────────────────────
-    price = soup.find(attrs={"class": lambda c: c and "price" in c.lower()})
+    # ── Price element (fallback — only reached if no OOS text found) ──────────
+    # Fixed lambda: c is a list of class strings in BS4, iterate instead of c.lower()
+    price = soup.find(attrs={"class": lambda c: c and any("price" in cls.lower() for cls in c)})
     if price:
         return True
 
-    logger.info("[bigbasket] no clear signal, defaulting OUT OF STOCK")
+    logger.info("[bigbasket] no signal, defaulting OUT OF STOCK")
     return False
