@@ -7,6 +7,15 @@ logger = logging.getLogger(__name__)
 NEEDS_JS = True
 
 _ADD_PATTERNS = ["add to cart", "buy now", "add to bag"]
+
+# Delivery-section strings confirmed on real OOS Croma pages (e.g. vivo T5X).
+# Checked FIRST — before JSON-LD (which can be stale) and before button text
+# (which appears on both in-stock and OOS pages) — so they act as overrides.
+_DELIVERY_RESTRICTION_PATTERNS = [
+    "not available for your pincode",
+    "unfortunately not available for your location",
+]
+
 _OOS_PATTERNS = [
     "out of stock", "sold out", "currently unavailable",
     "notify me when available", "coming soon",
@@ -62,6 +71,26 @@ def _offer_availability(offers) -> str:
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
+
+    # ── Delivery restriction — highest priority, overrides all other signals ───
+    # On OOS pages Croma's delivery section shows "Not Available for your pincode"
+    # or "Unfortunately not available for your location" (confirmed on real pages).
+    # These are checked before JSON-LD (which may carry stale InStock data) and
+    # before button text (which exists on both in-stock and OOS pages).
+    for pattern in _DELIVERY_RESTRICTION_PATTERNS:
+        if pattern in html_lower:
+            logger.info(f"[croma] delivery restriction: '{pattern}' → False")
+            return False
+
+    # Also inspect the delivery-text-msg element directly for broader coverage
+    # (catches phrasing variants not in the pattern list above).
+    delivery_el = soup.find(class_="delivery-text-msg")
+    if delivery_el:
+        dtxt = delivery_el.get_text(" ", strip=True).lower()
+        logger.info(f"[croma] delivery-text-msg: '{dtxt[:80]}'")
+        if "not available" in dtxt or "unfortunately" in dtxt:
+            logger.info("[croma] delivery-text-msg unavailable text → False")
+            return False
 
     # ── JSON-LD pass — OutOfStock trusted immediately; InStock deferred ────────
     # Croma's structured data has been observed returning InStock for products
