@@ -149,6 +149,59 @@ def _log_delivery_diagnostics(soup: BeautifulSoup, html: str) -> None:
         if idx != -1:
             logger.info(f"[croma][diag] ...{html[max(0, idx - 90):idx + 90]!r}...")
 
+    # 5. JSON-LD availability — the RAW value(s). Croma often reports stale
+    #    InStock for universally-OOS items, which is what makes the checker
+    #    return in-stock; seeing the literal value pins this down.
+    found_ld = False
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if isinstance(item, dict) and item.get("offers") is not None:
+                avail = _offer_availability(item.get("offers", {}))
+                if avail:
+                    found_ld = True
+                    logger.info(f"[croma][diag] JSON-LD availability={avail!r}")
+    if not found_ld:
+        logger.info("[croma][diag] JSON-LD availability: none found")
+
+    # 6. OOS text patterns — presence in raw HTML vs visible text. True-in-text
+    #    but False-in-html means the OOS wording is split across tags and the
+    #    raw-HTML _OOS_PATTERNS check would miss it.
+    for p in _OOS_PATTERNS:
+        in_html = p in html_lower
+        in_text = p in text
+        if in_html or in_text:
+            logger.info(f"[croma][diag] OOS pattern {p!r}: in_html={in_html} in_visible_text={in_text}")
+
+    # 7. Buy Now / Add-to-Cart button probe — logged here because the main
+    #    check() can return on stale InStock JSON-LD BEFORE it ever evaluates
+    #    button state, so the disabled-button signal would otherwise never
+    #    appear in the trail. Dumps the real classes/attrs + computed disabled.
+    btn_count = 0
+    for el in soup.find_all(["button", "a"]):
+        label = " ".join(filter(None, [
+            el.get_text(" ", strip=True),
+            el.get("aria-label", "") or "",
+            el.get("data-testid", "") or "",
+            el.get("id", "") or "",
+            " ".join(el.get("class", []) or []),
+        ])).lower()
+        if any(pat in label for pat in _ADD_PATTERNS):
+            logger.info(
+                f"[croma][diag] buy/cart <{el.name}> "
+                f"text={el.get_text(' ', strip=True)[:40]!r} class={el.get('class')} "
+                f"disabled_attr={el.get('disabled')!r} aria-disabled={el.get('aria-disabled')!r} "
+                f"style={el.get('style')!r} → _is_disabled={_is_disabled(el)}"
+            )
+            btn_count += 1
+            if btn_count >= 10:
+                break
+    if btn_count == 0:
+        logger.info("[croma][diag] no Buy Now / Add-to-Cart button matched")
+
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
