@@ -12,6 +12,7 @@ from aiogram.types import BotCommand
 from config import BOT_TOKEN, CHECK_INTERVAL
 from database import init_db, get_all_products, update_stock_status, get_user_primary_pincode
 from handlers import router
+from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import check_stock
 
 logging.basicConfig(
@@ -67,15 +68,10 @@ async def stock_checker_loop(bot: Bot):
                         )
                         update_stock_status(product["id"], now_in_stock)
                         if now_in_stock and not was_in_stock:
-                            target_price = product.get("target_price")
-                            should_alert = (
-                                target_price is None
-                                or current_price is None
-                                or current_price <= target_price
-                            )
-                            if should_alert:
+                            if should_alert_for_price(product, current_price):
                                 await send_stock_alert(bot, product, price=current_price)
                             else:
+                                target_price = product.get("target_price")
                                 logger.info(
                                     f"[bot] price gate: #{product['id']} in stock "
                                     f"@ ₹{current_price:,.0f} > target ₹{target_price:,.0f} — skipping alert"
@@ -103,29 +99,6 @@ async def stock_checker_loop(bot: Bot):
                 f"Cycle took {elapsed:.1f}s — longer than CHECK_INTERVAL "
                 f"({CHECK_INTERVAL}s); starting next cycle immediately"
             )
-
-
-async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
-    """Send an in-stock notification to the product owner."""
-    price_line = f"\n💰 <b>Current price: ₹{price:,.0f}</b>" if price is not None else ""
-    text = (
-        "🚨 <b>Back in Stock!</b>\n\n"
-        f"📦 <b>{product['name']}</b> is now available on "
-        f"<b>{product['site'].capitalize()}</b>!{price_line}\n\n"
-        f"🛒 <a href=\"{product['url']}\">Buy it now →</a>"
-    )
-    try:
-        await bot.send_message(
-            chat_id=product["user_id"],
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=False,
-        )
-        logger.info(
-            f"Alert sent to user {product['user_id']} for product #{product['id']}"
-        )
-    except Exception as exc:
-        logger.error(f"Failed to send alert: {exc}")
 
 
 # ---------------------------------------------------------------------------

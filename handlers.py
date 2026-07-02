@@ -26,6 +26,7 @@ from database import (
     update_stock_status,
     get_user_primary_pincode,
 )
+from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
 from config import SUPPORTED_SITES
 
@@ -149,19 +150,37 @@ async def _run_search(target: Message | CallbackQuery, user_id: int, keyword: st
 
 async def _parallel_check(
     products: list[dict],
+    bot,
     pincode: str | None = None,
     concurrency: int = 10,
 ) -> list[tuple[dict, bool]]:
     """Check multiple products concurrently, limited to `concurrency` at a time.
 
-    Default matches the Scrape.do plan's 10 concurrent-request limit.
+    Mirrors the background loop's (bot.py) was-in-stock vs now-in-stock
+    comparison: a manual check that finds an out-of-stock item now in stock
+    fires the same proactive send_stock_alert (respecting the Amazon price
+    gate) in addition to the chat reply built from the returned results —
+    so a genuine OOS -> in-stock transition is never missed just because a
+    user happened to check it manually before the next automatic cycle.
+
+    Default concurrency matches the Scrape.do plan's 10 concurrent-request limit.
     """
     sem = asyncio.Semaphore(concurrency)
 
     async def _one(p: dict) -> tuple[dict, bool]:
         async with sem:
-            result, _price = await check_stock(p["url"], p["site"], pincode=pincode)
+            was_in_stock = bool(p["in_stock"])
+            result, current_price = await check_stock(p["url"], p["site"], pincode=pincode)
             update_stock_status(p["id"], result)
+            if result and not was_in_stock:
+                if should_alert_for_price(p, current_price):
+                    await send_stock_alert(bot, p, price=current_price)
+                else:
+                    target_price = p.get("target_price")
+                    logger.info(
+                        f"[handlers] price gate: #{p['id']} in stock "
+                        f"@ ₹{current_price:,.0f} > target ₹{target_price:,.0f} — skipping alert"
+                    )
             return p, result
 
     return list(await asyncio.gather(*[_one(p) for p in products]))
@@ -610,7 +629,7 @@ async def callback_check_all_now(call: CallbackQuery):
     )
     await call.answer()
 
-    results = await _parallel_check(products, pincode=get_user_primary_pincode(user_id))
+    results = await _parallel_check(products, call.bot, pincode=get_user_primary_pincode(user_id))
     await call.message.edit_text(
         _format_check_results(results),
         parse_mode="HTML",
@@ -695,8 +714,22 @@ async def callback_check(call: CallbackQuery):
     await call.answer()
 
     pincode = get_user_primary_pincode(call.from_user.id)
+    was_in_stock = bool(product["in_stock"])
     in_stock, current_price = await check_stock(product["url"], product["site"], pincode=pincode)
     update_stock_status(product_id, in_stock)
+
+    # Mirror the background loop's transition check (bot.py): a manual check
+    # that discovers an OOS -> in-stock flip fires the same proactive alert,
+    # in addition to the chat reply below, so it's never silently missed.
+    if in_stock and not was_in_stock:
+        if should_alert_for_price(product, current_price):
+            await send_stock_alert(call.bot, product, price=current_price)
+        else:
+            target_price = product.get("target_price")
+            logger.info(
+                f"[handlers] price gate: #{product['id']} in stock "
+                f"@ ₹{current_price:,.0f} > target ₹{target_price:,.0f} — skipping alert"
+            )
 
     status_emoji = "✅" if in_stock else "❌"
     status_text = "IN STOCK" if in_stock else "OUT OF STOCK"
@@ -766,7 +799,7 @@ async def callback_sel_check_all(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await call.answer()
-    results = await _parallel_check(products, pincode=get_user_primary_pincode(user_id))
+    results = await _parallel_check(products, call.bot, pincode=get_user_primary_pincode(user_id))
     await call.message.edit_text(
         _format_check_results(results),
         parse_mode="HTML",
@@ -793,7 +826,7 @@ async def callback_sel_check_selected(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await call.answer()
-    results = await _parallel_check(products, pincode=get_user_primary_pincode(user_id))
+    results = await _parallel_check(products, call.bot, pincode=get_user_primary_pincode(user_id))
     await call.message.edit_text(
         _format_check_results(results),
         parse_mode="HTML",
