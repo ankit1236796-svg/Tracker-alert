@@ -25,10 +25,12 @@ from database import (
     get_product_by_id_for_user,
     update_stock_status,
     get_user_primary_pincode,
+    get_or_create_user,
 )
+from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
 from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
-from config import SUPPORTED_SITES
+from config import SUPPORTED_SITES, TRIAL_DAYS, ADMIN_USER_ID
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -100,10 +102,25 @@ async def _process_bulk(message: Message, entries: list[tuple[str, str]]) -> Non
     """Add a list of (name, url) pairs and send a summary reply."""
     user_id = message.from_user.id
     results = []
-    for name, url in entries:
+    for idx, (name, url) in enumerate(entries):
         site = detect_site(url)
         if site is None:
             results.append(f"❌ Unsupported site — <b>{name}</b>: <code>{url[:60]}</code>")
+            continue
+        # Re-checked per iteration (not once before the loop) so the item
+        # count reflects items already added earlier in this same bulk batch —
+        # otherwise a large paste could blow past the plan limit in one shot.
+        allowed, reason, limit_msg = check_can_add_item(user_id, site)
+        if not allowed:
+            if reason == REASON_ITEM_LIMIT:
+                # Every remaining item would fail identically — stop instead
+                # of repeating the same paragraph once per leftover item.
+                remaining = len(entries) - idx
+                results.append(
+                    f"🚫 Item limit reached — {remaining} remaining item(s) not added."
+                )
+                break
+            results.append(f"⚠️ {limit_msg} — <b>{name}</b>")
             continue
         ok, msg = add_product(user_id, name, url, site)
         if ok:
@@ -283,8 +300,38 @@ def _select_keyboard(products: list[dict], selected_ids: set[int]) -> InlineKeyb
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    user_id = message.from_user.id
+
+    # Admin doesn't have (or need) a trial/plan concept — always show the
+    # normal welcome, bypassing the access-status branch below entirely.
+    if user_id != ADMIN_USER_ID:
+        user_row = get_or_create_user(
+            user_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+        )
+        info = compute_access(user_row)
+        if not info.has_access:
+            # Locked / expired-grace: show ONLY the status + payment message —
+            # the feature list below is useless to them until they're renewed.
+            await message.answer(access_denied_text(info), parse_mode="HTML")
+            return
+        if info.status == "trial":
+            days_left = max(0, round(info.days_remaining or 0, 1))
+            trial_line = (
+                f"🎁 <b>Free trial active</b> — {days_left} day(s) left "
+                f"(started with a {TRIAL_DAYS}-day trial).\n\n"
+            )
+        else:
+            plan_name = info.plan["name"] if info.plan else "your plan"
+            days_left = max(0, round(info.days_remaining or 0, 1))
+            trial_line = f"✅ <b>{plan_name}</b> active — {days_left} day(s) left.\n\n"
+    else:
+        trial_line = ""
+
     await message.answer(
         "👋 <b>Welcome to Ankit's Stock Alert Bot!</b>\n\n"
+        + trial_line +
         "I monitor products on Amazon, Flipkart, Zepto, BigBasket, "
         "Blinkit, Croma, Instamart, and Myntra "
         "and alert you the moment they come back in stock.\n\n"
@@ -378,10 +425,18 @@ async def receive_link(message: Message, state: FSMContext):
     if len(urls) > 1:
         await state.clear()
         results = []
-        for url in urls:
+        for idx, url in enumerate(urls):
             site = detect_site(url)
             if site is None:
                 results.append(f"❌ Unsupported site: <code>{url[:60]}</code>")
+                continue
+            allowed, reason, limit_msg = check_can_add_item(user_id, site)
+            if not allowed:
+                if reason == REASON_ITEM_LIMIT:
+                    remaining = len(urls) - idx
+                    results.append(f"🚫 Item limit reached — {remaining} remaining URL(s) not added.")
+                    break
+                results.append(f"⚠️ {limit_msg}: <code>{url[:60]}</code>")
                 continue
             auto_name = _auto_name(url, site)
             ok, msg = add_product(user_id, auto_name, url, site)
@@ -414,6 +469,14 @@ async def receive_link(message: Message, state: FSMContext):
             "Please send a link from one of these sites.",
             parse_mode="HTML",
         )
+        return
+
+    # Checked here (before the Amazon target-price sub-flow) so a user who's
+    # already at their limit isn't walked through an extra step for nothing.
+    allowed, _reason, limit_msg = check_can_add_item(user_id, site)
+    if not allowed:
+        await state.clear()
+        await message.answer(limit_msg, parse_mode="HTML")
         return
 
     # ── Amazon: ask for optional target price before saving ─────────────────
@@ -470,6 +533,14 @@ async def receive_target_price(message: Message, state: FSMContext):
                 parse_mode="HTML",
             )
             return
+
+    # Re-checked here too (not just when the URL was first submitted) in case
+    # the user's plan/limit changed during the time spent typing a target price.
+    allowed, _reason, limit_msg = check_can_add_item(user_id, site)
+    if not allowed:
+        await state.clear()
+        await message.answer(limit_msg, parse_mode="HTML")
+        return
 
     ok, msg = add_product(user_id, name, url, site, target_price=target_price)
     await state.clear()

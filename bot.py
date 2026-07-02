@@ -7,12 +7,27 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
-from config import BOT_TOKEN, CHECK_INTERVAL
-from database import init_db, get_all_products, update_stock_status, get_user_primary_pincode
+from access import AccessControlMiddleware, compute_access, STATUS_TRIAL, STATUS_LOCKED
+from admin_handlers import router as admin_router
+from config import BOT_TOKEN, CHECK_INTERVAL, ADMIN_USER_ID, ACCESS_CHECK_INTERVAL, REMINDER_HOURS_BEFORE_EXPIRY
+from database import (
+    init_db,
+    get_all_products,
+    update_stock_status,
+    get_user_primary_pincode,
+    list_all_users,
+    mark_reminder_sent,
+    purge_user_data,
+)
 from handlers import router
-from notifications import send_stock_alert, should_alert_for_price
+from notifications import (
+    send_stock_alert,
+    should_alert_for_price,
+    send_expiry_reminder,
+    send_data_purged_notice,
+)
 from stock_checker import check_stock
 
 logging.basicConfig(
@@ -102,6 +117,69 @@ async def stock_checker_loop(bot: Bot):
 
 
 # ---------------------------------------------------------------------------
+# Access maintenance (expiry reminders + grace-period data purge)
+# ---------------------------------------------------------------------------
+
+async def run_access_maintenance_cycle(bot: Bot):
+    """
+    One pass over all users:
+    - Sends a one-time reminder to users within REMINDER_HOURS_BEFORE_EXPIRY of
+      their access_until (trial or paid). Tracked via reminder_sent_until so it
+      fires exactly once per expiry cycle — comparing against the CURRENT
+      access_until means it naturally re-arms the moment access is renewed.
+    - Permanently purges tracked items for users whose GRACE_PERIOD_DAYS window
+      (past access_until, with no admin block involved) has fully elapsed with
+      no renewal. purge_user_data is a no-op on an already-empty list, so this
+      is safe to re-run every cycle without double-purging or double-notifying.
+    Extracted from access_maintenance_loop so a single cycle is directly
+    testable without running the infinite loop.
+    """
+    users = list_all_users()
+    for u in users:
+        info = compute_access(u)
+
+        if info.has_access and info.days_remaining is not None:
+            hours_left = info.days_remaining * 24
+            if (
+                hours_left <= REMINDER_HOURS_BEFORE_EXPIRY
+                and u.get("reminder_sent_until") != u.get("access_until")
+            ):
+                await send_expiry_reminder(
+                    bot, u["user_id"], hours_left, info.status == STATUS_TRIAL
+                )
+                mark_reminder_sent(u["user_id"], u["access_until"])
+
+        elif info.status == STATUS_LOCKED and not u.get("blocked") and u.get("access_until"):
+            # LOCKED-by-time (not an admin block) past the full grace window —
+            # purge. Explicitly-blocked users are excluded: a block is a
+            # moderation action, not a billing lapse, and must never trigger
+            # data deletion on its own.
+            count = purge_user_data(u["user_id"])
+            if count:
+                logger.info(
+                    f"[access] purged {count} product(s) for expired user {u['user_id']}"
+                )
+                await send_data_purged_notice(bot, u["user_id"], count)
+
+
+async def access_maintenance_loop(bot: Bot):
+    """
+    Runs every ACCESS_CHECK_INTERVAL seconds (separate cadence from the stock
+    checker — this needs finer granularity than once/day so the
+    REMINDER_HOURS_BEFORE_EXPIRY window isn't missed, but every action in
+    run_access_maintenance_cycle is idempotent so running it often is harmless).
+    """
+    logger.info("Access maintenance loop started.")
+    while True:
+        try:
+            await run_access_maintenance_cycle(bot)
+        except Exception as exc:
+            logger.error(f"Access maintenance loop error: {exc}")
+
+        await asyncio.sleep(ACCESS_CHECK_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -118,8 +196,31 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="pins",   description="Manage your delivery pin codes"),
         BotCommand(command="cancel", description="Cancel the current operation"),
     ]
-    await bot.set_my_commands(commands)
-    logger.info(f"Registered {len(commands)} bot commands with Telegram")
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    logger.info(f"Registered {len(commands)} default bot commands with Telegram")
+
+    admin_commands = commands + [
+        BotCommand(command="addplan",     description="[admin] Create a plan"),
+        BotCommand(command="editplan",    description="[admin] Edit a plan field"),
+        BotCommand(command="listplans",   description="[admin] List all plans"),
+        BotCommand(command="deleteplan",  description="[admin] Delete an unused plan"),
+        BotCommand(command="setuserplan", description="[admin] Assign a user to a plan"),
+        BotCommand(command="approve",     description="[admin] Grant/extend access on a plan"),
+        BotCommand(command="reject",      description="[admin] Deny a user's access request"),
+        BotCommand(command="extend",      description="[admin] Add days without changing plan"),
+        BotCommand(command="block",       description="[admin] Lock a user out"),
+        BotCommand(command="unblock",     description="[admin] Restore a blocked user"),
+        BotCommand(command="pending",     description="[admin] Users in trial or awaiting approval"),
+        BotCommand(command="users",       description="[admin] List all users + status"),
+        BotCommand(command="finduser",    description="[admin] Full profile for one user"),
+        BotCommand(command="broadcast",   description="[admin] Message all active users"),
+        BotCommand(command="stats",       description="[admin] Usage & revenue summary"),
+    ]
+    # Scoped ONLY to the admin's own chat — regular users never see these in
+    # their Telegram "/" menu, on top of being functionally unreachable to
+    # them (admin_handlers.router is filtered to ADMIN_USER_ID).
+    await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_USER_ID))
+    logger.info(f"Registered {len(admin_commands)} admin commands scoped to chat {ADMIN_USER_ID}")
 
 
 async def main():
@@ -131,18 +232,35 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
+
+    # Registered on the Dispatcher itself (not a specific router) so it gates
+    # every update regardless of which router ends up handling it. Safe for
+    # admin commands too: the middleware unconditionally bypasses when
+    # user.id == ADMIN_USER_ID as its very first check.
+    access_middleware = AccessControlMiddleware()
+    dp.message.outer_middleware(access_middleware)
+    dp.callback_query.outer_middleware(access_middleware)
+
+    # admin_router first: its handlers are filtered to ADMIN_USER_ID only, so
+    # order relative to the main router doesn't affect regular users (command
+    # names don't overlap) but keeps admin commands resolving first for clarity.
+    dp.include_router(admin_router)
     dp.include_router(router)
 
     await register_commands(bot)
 
-    # Start the background checker as a concurrent task
+    # Background tasks: stock checking (existing) and access maintenance
+    # (reminders + grace-period purge) run as independent concurrent loops
+    # on their own cadences (CHECK_INTERVAL vs ACCESS_CHECK_INTERVAL).
     checker_task = asyncio.create_task(stock_checker_loop(bot))
+    access_task = asyncio.create_task(access_maintenance_loop(bot))
 
     logger.info("Bot is starting…")
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         checker_task.cancel()
+        access_task.cancel()
         await bot.session.close()
 
 
