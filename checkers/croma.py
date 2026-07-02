@@ -44,21 +44,34 @@ _OOS_PATTERNS = [
 _CART_CLASSES = ["add-to-cart", "addToCart", "plp-add-to-cart"]
 
 
+# Class tokens that indicate a button is in its DISABLED state on Croma.
+# IMPORTANT: 'disable-btn-in-pdp' is a STRUCTURAL hook class Croma renders on
+# the Buy Now / Add to Cart buttons in BOTH states, so it must NOT count as
+# disabled — matching the bare substring 'disable' (which it contains) flagged
+# active buttons as disabled and made every product read out-of-stock.
+# The real per-action disabled-state classes are 'disableBuyNow' /
+# 'disableCartBtn'; the generic 'disabled'/'inactive' markers are also honored.
+_DISABLED_CLASS_MARKERS = ("disabled", "inactive", "disablebuynow", "disablecartbtn")
+
+
 def _is_disabled(el) -> bool:
     """Return True if a BS4 element is visually/semantically disabled.
 
     Croma signals an OOS product's Buy Now / Add to Cart buttons ONLY via class
     names, not HTML attributes — e.g. class=['btn', 'disable-btn-in-pdp',
-    'disableBuyNow'] with disabled/aria-disabled/style all unset. Matching the
-    substring 'disable' (not the full word 'disabled') catches disableBuyNow,
-    disableCartBtn, and disable-btn-in-pdp, while still matching 'disabled'.
+    'disableBuyNow'] with disabled/aria-disabled/style all unset. We match the
+    specific per-action state classes (disableBuyNow / disableCartBtn) plus the
+    generic 'disabled'/'inactive' markers, but deliberately NOT the structural
+    'disable-btn-in-pdp' hook (present on active buttons too). Note 'disabled'
+    is matched with its trailing 'd', so it catches btn-disabled / is-disabled
+    without catching disable-btn-in-pdp.
     """
     if el.get("disabled") is not None:
         return True
     if el.get("aria-disabled", "").lower() == "true":
         return True
     classes = " ".join(el.get("class", [])).lower()
-    return "disable" in classes or "inactive" in classes
+    return any(marker in classes for marker in _DISABLED_CLASS_MARKERS)
 
 
 def _offer_availability(offers) -> str:
