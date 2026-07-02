@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
@@ -35,18 +36,22 @@ def _log_startup_checks():
 
 async def stock_checker_loop(bot: Bot):
     """
-    Runs every CHECK_INTERVAL seconds.
-    Checks all tracked products in parallel (max 3 concurrent Scrape.do calls).
+    Runs on a fixed CHECK_INTERVAL period measured from the start of each cycle,
+    so the interval is not stacked on top of the checking time — a full cycle
+    (checking + wait) targets CHECK_INTERVAL total rather than checking + interval.
+    Checks all tracked products in parallel (max 10 concurrent Scrape.do calls,
+    matching the plan's concurrency limit).
     Sends an alert when a product transitions from out-of-stock → in-stock.
     For Amazon items with a target_price, only alerts when price ≤ target.
     """
     logger.info("Stock checker loop started.")
     while True:
+        cycle_start = time.monotonic()
         try:
             products = get_all_products()
             logger.info(f"Checking {len(products)} product(s) in parallel…")
 
-            sem = asyncio.Semaphore(3)
+            sem = asyncio.Semaphore(10)
 
             async def _check_one(product: dict):
                 async with sem:
@@ -83,7 +88,21 @@ async def stock_checker_loop(bot: Bot):
         except Exception as exc:
             logger.error(f"Stock checker loop error: {exc}")
 
-        await asyncio.sleep(CHECK_INTERVAL)
+        # Sleep only the remainder of CHECK_INTERVAL, measured from cycle start,
+        # so total cycle time ≈ CHECK_INTERVAL instead of checking_time + CHECK_INTERVAL.
+        elapsed = time.monotonic() - cycle_start
+        sleep_for = CHECK_INTERVAL - elapsed
+        if sleep_for > 0:
+            logger.info(
+                f"Cycle finished in {elapsed:.1f}s; sleeping {sleep_for:.1f}s "
+                f"until next cycle (interval={CHECK_INTERVAL}s)"
+            )
+            await asyncio.sleep(sleep_for)
+        else:
+            logger.warning(
+                f"Cycle took {elapsed:.1f}s — longer than CHECK_INTERVAL "
+                f"({CHECK_INTERVAL}s); starting next cycle immediately"
+            )
 
 
 async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):

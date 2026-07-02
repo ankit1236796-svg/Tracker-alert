@@ -150,9 +150,12 @@ async def _run_search(target: Message | CallbackQuery, user_id: int, keyword: st
 async def _parallel_check(
     products: list[dict],
     pincode: str | None = None,
-    concurrency: int = 3,
+    concurrency: int = 10,
 ) -> list[tuple[dict, bool]]:
-    """Check multiple products concurrently, limited to `concurrency` at a time."""
+    """Check multiple products concurrently, limited to `concurrency` at a time.
+
+    Default matches the Scrape.do plan's 10 concurrent-request limit.
+    """
     sem = asyncio.Semaphore(concurrency)
 
     async def _one(p: dict) -> tuple[dict, bool]:
