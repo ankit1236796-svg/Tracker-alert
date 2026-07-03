@@ -104,8 +104,16 @@ async def _fetch_html(scraper_url: str, site: str) -> str:
         return html
 
 # Sites that need JS rendering
+#
+# Flipkart deliberately excluded: empirically verified via
+# compare_flipkart_render.py against 5 manually-confirmed products (3 OOS,
+# 2 in-stock) that render=false reproduces the same checkers.flipkart.check()
+# result as render=true in every case — JSON-LD availability and OOS/button
+# text both survive the non-rendered fetch. Cuts Flipkart from 5 credits to
+# 1 credit per Scrape.do request. If Flipkart's markup changes and this
+# stops holding, re-add "flipkart" here.
 _JS_SITES = {
-    "flipkart", "zepto", "bigbasket", "blinkit", "croma", "instamart", "myntra",
+    "zepto", "bigbasket", "blinkit", "croma", "instamart", "myntra",
     "jiomart", "reliancedigital", "oneplus",
 }
 

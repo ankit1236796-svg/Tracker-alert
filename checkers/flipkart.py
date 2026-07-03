@@ -4,7 +4,9 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-NEEDS_JS = True
+# See stock_checker.py's _JS_SITES for why this is False — empirically
+# verified that render=false reproduces render=true's check() result.
+NEEDS_JS = False
 
 _PRICE_CLASSES = [
     "_30jeq3", "Nx9bqj", "_25b18c", "_16Jk6d", "CxhGGd",
