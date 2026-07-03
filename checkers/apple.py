@@ -1,6 +1,12 @@
 import json
 import logging
+import re
+from urllib.parse import urlencode
+
+import httpx
 from bs4 import BeautifulSoup
+
+from .common import build_scraper_url
 
 logger = logging.getLogger(__name__)
 
@@ -61,3 +67,198 @@ def check(soup: BeautifulSoup, html: str) -> bool:
 
     logger.info("[apple] no conclusive signal → defaulting OUT OF STOCK (False)")
     return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Pincode-specific availability via Apple's PUBLIC fulfillment-messages API
+#
+# https://www.apple.com/in/shop/fulfillment-messages?parts.0=<SKU>&location=<pincode>
+# This is the exact endpoint Apple's own storefront JS calls to render nearby-
+# store pickup availability — confirmed via multiple independent, currently-
+# working third-party implementations (some India-specific), called with no
+# API key, no login, and no scraped/reverse-engineered internal app credential
+# (unlike the Blinkit/Zepto/JioMart cases, which were rejected for that reason).
+#
+# Design note — why an "unavailable" pickup signal never asserts OOS on its own:
+# Apple has very few physical retail stores in India (a handful of metro
+# cities), while its courier delivery network covers far more pincodes. So
+# "no store shows pickup availability near this pincode" is the COMMON case
+# for most Indian pincodes and does NOT reliably mean the product can't be
+# bought/delivered there — it just means pickup data isn't informative here.
+# Treating that as OOS would create systematic false negatives for most users.
+# The pincode-specific lookup is therefore used ONLY to CONFIRM in-stock when
+# it can (a genuine, pincode-specific positive signal); any inconclusive or
+# negative pickup result falls back to the existing generic page-based check()
+# — so accuracy is never worse than before, only better when it can confirm.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_FULFILLMENT_URL = "https://www.apple.com/in/shop/fulfillment-messages"
+_FULFILLMENT_TIMEOUT = 20.0
+
+# Apple part numbers ("SKUs") are alphanumeric, always ending in a 2-letter
+# country code + "/A" (e.g. "MG6M4HN/A" for India). Matched generically rather
+# than hardcoding "HN" since not every listed product's SKU is guaranteed to
+# follow that exact regional suffix.
+_SKU_INLINE_PATTERN = re.compile(r'"partNumber"\s*:\s*"([A-Z0-9]{5,14}/A)"')
+_SKU_JSONLD_INLINE_PATTERN = re.compile(r'"sku"\s*:\s*"([A-Z0-9]{5,14}/A)"')
+
+
+def _extract_sku(soup: BeautifulSoup, html: str) -> str | None:
+    """
+    Extract Apple's public SKU/part number from the already-fetched product
+    page — no extra request needed. It's visible in both the JSON-LD block
+    and the page's inline JS config. Tried in order; logs which method (if
+    any) succeeded so a page-structure change is visible in Railway logs.
+    """
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if not isinstance(item, dict):
+                continue
+            sku = item.get("sku") or (item.get("offers") or {}).get("sku")
+            if sku:
+                logger.info(f"[apple][resolve] SKU from JSON-LD: {sku!r}")
+                return str(sku)
+
+    m = _SKU_INLINE_PATTERN.search(html)
+    if m:
+        logger.info(f"[apple][resolve] SKU from inline partNumber: {m.group(1)!r}")
+        return m.group(1)
+
+    m = _SKU_JSONLD_INLINE_PATTERN.search(html)
+    if m:
+        logger.info(f"[apple][resolve] SKU from inline sku field: {m.group(1)!r}")
+        return m.group(1)
+
+    logger.warning("[apple][resolve] could not extract SKU/part number from product page")
+    return None
+
+
+def _build_fulfillment_target(sku: str, pincode: str) -> str:
+    params = {
+        "fae": "true",
+        "pl": "true",
+        "mts.0": "regular",
+        "parts.0": sku,
+        "location": pincode,
+    }
+    return f"{_FULFILLMENT_URL}?{urlencode(params)}"
+
+
+async def _fetch_pickup_availability(sku: str, pincode: str) -> dict | None:
+    """
+    Calls Apple's public fulfillment-messages API. Returns the raw parsed
+    JSON, or None on any failure (network error, non-200, non-JSON response —
+    e.g. a block/challenge page). Never raises; the caller falls back to the
+    generic page-based check() on None.
+    """
+    target = _build_fulfillment_target(sku, pincode)
+    # render_js=False: this is a JSON API endpoint, not a page needing a
+    # headless-browser render (same reasoning as Blinkit's autoSuggest/info
+    # calls) — and every working third-party implementation calls it cold,
+    # with no special headers/cookies required.
+    scraper_url = build_scraper_url(target, render_js=False)
+    logger.info(f"[apple][resolve] fulfillment-messages target={target!r}")
+
+    try:
+        async with httpx.AsyncClient(timeout=_FULFILLMENT_TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(scraper_url)
+    except Exception as exc:
+        logger.warning(f"[apple][resolve] fulfillment-messages request failed: {exc}")
+        return None
+
+    logger.info(f"[apple][resolve] fulfillment-messages status={resp.status_code}")
+    if resp.status_code != 200:
+        logger.warning(
+            f"[apple][resolve] fulfillment-messages HTTP {resp.status_code}: {resp.text[:200]!r}"
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning(
+            f"[apple][resolve] fulfillment-messages non-JSON response "
+            f"(likely a block/challenge page): {resp.text[:300]!r}"
+        )
+        return None
+
+    return data
+
+
+def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
+    """
+    True  - at least one nearby store shows this SKU as pickup available/
+             eligible: a genuine, pincode-specific confirmation of in-stock.
+    None  - inconclusive: no stores found near this pincode (the common case
+             for most Indian pincodes — see module docstring), an
+             "unavailable" pickup result (not treated as OOS, for the same
+             reason), or an unexpected response shape. Caller falls back to
+             the generic check() rather than risk a false OOS.
+    """
+    logger.info(f"[apple][resolve] raw fulfillment response (truncated): {str(data)[:500]!r}")
+
+    stores = (
+        (data.get("body") or {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
+    )
+    logger.info(f"[apple][resolve] {len(stores)} store(s) returned for this pincode")
+
+    if not stores:
+        logger.info(
+            "[apple][resolve] no stores found near this pincode (common in India's "
+            "sparse Apple Store network) — inconclusive, falling back to generic check"
+        )
+        return None
+
+    for store in stores:
+        part_info = (store.get("partsAvailability") or {}).get(sku, {})
+        pickup_display = part_info.get("pickupDisplay", "")
+        logger.info(
+            f"[apple][resolve] store={store.get('storeName')!r} "
+            f"pickupDisplay={pickup_display!r}"
+        )
+        if pickup_display in ("available", "eligible"):
+            logger.info(
+                f"[apple][resolve] confirmed available at {store.get('storeName')!r} → True"
+            )
+            return True
+
+    logger.info(
+        "[apple][resolve] no store shows pickup availability for this SKU — NOT "
+        "treated as OOS (pickup-only signal; courier delivery coverage is wider "
+        "than pickup in India); falling back to generic check"
+    )
+    return None
+
+
+async def refine_with_pincode(
+    soup: BeautifulSoup, html: str, pincode: str, generic_result: bool
+) -> bool:
+    """
+    Called from stock_checker.py when a pincode is available for an Apple
+    product. Tries to CONFIRM in-stock via the public fulfillment-messages
+    API; never downgrades the result to OOS based on pincode data alone —
+    worst case (SKU not found, API fails, no stores nearby, or nothing
+    available for pickup), it returns generic_result unchanged, so accuracy
+    is never worse than the pre-existing page-based check.
+    """
+    sku = _extract_sku(soup, html)
+    if not sku:
+        logger.warning(
+            "[apple][resolve] no SKU extracted — cannot run pincode-specific "
+            "lookup, falling back to generic check"
+        )
+        return generic_result
+
+    data = await _fetch_pickup_availability(sku, pincode)
+    if data is None:
+        return generic_result
+
+    pincode_result = _evaluate_pickup_availability(data, sku)
+    if pincode_result is None:
+        return generic_result
+
+    return pincode_result

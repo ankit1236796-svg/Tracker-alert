@@ -11,6 +11,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from checkers import detect_site, build_scraper_url, HEADERS, CHECKER_MAP, PRICE_EXTRACTOR_MAP
+from checkers import apple as apple_checker
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,18 @@ async def check_stock(url: str, site: str, pincode: str | None = None) -> tuple[
                 f"geolocation, not the user's delivery area. "
                 f"Use /pins to add a pincode for more accurate results."
             )
+    elif site == "apple":
+        # Apple uses a genuinely public API (no cookie/session needed) — see
+        # checkers/apple.py:refine_with_pincode. It runs AFTER the main page
+        # fetch below (it needs the SKU extracted from that page), not here.
+        if pincode:
+            logger.info(f"[apple] pincode={pincode!r} set — will attempt pincode-specific pickup lookup")
+        else:
+            logger.warning(
+                f"[apple] no pincode set — stock reflects the generic product page "
+                f"only (JSON-LD/Add to Bag/OOS text), not pincode-specific pickup "
+                f"availability. Use /pins to add a pincode for more accurate results."
+            )
 
     try:
         scraper_url = build_scraper_url(url, render_js=site in _JS_SITES, set_cookies=set_cookies)
@@ -137,6 +150,11 @@ async def check_stock(url: str, site: str, pincode: str | None = None) -> tuple[
         html = response.text
         soup = BeautifulSoup(html, "html.parser")
         result = checker(soup, html)
+
+        if site == "apple" and pincode:
+            result = await apple_checker.refine_with_pincode(
+                soup, html, pincode, generic_result=result
+            )
 
         price: float | None = None
         price_extractor = PRICE_EXTRACTOR_MAP.get(site)
