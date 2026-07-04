@@ -41,7 +41,7 @@ PLAYWRIGHT_TIMEOUT = 30000  # ms
 SUPPORTED_SITES = {
     "amazon":          ["amazon.in", "amazon.com"],
     "flipkart":        ["flipkart.com"],
-    "zepto":           ["zeptonow.com"],
+    "zepto":           ["zeptonow.com", "zepto.com"],
     "bigbasket":       ["bigbasket.com"],
     "blinkit":         ["blinkit.com"],
     "croma":           ["croma.com"],
