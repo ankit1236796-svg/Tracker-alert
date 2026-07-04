@@ -332,10 +332,9 @@ async def cmd_start(message: Message):
         trial_line = ""
 
     await message.answer(
-        "👋 <b>Welcome to Ankit's Stock Alert Bot!</b>\n\n"
+        "👋 <b>Welcome to Ullu Alert!</b>\n\n"
         + trial_line +
-        "I monitor products on Amazon, Flipkart, Zepto, BigBasket, "
-        "Blinkit, Croma, Instamart, and Myntra "
+        "I monitor products on multiple online shopping sites "
         "and alert you the moment they come back in stock.\n\n"
         "<b>Commands:</b>\n"
         "  /add     – Track product(s); bulk format: <code>Name | URL</code> one per line\n"
