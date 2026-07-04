@@ -20,6 +20,11 @@ REMINDER_HOURS_BEFORE_EXPIRY = int(os.getenv("REMINDER_HOURS_BEFORE_EXPIRY", "6"
 # is idempotent so running it this often is harmless.
 ACCESS_CHECK_INTERVAL = int(os.getenv("ACCESS_CHECK_INTERVAL", "1800"))  # 30 min default
 
+# Number of WhatsApp share+confirm rounds required before /freetrial's
+# one-time trial bonus can be claimed — see database.py's
+# increment_share_trial_round / activate_share_trial.
+SHARE_TRIAL_ROUNDS_REQUIRED = int(os.getenv("SHARE_TRIAL_ROUNDS_REQUIRED", "5"))
+
 # Playwright settings
 PLAYWRIGHT_HEADLESS = True
 PLAYWRIGHT_TIMEOUT = 30000  # ms

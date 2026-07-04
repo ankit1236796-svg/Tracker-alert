@@ -176,6 +176,16 @@ def access_denied_text(info: AccessInfo) -> str:
             "🚫 <b>Your access has been blocked by the admin.</b>\n\n"
             "If you believe this is a mistake, please contact the admin."
         )
+    if info.status == STATUS_LOCKED and info.days_remaining is None:
+        # access_until was never set at all — distinct from "trial ended"
+        # below (which only fires once access_until holds a real past date).
+        # Since get_or_create_user no longer auto-grants a trial, this is now
+        # the normal state for every brand-new user.
+        return (
+            "👋 <b>You don't have an active trial yet.</b>\n\n"
+            "Use /freetrial to get a free trial by sharing Ullu Alert on "
+            "WhatsApp, or contact the admin for manual approval."
+        )
     if info.status == STATUS_EXPIRED_GRACE:
         grace_left = int(info.grace_days_remaining) if info.grace_days_remaining else 0
         return (

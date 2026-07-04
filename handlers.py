@@ -28,11 +28,14 @@ from database import (
     get_or_create_user,
     has_used_share_trial,
     activate_share_trial,
+    get_share_trial_rounds,
+    increment_share_trial_round,
+    reset_share_trial_rounds,
 )
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
 from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
-from config import SUPPORTED_SITES, TRIAL_DAYS, ADMIN_USER_ID
+from config import SUPPORTED_SITES, TRIAL_DAYS, ADMIN_USER_ID, SHARE_TRIAL_ROUNDS_REQUIRED
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -357,10 +360,18 @@ async def cmd_start(message: Message):
 # /freetrial – WhatsApp-share-gated one-time trial bonus
 # ---------------------------------------------------------------------------
 
-def _freetrial_share_text() -> str:
+def _freetrial_round_text(rounds_done: int) -> str:
+    round_num = min(rounds_done + 1, SHARE_TRIAL_ROUNDS_REQUIRED)
+    if rounds_done == 0:
+        progress_line = (
+            f"Share Ullu Alert with a friend or group on WhatsApp, then confirm "
+            f"below — do this {SHARE_TRIAL_ROUNDS_REQUIRED} times to unlock your free trial.\n\n"
+        )
+    else:
+        progress_line = f"✅ {rounds_done}/{SHARE_TRIAL_ROUNDS_REQUIRED} shares done — keep going!\n\n"
     return (
-        "🎁 <b>Get a free trial!</b>\n\n"
-        "Share Ullu Alert with 5 friends or groups on WhatsApp, then confirm below.\n\n"
+        f"🎁 <b>Get a free trial!</b> (Round {round_num} of {SHARE_TRIAL_ROUNDS_REQUIRED})\n\n"
+        + progress_line +
         "Once done, tap the button below:"
     )
 
@@ -369,15 +380,32 @@ async def _freetrial_share_keyboard(bot) -> InlineKeyboardMarkup:
     me = await bot.get_me()
     bot_link = f"https://t.me/{me.username}"
     share_text = (
-        f"🎁 I'm using Ullu Alert to track out-of-stock products and get notified "
-        f"the instant they're back in stock! Try it free: {bot_link}"
+        f"🚨 PS5 restock? New iPhone drop? Don't miss it again!\n\n"
+        f"I use Ullu Alert (100% FREE) — it watches products 24/7 and pings me "
+        f"the SECOND they're back in stock, so I never miss a restock. 🔥\n\n"
+        f"Try it free: {bot_link}"
     )
     wa_url = f"https://wa.me/?text={quote(share_text)}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Share on WhatsApp", url=wa_url)],
-        [InlineKeyboardButton(text="✅ I've shared it", callback_data="freetrial:shared")],
+        [InlineKeyboardButton(text="✅ Done", callback_data="freetrial:done")],
     ])
 
+
+_FREETRIAL_CONFIRM_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="✅ Yes, I confirm", callback_data="freetrial:confirm"),
+        InlineKeyboardButton(text="🔄 Retry", callback_data="freetrial:retry"),
+    ]
+])
+
+_FREETRIAL_CONFIRM_TEXT = (
+    f"⚠️ <b>Are you sure you shared this in {SHARE_TRIAL_ROUNDS_REQUIRED} "
+    f"WhatsApp groups/contacts?</b>\n\n"
+    "Cheating will result in your free trial being denied and you may be "
+    "permanently banned from future free trials.\n\n"
+    "Do you still want to confirm?"
+)
 
 _FREETRIAL_ALREADY_USED_TEXT = (
     "🚫 <b>You've already used this offer.</b>\n\n"
@@ -403,46 +431,56 @@ async def cmd_freetrial(message: Message):
         await message.answer(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
         return
 
+    # Resume wherever this user left off (rounds persist in the DB across
+    # restarts/breaks) rather than restarting the cycle on every /freetrial call.
+    rounds_done = get_share_trial_rounds(user_id)
+    if rounds_done >= SHARE_TRIAL_ROUNDS_REQUIRED:
+        await message.answer(
+            _FREETRIAL_CONFIRM_TEXT, parse_mode="HTML", reply_markup=_FREETRIAL_CONFIRM_KEYBOARD
+        )
+        return
+
     await message.answer(
-        _freetrial_share_text(),
+        _freetrial_round_text(rounds_done),
         parse_mode="HTML",
         reply_markup=await _freetrial_share_keyboard(message.bot),
         disable_web_page_preview=True,
     )
 
 
-@router.callback_query(F.data == "freetrial:shared")
-async def callback_freetrial_shared(call: CallbackQuery):
-    if has_used_share_trial(call.from_user.id):
+@router.callback_query(F.data == "freetrial:done")
+async def callback_freetrial_done(call: CallbackQuery):
+    user_id = call.from_user.id
+    if has_used_share_trial(user_id):
         await call.message.edit_text(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
         await call.answer()
         return
 
-    await call.message.edit_text(
-        "⚠️ <b>Are you sure you shared this in 5 WhatsApp groups/contacts?</b>\n\n"
-        "Cheating will result in your free trial being denied and you may be "
-        "permanently banned from future free trials.\n\n"
-        "Do you still want to confirm?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Yes, I confirm", callback_data="freetrial:confirm"),
-                InlineKeyboardButton(text="🔄 Retry", callback_data="freetrial:retry"),
-            ]
-        ]),
-    )
+    rounds_done = increment_share_trial_round(user_id)
+    if rounds_done >= SHARE_TRIAL_ROUNDS_REQUIRED:
+        await call.message.edit_text(
+            _FREETRIAL_CONFIRM_TEXT, parse_mode="HTML", reply_markup=_FREETRIAL_CONFIRM_KEYBOARD
+        )
+    else:
+        await call.message.edit_text(
+            _freetrial_round_text(rounds_done),
+            parse_mode="HTML",
+            reply_markup=await _freetrial_share_keyboard(call.bot),
+        )
     await call.answer()
 
 
 @router.callback_query(F.data == "freetrial:retry")
 async def callback_freetrial_retry(call: CallbackQuery):
-    if has_used_share_trial(call.from_user.id):
+    user_id = call.from_user.id
+    if has_used_share_trial(user_id):
         await call.message.edit_text(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
         await call.answer()
         return
 
+    reset_share_trial_rounds(user_id)
     await call.message.edit_text(
-        _freetrial_share_text(),
+        _freetrial_round_text(0),
         parse_mode="HTML",
         reply_markup=await _freetrial_share_keyboard(call.bot),
     )
@@ -451,10 +489,22 @@ async def callback_freetrial_retry(call: CallbackQuery):
 
 @router.callback_query(F.data == "freetrial:confirm")
 async def callback_freetrial_confirm(call: CallbackQuery):
-    granted, updated = activate_share_trial(call.from_user.id)
+    user_id = call.from_user.id
+    granted, updated = activate_share_trial(user_id)
 
     if not granted:
-        await call.message.edit_text(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
+        if has_used_share_trial(user_id):
+            await call.message.edit_text(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
+        else:
+            # Rounds incomplete (e.g. a stale button tapped after a Retry
+            # reset the counter elsewhere) — send them back to the real
+            # current round instead of silently failing.
+            rounds_done = get_share_trial_rounds(user_id)
+            await call.message.edit_text(
+                _freetrial_round_text(rounds_done),
+                parse_mode="HTML",
+                reply_markup=await _freetrial_share_keyboard(call.bot),
+            )
         await call.answer()
         return
 

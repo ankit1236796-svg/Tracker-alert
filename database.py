@@ -3,7 +3,7 @@ import sqlite3
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from config import DB_PATH, TRIAL_DAYS
+from config import DB_PATH, TRIAL_DAYS, SHARE_TRIAL_ROUNDS_REQUIRED
 
 logger = logging.getLogger(__name__)
 
@@ -15,12 +15,6 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def now_ist_str() -> str:
     """Current time in IST as a 'YYYY-MM-DD HH:MM:SS' string for storage."""
     return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def ist_str_plus(days: float = 0, hours: float = 0) -> str:
-    """IST timestamp string offset by the given days/hours from now — used for
-    trial/access expiry deadlines."""
-    return (datetime.now(IST) + timedelta(days=days, hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_ist(raw: str) -> datetime:
@@ -123,6 +117,16 @@ def init_db():
         # free trial (see /freetrial in handlers.py) — one claim per account.
         try:
             conn.execute("ALTER TABLE users ADD COLUMN share_trial_used INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # Migration: add share_trial_rounds_done counter for the 5-round
+        # share+confirm cycle /freetrial requires before the bonus can be
+        # claimed. Stored in the DB (not FSM/in-memory state) so progress
+        # survives a bot restart or the user taking a break between shares.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN share_trial_rounds_done INTEGER NOT NULL DEFAULT 0")
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
@@ -423,29 +427,27 @@ def get_or_create_user(
     user_id: int, username: str | None = None, first_name: str | None = None
 ) -> dict:
     """
-    Returns the user's access row, creating it with a fresh TRIAL_DAYS trial
-    on first sight (called from /start). Keeps username/first_name current on
-    every call since Telegram profiles can change.
+    Returns the user's access row, creating a bare row with NO access granted
+    on first sight (plan_id/access_until stay NULL) — no automatic trial.
+    The only ways to gain access are the /freetrial WhatsApp-share flow
+    (see activate_share_trial) or manual admin approval (see grant_access).
+    Keeps username/first_name current on every call since Telegram profiles
+    can change.
     """
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
         if row is None:
-            trial_plan = conn.execute(
-                "SELECT id FROM plans WHERE is_trial_plan = 1 AND is_active = 1 LIMIT 1"
-            ).fetchone()
-            plan_id = trial_plan["id"] if trial_plan else None
-            access_until = ist_str_plus(days=TRIAL_DAYS)
             conn.execute(
                 """
                 INSERT INTO users
                     (user_id, username, first_name, plan_id, is_trial, access_until, blocked, created_at)
-                VALUES (?, ?, ?, ?, 1, ?, 0, ?)
+                VALUES (?, ?, ?, NULL, 0, NULL, 0, ?)
                 """,
-                (user_id, username, first_name, plan_id, access_until, now_ist_str()),
+                (user_id, username, first_name, now_ist_str()),
             )
             conn.commit()
             row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-            logger.info(f"New user {user_id} started a {TRIAL_DAYS}-day trial until {access_until}")
+            logger.info(f"New user {user_id} created with no access — must use /freetrial or await admin approval")
         elif username != row["username"] or first_name != row["first_name"]:
             conn.execute(
                 "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
@@ -549,26 +551,72 @@ def has_used_share_trial(user_id: int) -> bool:
     return bool(row and row.get("share_trial_used"))
 
 
+def get_share_trial_rounds(user_id: int) -> int:
+    """How many of the SHARE_TRIAL_ROUNDS_REQUIRED share+confirm rounds this
+    user has completed so far (0 for a user who hasn't started, or has none)."""
+    row = get_user(user_id)
+    return (row.get("share_trial_rounds_done") or 0) if row else 0
+
+
+def increment_share_trial_round(user_id: int) -> int:
+    """
+    Advance this user's share-trial round counter by 1, capped at
+    SHARE_TRIAL_ROUNDS_REQUIRED. Returns the new count. Stored in the DB
+    (not FSM/in-memory state) so a user can close the app between shares and
+    resume exactly where they left off, even across a bot restart.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT share_trial_rounds_done FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        current = (row["share_trial_rounds_done"] or 0) if row else 0
+        new_count = min(current + 1, SHARE_TRIAL_ROUNDS_REQUIRED)
+        conn.execute(
+            "UPDATE users SET share_trial_rounds_done = ? WHERE user_id = ?",
+            (new_count, user_id),
+        )
+        conn.commit()
+    return new_count
+
+
+def reset_share_trial_rounds(user_id: int) -> None:
+    """Reset the share-trial round counter to 0 (used by /freetrial's Retry button)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET share_trial_rounds_done = 0 WHERE user_id = ?", (user_id,)
+        )
+        conn.commit()
+
+
 def activate_share_trial(user_id: int) -> tuple[bool, Optional[dict]]:
     """
     One-time WhatsApp-share-gated trial bonus (see /freetrial in handlers.py).
-    Returns (granted, row): granted=False (row unchanged) if this user already
-    claimed it before or has no user row yet — the check-and-set happens
-    inside this one DB call so it's the single source of truth (safe against
-    a double-tapped confirm button), not just the handler-level UX checks.
+    Returns (granted, row): granted=False (row unchanged) if this user
+    already claimed it before, hasn't completed all SHARE_TRIAL_ROUNDS_REQUIRED
+    share+confirm rounds yet, or has no user row at all — the check-and-set
+    happens inside this one DB call so it's the single source of truth (safe
+    against a double-tapped confirm button), not just the handler-level UX
+    checks.
 
     Stacks TRIAL_DAYS onto access_until using the same "extend from whichever
-    is later: now or the current expiry" logic as grant_access, but WITHOUT
-    touching plan_id/is_trial — this is a bonus-days grant, not a plan
-    change, so a paying customer keeps their plan tier and a trial/locked-out
-    user's existing classification is preserved either way.
+    is later: now or the current expiry" logic as grant_access. If this user
+    never had any access before (access_until was NULL — the common case now
+    that get_or_create_user no longer auto-grants a trial), this IS their
+    first real trial: the trial plan and is_trial=1 are assigned, exactly as
+    the old auto-grant used to do, so item-limit enforcement and /start's
+    "Free trial active" label work correctly. If they already have (or had)
+    real access — an admin-assigned paid plan, most likely — plan_id/is_trial
+    are left untouched: this is a bonus-days grant on top, not a plan change.
     """
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
         if row is None or row["share_trial_used"]:
             return False, (dict(row) if row else None)
+        if (row["share_trial_rounds_done"] or 0) < SHARE_TRIAL_ROUNDS_REQUIRED:
+            return False, dict(row)
 
         now = datetime.now(IST)
+        never_had_access = not row["access_until"]
         base = now
         if row["access_until"]:
             try:
@@ -579,10 +627,24 @@ def activate_share_trial(user_id: int) -> tuple[bool, Optional[dict]]:
                 pass
         new_until = (base + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
-        conn.execute(
-            "UPDATE users SET access_until = ?, share_trial_used = 1 WHERE user_id = ?",
-            (new_until, user_id),
-        )
+        if never_had_access:
+            trial_plan = conn.execute(
+                "SELECT id FROM plans WHERE is_trial_plan = 1 AND is_active = 1 LIMIT 1"
+            ).fetchone()
+            plan_id = trial_plan["id"] if trial_plan else row["plan_id"]
+            conn.execute(
+                """
+                UPDATE users
+                SET plan_id = ?, is_trial = 1, access_until = ?, share_trial_used = 1
+                WHERE user_id = ?
+                """,
+                (plan_id, new_until, user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET access_until = ?, share_trial_used = 1 WHERE user_id = ?",
+                (new_until, user_id),
+            )
         conn.commit()
         updated = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
 
