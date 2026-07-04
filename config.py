@@ -25,6 +25,14 @@ ACCESS_CHECK_INTERVAL = int(os.getenv("ACCESS_CHECK_INTERVAL", "1800"))  # 30 mi
 # increment_share_trial_round / activate_share_trial.
 SHARE_TRIAL_ROUNDS_REQUIRED = int(os.getenv("SHARE_TRIAL_ROUNDS_REQUIRED", "5"))
 
+# Telegram never notifies a bot when a `url`-type inline button (like "Share
+# on WhatsApp") is tapped — there's no event to detect it. This delay is the
+# closest available approximation: the "Done" button for each /freetrial
+# round is withheld for this many seconds after the share button appears, so
+# it can't be spammed through instantly without at least a brief pause. It
+# does NOT verify an actual share happened.
+SHARE_TRIAL_TAP_DELAY_SECONDS = int(os.getenv("SHARE_TRIAL_TAP_DELAY_SECONDS", "3"))
+
 # Playwright settings
 PLAYWRIGHT_HEADLESS = True
 PLAYWRIGHT_TIMEOUT = 30000  # ms

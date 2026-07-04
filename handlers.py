@@ -35,7 +35,13 @@ from database import (
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
 from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
-from config import SUPPORTED_SITES, TRIAL_DAYS, ADMIN_USER_ID, SHARE_TRIAL_ROUNDS_REQUIRED
+from config import (
+    SUPPORTED_SITES,
+    TRIAL_DAYS,
+    ADMIN_USER_ID,
+    SHARE_TRIAL_ROUNDS_REQUIRED,
+    SHARE_TRIAL_TAP_DELAY_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -372,24 +378,76 @@ def _freetrial_round_text(rounds_done: int) -> str:
     return (
         f"🎁 <b>Get a free trial!</b> (Round {round_num} of {SHARE_TRIAL_ROUNDS_REQUIRED})\n\n"
         + progress_line +
-        "Once done, tap the button below:"
+        "⏳ Tap <b>Share on WhatsApp</b> below — the <b>Done</b> button "
+        "appears a few seconds after."
     )
 
 
-async def _freetrial_share_keyboard(bot) -> InlineKeyboardMarkup:
+async def _freetrial_bot_link(bot) -> str:
     me = await bot.get_me()
-    bot_link = f"https://t.me/{me.username}"
+    return f"https://t.me/{me.username}"
+
+
+def _freetrial_wa_url(bot_link: str) -> str:
     share_text = (
         f"🚨 PS5 restock? New iPhone drop? Don't miss it again!\n\n"
         f"I use Ullu Alert (100% FREE) — it watches products 24/7 and pings me "
         f"the SECOND they're back in stock, so I never miss a restock. 🔥\n\n"
         f"Try it free: {bot_link}"
     )
-    wa_url = f"https://wa.me/?text={quote(share_text)}"
+    return f"https://wa.me/?text={quote(share_text)}"
+
+
+def _freetrial_share_only_keyboard(bot_link: str) -> InlineKeyboardMarkup:
+    """Round's initial keyboard: Share button only. "Done" isn't there yet —
+    see _reveal_done_button. Telegram gives the bot no event when a `url`
+    button is tapped, so this delay is the closest available approximation
+    to "must tap Share before Done," not a real verification of it."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Share on WhatsApp", url=wa_url)],
+        [InlineKeyboardButton(text="📤 Share on WhatsApp", url=_freetrial_wa_url(bot_link))],
+    ])
+
+
+def _freetrial_full_keyboard(bot_link: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Share on WhatsApp", url=_freetrial_wa_url(bot_link))],
         [InlineKeyboardButton(text="✅ Done", callback_data="freetrial:done")],
     ])
+
+
+async def _reveal_done_button(bot, message: Message, user_id: int, expected_rounds_done: int) -> None:
+    """
+    Waits SHARE_TRIAL_TAP_DELAY_SECONDS, then adds the "Done" button to this
+    round's message — unless the user has since moved on (retried, or
+    somehow already claimed) before the delay elapsed, in which case that
+    newer state's own reveal task owns showing Done and this one no-ops.
+    """
+    await asyncio.sleep(SHARE_TRIAL_TAP_DELAY_SECONDS)
+    if has_used_share_trial(user_id):
+        return
+    if get_share_trial_rounds(user_id) != expected_rounds_done:
+        return
+    bot_link = await _freetrial_bot_link(bot)
+    try:
+        await message.edit_reply_markup(reply_markup=_freetrial_full_keyboard(bot_link))
+    except Exception:
+        pass  # message may have been edited/deleted already
+
+
+async def _show_round(target: Message, bot, user_id: int, rounds_done: int, *, is_new_message: bool) -> None:
+    """Show a round's share screen (Share-only at first) and schedule the
+    delayed reveal of the Done button. `target` is the Message to send a new
+    reply from (cmd_freetrial) or edit in place (callback handlers)."""
+    bot_link = await _freetrial_bot_link(bot)
+    text = _freetrial_round_text(rounds_done)
+    keyboard = _freetrial_share_only_keyboard(bot_link)
+    if is_new_message:
+        sent = await target.answer(
+            text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True
+        )
+    else:
+        sent = await target.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    asyncio.create_task(_reveal_done_button(bot, sent, user_id, rounds_done))
 
 
 _FREETRIAL_CONFIRM_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
@@ -440,12 +498,7 @@ async def cmd_freetrial(message: Message):
         )
         return
 
-    await message.answer(
-        _freetrial_round_text(rounds_done),
-        parse_mode="HTML",
-        reply_markup=await _freetrial_share_keyboard(message.bot),
-        disable_web_page_preview=True,
-    )
+    await _show_round(message, message.bot, user_id, rounds_done, is_new_message=True)
 
 
 @router.callback_query(F.data == "freetrial:done")
@@ -462,11 +515,7 @@ async def callback_freetrial_done(call: CallbackQuery):
             _FREETRIAL_CONFIRM_TEXT, parse_mode="HTML", reply_markup=_FREETRIAL_CONFIRM_KEYBOARD
         )
     else:
-        await call.message.edit_text(
-            _freetrial_round_text(rounds_done),
-            parse_mode="HTML",
-            reply_markup=await _freetrial_share_keyboard(call.bot),
-        )
+        await _show_round(call.message, call.bot, user_id, rounds_done, is_new_message=False)
     await call.answer()
 
 
@@ -479,11 +528,7 @@ async def callback_freetrial_retry(call: CallbackQuery):
         return
 
     reset_share_trial_rounds(user_id)
-    await call.message.edit_text(
-        _freetrial_round_text(0),
-        parse_mode="HTML",
-        reply_markup=await _freetrial_share_keyboard(call.bot),
-    )
+    await _show_round(call.message, call.bot, user_id, 0, is_new_message=False)
     await call.answer()
 
 
@@ -500,11 +545,7 @@ async def callback_freetrial_confirm(call: CallbackQuery):
             # reset the counter elsewhere) — send them back to the real
             # current round instead of silently failing.
             rounds_done = get_share_trial_rounds(user_id)
-            await call.message.edit_text(
-                _freetrial_round_text(rounds_done),
-                parse_mode="HTML",
-                reply_markup=await _freetrial_share_keyboard(call.bot),
-            )
+            await _show_round(call.message, call.bot, user_id, rounds_done, is_new_message=False)
         await call.answer()
         return
 
