@@ -29,7 +29,12 @@ def detect_site(url: str) -> str | None:
     return None
 
 
-def build_scraper_url(url: str, render_js: bool = False, set_cookies: str | None = None) -> str:
+def build_scraper_url(
+    url: str,
+    render_js: bool = False,
+    set_cookies: str | None = None,
+    custom_headers: bool = False,
+) -> str:
     # Read at call time so Railway's runtime env var is always used,
     # regardless of when this module was first imported.
     token = os.environ.get("SCRAPEDO_KEY", "")
@@ -42,4 +47,11 @@ def build_scraper_url(url: str, render_js: bool = False, set_cookies: str | None
         params["render"] = "true"
     if set_cookies:
         params["setCookies"] = set_cookies
+    if custom_headers:
+        # Scrape.do's "Custom Headers" feature: when set, it forwards every
+        # header on the request TO Scrape.do straight through to the target
+        # site, instead of using its own defaults. Needed for endpoints that
+        # require caller-supplied auth headers (e.g. Croma's authenticated
+        # inventory API) rather than a plain page fetch.
+        params["customHeaders"] = "true"
     return f"{SCRAPEDO_API_URL}?{urlencode(params)}"
