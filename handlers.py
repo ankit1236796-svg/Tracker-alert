@@ -41,6 +41,7 @@ from config import (
     ADMIN_USER_ID,
     SHARE_TRIAL_ROUNDS_REQUIRED,
     SHARE_TRIAL_TAP_DELAY_SECONDS,
+    UNRELIABLE_SITES,
 )
 
 logger = logging.getLogger(__name__)
@@ -216,6 +217,10 @@ async def _parallel_check(
     return list(await asyncio.gather(*[_one(p) for p in products]))
 
 
+def _unreliable_note(site: str) -> str:
+    return " ⚠️ <i>unreliable — under investigation, don't trust this status</i>" if site in UNRELIABLE_SITES else ""
+
+
 def _format_check_results(results: list[tuple[dict, bool]]) -> str:
     """Format parallel-check results into a readable summary."""
     total = len(results)
@@ -225,14 +230,14 @@ def _format_check_results(results: list[tuple[dict, bool]]) -> str:
     if in_stock:
         lines.append("✅ <b>In Stock:</b>")
         for p, _ in in_stock:
-            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]")
+            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]{_unreliable_note(p['site'])}")
             lines.append(f"    <a href=\"{p['url']}\">View →</a>")
     if oos:
         if in_stock:
             lines.append("")
         lines.append("❌ <b>Out of Stock:</b>")
         for p, _ in oos:
-            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]")
+            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]{_unreliable_note(p['site'])}")
     return "\n".join(lines)
 
 
@@ -1032,11 +1037,16 @@ async def callback_check(call: CallbackQuery):
     status_emoji = "✅" if in_stock else "❌"
     status_text = "IN STOCK" if in_stock else "OUT OF STOCK"
     price_line = f"\n💰 Current price: ₹{current_price:,.0f}" if current_price is not None else ""
+    warning_line = (
+        f"\n⚠️ <i>{product['site'].capitalize()} results are currently unreliable "
+        f"(under investigation) — don't trust this status.</i>"
+        if product["site"] in UNRELIABLE_SITES else ""
+    )
     await call.message.edit_text(
         f"{status_emoji} <b>{product['name']}</b>\n\n"
         f"Status: <b>{status_text}</b>{price_line}\n"
         f"Site: {product['site'].capitalize()}\n"
-        f"🔗 <a href=\"{product['url']}\">View product</a>",
+        f"🔗 <a href=\"{product['url']}\">View product</a>{warning_line}",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=_check_result_keyboard(),

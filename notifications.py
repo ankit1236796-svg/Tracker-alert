@@ -11,6 +11,8 @@ import logging
 
 from aiogram import Bot
 
+from config import UNRELIABLE_SITES
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,7 +28,21 @@ def should_alert_for_price(product: dict, current_price: float | None) -> bool:
 
 
 async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
-    """Send an in-stock notification to the product owner."""
+    """
+    Send an in-stock notification to the product owner. Sites in
+    config.UNRELIABLE_SITES are gated here — the single call site every
+    alert path (background loop, bulk /check, single-item /check) shares —
+    so a site with confirmed-flaky results can never trigger a false
+    "back in stock" push while still under investigation.
+    """
+    if product["site"] in UNRELIABLE_SITES:
+        logger.warning(
+            f"[alert-suppressed] site={product['site']!r} is in UNRELIABLE_SITES — "
+            f"skipping automatic stock alert for product #{product['id']} to avoid "
+            f"a possible false notification. Remove from config.UNRELIABLE_SITES "
+            f"once the root cause is fixed."
+        )
+        return
     price_line = f"\n💰 <b>Current price: ₹{price:,.0f}</b>" if price is not None else ""
     text = (
         "🚨 <b>Back in Stock!</b>\n\n"

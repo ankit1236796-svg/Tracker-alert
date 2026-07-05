@@ -33,6 +33,15 @@ SHARE_TRIAL_ROUNDS_REQUIRED = int(os.getenv("SHARE_TRIAL_ROUNDS_REQUIRED", "5"))
 # does NOT verify an actual share happened.
 SHARE_TRIAL_TAP_DELAY_SECONDS = int(os.getenv("SHARE_TRIAL_TAP_DELAY_SECONDS", "10"))
 
+# Sites whose results are confirmed unreliable enough that AUTOMATIC alerts
+# must be suppressed until root-caused and fixed — added after Croma was
+# observed flipping between correct and fully-inverted results across two
+# manual checks ~8-9 minutes apart, for the same tracked products. Manual
+# /check still runs and shows a result, but with an explicit reliability
+# warning (see handlers.py) rather than silently trusting it. Remove a site
+# from this set once the root cause is found and fixed.
+UNRELIABLE_SITES = {"croma"}
+
 # Playwright settings
 PLAYWRIGHT_HEADLESS = True
 PLAYWRIGHT_TIMEOUT = 30000  # ms
