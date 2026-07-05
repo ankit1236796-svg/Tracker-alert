@@ -201,6 +201,7 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="search", description="Search tracked products by name"),
         BotCommand(command="stores", description="List all supported stores"),
         BotCommand(command="pins",   description="Manage your delivery pin codes"),
+        BotCommand(command="language", description="Change language (English / हिंदी / Hinglish)"),
         BotCommand(command="freetrial", description="Get a bonus free trial by sharing on WhatsApp"),
         BotCommand(command="cancel", description="Cancel the current operation"),
     ]

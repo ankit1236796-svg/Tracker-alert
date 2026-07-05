@@ -57,6 +57,7 @@ from database import (
     get_approvals_since,
     get_approval_history,
     get_product_by_id,
+    get_user_lang,
     remove_product,
     grant_access,
     reject_user,
@@ -369,7 +370,7 @@ def create_app() -> Flask:
         if _require_user(uid) is None:
             return redirect(url_for("users"))
         if set_blocked(uid, True, ADMIN_USER_ID):
-            _tg_send(uid, block_notice_text())
+            _tg_send(uid, block_notice_text(get_user_lang(uid)))
             flash(f"User {uid} blocked.", "ok")
         else:
             flash(f"Could not block user {uid}.", "bad")
@@ -381,7 +382,7 @@ def create_app() -> Flask:
         if _require_user(uid) is None:
             return redirect(url_for("users"))
         if set_blocked(uid, False, ADMIN_USER_ID):
-            _tg_send(uid, unblock_notice_text())
+            _tg_send(uid, unblock_notice_text(get_user_lang(uid)))
             flash(f"User {uid} unblocked.", "ok")
         else:
             flash(f"Could not unblock user {uid}.", "bad")
@@ -403,7 +404,7 @@ def create_app() -> Flask:
         if updated:
             plan = get_plan_by_id(updated["plan_id"]) if updated.get("plan_id") else None
             _tg_send(uid, approval_notice_text(
-                plan["name"] if plan else "your plan", days, updated["access_until"]))
+                plan["name"] if plan else "your plan", days, updated["access_until"], get_user_lang(uid)))
             flash(f"Extended user {uid} by {days} day(s).", "ok")
         else:
             flash(f"Could not extend user {uid}.", "bad")
@@ -427,7 +428,7 @@ def create_app() -> Flask:
             flash("That plan no longer exists.", "bad")
             return redirect(url_for("pending"))
         updated = grant_access(uid, plan_id, days, ADMIN_USER_ID)
-        _tg_send(uid, approval_notice_text(plan["name"], days, updated["access_until"]))
+        _tg_send(uid, approval_notice_text(plan["name"], days, updated["access_until"], get_user_lang(uid)))
         flash(f"Approved user {uid} on {plan['name']} for {days} day(s).", "ok")
         return redirect(request.referrer or url_for("pending"))
 
@@ -438,7 +439,7 @@ def create_app() -> Flask:
             return redirect(url_for("pending"))
         reason = (request.form.get("reason") or "").strip() or None
         if reject_user(uid, ADMIN_USER_ID, reason):
-            _tg_send(uid, rejection_notice_text(reason))
+            _tg_send(uid, rejection_notice_text(reason, get_user_lang(uid)))
             flash(f"Rejected user {uid}.", "ok")
         else:
             flash(f"Could not reject user {uid}.", "bad")
@@ -511,7 +512,7 @@ def create_app() -> Flask:
         done = 0
         for uid in uids:
             if get_user(uid) and set_blocked(uid, True, ADMIN_USER_ID):
-                _tg_send(uid, block_notice_text())
+                _tg_send(uid, block_notice_text(get_user_lang(uid)))
                 done += 1
         flash(f"Blocked {done} user(s).", "ok")
         return redirect(request.referrer or url_for("users"))
@@ -526,7 +527,7 @@ def create_app() -> Flask:
         done = 0
         for uid in uids:
             if get_user(uid) and set_blocked(uid, False, ADMIN_USER_ID):
-                _tg_send(uid, unblock_notice_text())
+                _tg_send(uid, unblock_notice_text(get_user_lang(uid)))
                 done += 1
         flash(f"Unblocked {done} user(s).", "ok")
         return redirect(request.referrer or url_for("users"))
@@ -555,7 +556,7 @@ def create_app() -> Flask:
             if get_user(uid) is None:
                 continue
             updated = grant_access(uid, plan_id, days, ADMIN_USER_ID)
-            _tg_send(uid, approval_notice_text(plan["name"], days, updated["access_until"]))
+            _tg_send(uid, approval_notice_text(plan["name"], days, updated["access_until"], get_user_lang(uid)))
             done += 1
         flash(f"Approved {done} user(s) on {plan['name']} for {days} day(s).", "ok")
         return redirect(url_for("pending"))
@@ -571,7 +572,7 @@ def create_app() -> Flask:
         done = 0
         for uid in uids:
             if get_user(uid) and reject_user(uid, ADMIN_USER_ID, reason):
-                _tg_send(uid, rejection_notice_text(reason))
+                _tg_send(uid, rejection_notice_text(reason, get_user_lang(uid)))
                 done += 1
         flash(f"Rejected {done} user(s).", "ok")
         return redirect(url_for("pending"))
@@ -603,7 +604,7 @@ def create_app() -> Flask:
         if notify:
             msg = custom_message.strip() if custom_message and custom_message.strip() else None
             for owner, names in by_user.items():
-                if _tg_send(owner, msg or items_removed_text(names)):
+                if _tg_send(owner, msg or items_removed_text(names, get_user_lang(owner))):
                     notified += 1
         return removed, notified
 

@@ -25,8 +25,10 @@ from database import (
     parse_ist,
     get_or_create_user,
     get_plan_by_id,
+    get_user_lang,
     list_products,
 )
+from translations import t
 
 logger = logging.getLogger(__name__)
 
@@ -140,34 +142,25 @@ def check_can_add_item(user_id: int, site: str) -> tuple[bool, str | None, str |
         return True, None, None
 
     info = get_access_info(user_id)
+    lang = info.user_row.get("lang") or "en"
     if not info.has_access:
         return False, REASON_NO_ACCESS, access_denied_text(info)
 
     plan = info.plan
     if plan is None:
-        return False, REASON_NO_PLAN, (
-            "⚠️ You don't have an active plan assigned. Contact the admin to get set up."
-        )
+        return False, REASON_NO_PLAN, t("no_active_plan", lang)
 
     current_count = len(list_products(user_id))
     if current_count >= plan["max_items"]:
-        return False, REASON_ITEM_LIMIT, (
-            f"🚫 <b>Item limit reached.</b>\n\n"
-            f"Your <b>{plan['name']}</b> plan allows up to <b>{plan['max_items']}</b> "
-            f"tracked items, and you're currently tracking <b>{current_count}</b>.\n\n"
-            f"Remove an item with /remove, or contact the admin to upgrade your plan."
-        )
+        return False, REASON_ITEM_LIMIT, t(
+            "item_limit", lang, plan=plan["name"], max=plan["max_items"], count=current_count)
 
     allowed_sites = plan["sites"]
     if allowed_sites != "all":
         allowed_list = {s.strip().lower() for s in allowed_sites.split(",") if s.strip()}
         if site.lower() not in allowed_list:
-            return False, REASON_SITE_NOT_ALLOWED, (
-                f"🚫 <b>Store not included in your plan.</b>\n\n"
-                f"Your <b>{plan['name']}</b> plan only allows: "
-                f"<b>{', '.join(sorted(allowed_list))}</b>.\n\n"
-                f"Contact the admin to upgrade to a plan that includes this store."
-            )
+            return False, REASON_SITE_NOT_ALLOWED, t(
+                "store_not_in_plan", lang, plan=plan["name"], sites=", ".join(sorted(allowed_list)))
 
     return True, None, None
 
@@ -177,46 +170,21 @@ def check_can_add_item(user_id: int, site: str) -> tuple[bool, str | None, str |
 # ---------------------------------------------------------------------------
 
 def access_denied_text(info: AccessInfo) -> str:
+    lang = info.user_row.get("lang") or "en"
     if info.status == STATUS_LOCKED and info.user_row.get("blocked"):
-        return (
-            "🚫 <b>Your access has been blocked by the admin.</b>\n\n"
-            "If you believe this is a mistake, please contact the admin."
-        )
+        return t("access_blocked", lang)
     if info.status == STATUS_LOCKED and info.days_remaining is None:
-        # access_until was never set at all — distinct from "trial ended"
-        # below (which only fires once access_until holds a real past date).
-        # Since get_or_create_user no longer auto-grants a trial, this is now
-        # the normal state for every brand-new user.
-        return (
-            "👋 <b>You don't have an active trial yet.</b>\n\n"
-            "Use /freetrial to get a free trial by sharing Ullu Alert on "
-            "WhatsApp, or contact the admin for manual approval."
-        )
+        # access_until was never set at all — the normal state for a brand-new
+        # user, since get_or_create_user no longer auto-grants a trial.
+        return t("access_no_trial", lang)
     if info.status == STATUS_EXPIRED_GRACE:
         grace_left = int(info.grace_days_remaining) if info.grace_days_remaining else 0
-        return (
-            "⏰ <b>Your access has expired.</b>\n\n"
-            f"Your tracked items are safely kept for <b>{grace_left} more day"
-            f"{'s' if grace_left != 1 else ''}</b> — renew within that window "
-            "and your full list is restored automatically. After that, they're "
-            "permanently deleted.\n\n"
-            + _payment_instructions()
+        return t(
+            "access_expired_grace", lang,
+            grace=grace_left, s=("" if grace_left == 1 else "s"),
+            payment=t("payment_instructions", lang),
         )
-    return (
-        "⏰ <b>Your trial has ended.</b>\n\n"
-        "You need an active plan to keep using this bot.\n\n"
-        + _payment_instructions()
-    )
-
-
-def _payment_instructions() -> str:
-    return (
-        "💳 <b>To get access:</b>\n"
-        "Send an Amazon Gift Card to the admin (details to be shared) and "
-        "include your Telegram user ID in the message.\n\n"
-        "📩 Contact: the admin will review and approve your access shortly "
-        "after payment — use /start any time to check your status."
-    )
+    return t("access_trial_ended", lang, payment=t("payment_instructions", lang))
 
 
 # ---------------------------------------------------------------------------

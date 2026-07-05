@@ -25,16 +25,20 @@ from database import (
     get_product_by_id_for_user,
     update_stock_status,
     get_user_primary_pincode,
+    get_user,
     get_or_create_user,
     has_used_share_trial,
     activate_share_trial,
     get_share_trial_rounds,
     increment_share_trial_round,
     reset_share_trial_rounds,
+    get_user_lang,
+    set_user_lang,
 )
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
 from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
+from translations import t, LANG_LABEL
 from config import (
     SUPPORTED_SITES,
     TRIAL_DAYS,
@@ -76,25 +80,16 @@ _SUPPORTED_SITES_TEXT = (
     "blinkit.com · swiggy.com (Instamart) · myntra.com"
 )
 
-_COMING_SOON_TEXT = (
-    "🚧 <b>Croma tracking is temporarily unavailable.</b>\n\n"
-    "We found reliability issues with Croma stock detection and pulled it "
-    "while we fix them, rather than risk sending you wrong alerts. "
-    "Check back soon, or track this product on another supported store "
-    "in the meantime."
-)
-
-
-def _coming_soon_message(url: str) -> str | None:
+def _coming_soon_message(url: str, lang: str = "en") -> str | None:
     """
-    Return a "coming soon" message for a domain in config.COMING_SOON_DOMAINS
-    (deliberately pulled, not simply unbuilt), or None otherwise — lets /add
-    give an honest, specific reason instead of lumping it in with genuinely
-    unsupported sites.
+    Return a "coming soon" message (in `lang`) for a domain in
+    config.COMING_SOON_DOMAINS (deliberately pulled, not simply unbuilt), or
+    None otherwise — lets /add give an honest, specific reason instead of
+    lumping it in with genuinely unsupported sites.
     """
     host = urlparse(url).netloc.lower().replace("www.", "")
     if any(host == d or host.endswith("." + d) for d in COMING_SOON_DOMAINS):
-        return _COMING_SOON_TEXT
+        return t("coming_soon_croma", lang)
     return None
 
 
@@ -339,87 +334,121 @@ def _select_keyboard(products: list[dict], selected_ids: set[int]) -> InlineKeyb
 
 
 # ---------------------------------------------------------------------------
+# /language – pick English / हिंदी / Hinglish
+# ---------------------------------------------------------------------------
+
+def _language_keyboard(*, first_run: bool) -> InlineKeyboardMarkup:
+    # first_run=True chains into showing the welcome after the pick.
+    suffix = ":firstrun" if first_run else ""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="English", callback_data=f"setlang:en{suffix}")],
+        [InlineKeyboardButton(text="हिंदी", callback_data=f"setlang:hi{suffix}")],
+        [InlineKeyboardButton(text="Hinglish", callback_data=f"setlang:hinglish{suffix}")],
+    ])
+
+
+@router.message(Command("language"))
+async def cmd_language(message: Message):
+    lang = get_user_lang(message.from_user.id)
+    await message.answer(
+        t("language_prompt", lang), parse_mode="HTML",
+        reply_markup=_language_keyboard(first_run=False),
+    )
+
+
+@router.callback_query(F.data.startswith("setlang:"))
+async def callback_setlang(call: CallbackQuery):
+    payload = call.data.split(":", 1)[1]
+    first_run = payload.endswith(":firstrun")
+    lang = payload.replace(":firstrun", "")
+    if lang not in ("en", "hi", "hinglish"):
+        await call.answer()
+        return
+    # ensure a row exists (new users hitting the first-run prompt), then set
+    get_or_create_user(
+        call.from_user.id,
+        username=call.from_user.username,
+        first_name=call.from_user.first_name,
+    )
+    set_user_lang(call.from_user.id, lang)
+    await call.message.edit_text(t("language_set", lang), parse_mode="HTML")
+    await call.answer()
+    if first_run:
+        await _send_welcome(call.message, call.from_user.id, lang)
+
+
+# ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
+
+async def _send_welcome(target: Message, user_id: int, lang: str) -> None:
+    """Render the welcome (status line + body + commands) in the given lang.
+    `target` is the Message to reply from (a fresh /start message, or the
+    edited language-picker message on first run)."""
+    if user_id != ADMIN_USER_ID:
+        user_row = get_or_create_user(user_id)
+        info = compute_access(user_row)
+        if not info.has_access:
+            await target.answer(access_denied_text(info), parse_mode="HTML")
+            return
+        if info.status == "trial":
+            days_left = max(0, round(info.days_remaining or 0, 1))
+            trial_line = t("status_trial", lang, days=days_left, trial_days=TRIAL_DAYS)
+        else:
+            plan_name = info.plan["name"] if info.plan else "your plan"
+            days_left = max(0, round(info.days_remaining or 0, 1))
+            trial_line = t("status_plan", lang, plan=plan_name, days=days_left)
+    else:
+        trial_line = ""
+
+    await target.answer(
+        t("welcome_body", lang, trial_line=trial_line) + t("welcome_commands", lang),
+        parse_mode="HTML",
+    )
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
 
-    # Admin doesn't have (or need) a trial/plan concept — always show the
-    # normal welcome, bypassing the access-status branch below entirely.
-    if user_id != ADMIN_USER_ID:
-        user_row = get_or_create_user(
+    # First-run auto-prompt: a brand-new non-admin user (no row yet — /start
+    # bypasses the middleware that would otherwise create one) is asked to pick
+    # a language before anything else; the picker chains into the welcome.
+    if user_id != ADMIN_USER_ID and get_user(user_id) is None:
+        get_or_create_user(
             user_id,
             username=message.from_user.username,
             first_name=message.from_user.first_name,
         )
-        info = compute_access(user_row)
-        if not info.has_access:
-            # Locked / expired-grace: show ONLY the status + payment message —
-            # the feature list below is useless to them until they're renewed.
-            await message.answer(access_denied_text(info), parse_mode="HTML")
-            return
-        if info.status == "trial":
-            days_left = max(0, round(info.days_remaining or 0, 1))
-            trial_line = (
-                f"🎁 <b>Free trial active</b> — {days_left} day(s) left "
-                f"(started with a {TRIAL_DAYS}-day trial).\n\n"
-            )
-        else:
-            plan_name = info.plan["name"] if info.plan else "your plan"
-            days_left = max(0, round(info.days_remaining or 0, 1))
-            trial_line = f"✅ <b>{plan_name}</b> active — {days_left} day(s) left.\n\n"
-    else:
-        trial_line = ""
+        await message.answer(
+            t("language_welcome_prompt", "en"), parse_mode="HTML",
+            reply_markup=_language_keyboard(first_run=True),
+        )
+        return
 
-    await message.answer(
-        "👋 <b>Welcome to Ullu Alert!</b>\n\n"
-        + trial_line +
-        "I monitor products on multiple online shopping sites "
-        "and alert you the moment they come back in stock.\n\n"
-        "<b>Commands:</b>\n"
-        "  /add     – Track product(s); bulk format: <code>Name | URL</code> one per line\n"
-        "  /list    – View your tracked products\n"
-        "  /remove  – Stop tracking a product\n"
-        "  /check   – Check stock (filter by store, or check all at once)\n"
-        "  /select  – Select items to bulk-check or delete\n"
-        "  /search  – Search your tracked products by name\n"
-        "  /stores  – List all supported stores\n"
-        "  /pins    – Manage your delivery pin codes\n"
-        "  /freetrial – Get a bonus free trial by sharing on WhatsApp\n\n"
-        "Use /add to get started!",
-        parse_mode="HTML",
+    # Keep the stored Telegram profile fresh, then show the localized welcome.
+    get_or_create_user(
+        user_id, username=message.from_user.username, first_name=message.from_user.first_name,
     )
+    await _send_welcome(message, user_id, get_user_lang(user_id))
 
 
 # ---------------------------------------------------------------------------
 # /freetrial – WhatsApp-share-gated one-time trial bonus
 # ---------------------------------------------------------------------------
 
-def _freetrial_round_text(rounds_done: int, *, waiting: bool) -> str:
+def _freetrial_round_text(rounds_done: int, *, waiting: bool, lang: str) -> str:
     round_num = min(rounds_done + 1, SHARE_TRIAL_ROUNDS_REQUIRED)
+    header = t("ft_header", lang, n=round_num, total=SHARE_TRIAL_ROUNDS_REQUIRED)
     if rounds_done == 0:
-        progress_line = (
-            f"Share Ullu Alert with a friend or group on WhatsApp, then confirm "
-            f"below — do this {SHARE_TRIAL_ROUNDS_REQUIRED} times to unlock your free trial.\n\n"
-        )
+        progress_line = t("ft_progress_first", lang, total=SHARE_TRIAL_ROUNDS_REQUIRED)
     else:
-        progress_line = f"✅ {rounds_done}/{SHARE_TRIAL_ROUNDS_REQUIRED} shares done — keep going!\n\n"
-
+        progress_line = t("ft_progress_more", lang, done=rounds_done, total=SHARE_TRIAL_ROUNDS_REQUIRED)
     if waiting:
-        status_line = (
-            f"⏳ Please wait {SHARE_TRIAL_TAP_DELAY_SECONDS} seconds while you share...\n\n"
-            "Tap <b>Share on WhatsApp</b> below — open the app, pick a contact "
-            "or group, and send it."
-        )
+        status_line = t("ft_waiting", lang, secs=SHARE_TRIAL_TAP_DELAY_SECONDS)
     else:
-        status_line = "✅ Shared? Tap <b>Done</b> below to continue."
-
-    return (
-        f"🎁 <b>Get a free trial!</b> (Round {round_num} of {SHARE_TRIAL_ROUNDS_REQUIRED})\n\n"
-        + progress_line + status_line
-    )
+        status_line = t("ft_ready", lang)
+    return header + progress_line + status_line
 
 
 async def _freetrial_bot_link(bot) -> str:
@@ -427,29 +456,23 @@ async def _freetrial_bot_link(bot) -> str:
     return f"https://t.me/{me.username}"
 
 
-def _freetrial_wa_url(bot_link: str) -> str:
-    share_text = (
-        f"🚨 PS5 restock? New iPhone drop? Don't miss it again!\n\n"
-        f"I use Ullu Alert (100% FREE) — it watches products 24/7 and pings me "
-        f"the SECOND they're back in stock, so I never miss a restock. 🔥\n\n"
-        f"Try it free: {bot_link}"
-    )
-    return f"https://wa.me/?text={quote(share_text)}"
+def _freetrial_wa_url(bot_link: str, lang: str) -> str:
+    return f"https://wa.me/?text={quote(t('ft_wa_share_text', lang, link=bot_link))}"
 
 
-def _freetrial_share_only_keyboard(bot_link: str) -> InlineKeyboardMarkup:
+def _freetrial_share_only_keyboard(bot_link: str, lang: str) -> InlineKeyboardMarkup:
     """Round's initial keyboard: Share button only. "Done" isn't there yet —
     see _reveal_done_button. Telegram gives the bot no event when a `url`
     button is tapped, so this delay is the closest available approximation
     to "must tap Share before Done," not a real verification of it."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Share on WhatsApp", url=_freetrial_wa_url(bot_link))],
+        [InlineKeyboardButton(text="📤 Share on WhatsApp", url=_freetrial_wa_url(bot_link, lang))],
     ])
 
 
-def _freetrial_full_keyboard(bot_link: str) -> InlineKeyboardMarkup:
+def _freetrial_full_keyboard(bot_link: str, lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Share on WhatsApp", url=_freetrial_wa_url(bot_link))],
+        [InlineKeyboardButton(text="📤 Share on WhatsApp", url=_freetrial_wa_url(bot_link, lang))],
         [InlineKeyboardButton(text="✅ Done", callback_data="freetrial:done")],
     ])
 
@@ -467,12 +490,13 @@ async def _reveal_done_button(bot, message: Message, user_id: int, expected_roun
         return
     if get_share_trial_rounds(user_id) != expected_rounds_done:
         return
+    lang = get_user_lang(user_id)
     bot_link = await _freetrial_bot_link(bot)
     try:
         await message.edit_text(
-            _freetrial_round_text(expected_rounds_done, waiting=False),
+            _freetrial_round_text(expected_rounds_done, waiting=False, lang=lang),
             parse_mode="HTML",
-            reply_markup=_freetrial_full_keyboard(bot_link),
+            reply_markup=_freetrial_full_keyboard(bot_link, lang),
         )
     except Exception:
         pass  # message may have been edited/deleted already
@@ -483,9 +507,10 @@ async def _show_round(target: Message, bot, user_id: int, rounds_done: int, *, i
     schedule the delayed reveal of the "Done" text/button. `target` is the
     Message to send a new reply from (cmd_freetrial) or edit in place
     (callback handlers)."""
+    lang = get_user_lang(user_id)
     bot_link = await _freetrial_bot_link(bot)
-    text = _freetrial_round_text(rounds_done, waiting=True)
-    keyboard = _freetrial_share_only_keyboard(bot_link)
+    text = _freetrial_round_text(rounds_done, waiting=True, lang=lang)
+    keyboard = _freetrial_share_only_keyboard(bot_link, lang)
     if is_new_message:
         sent = await target.answer(
             text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True
@@ -502,18 +527,9 @@ _FREETRIAL_CONFIRM_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
     ]
 ])
 
-_FREETRIAL_CONFIRM_TEXT = (
-    f"⚠️ <b>Are you sure you shared this in {SHARE_TRIAL_ROUNDS_REQUIRED} "
-    f"WhatsApp groups/contacts?</b>\n\n"
-    "Cheating will result in your free trial being denied and you may be "
-    "permanently banned from future free trials.\n\n"
-    "Do you still want to confirm?"
-)
 
-_FREETRIAL_ALREADY_USED_TEXT = (
-    "🚫 <b>You've already used this offer.</b>\n\n"
-    "The WhatsApp-share free trial can only be claimed once per account."
-)
+def _ft_confirm_text(lang: str) -> str:
+    return t("ft_confirm", lang, total=SHARE_TRIAL_ROUNDS_REQUIRED)
 
 
 @router.message(Command("freetrial"))
@@ -521,7 +537,7 @@ async def cmd_freetrial(message: Message):
     user_id = message.from_user.id
 
     if user_id == ADMIN_USER_ID:
-        await message.answer("The admin account doesn't need a trial.")
+        await message.answer(t("ft_admin_no_need", get_user_lang(user_id)))
         return
 
     get_or_create_user(
@@ -529,9 +545,10 @@ async def cmd_freetrial(message: Message):
         username=message.from_user.username,
         first_name=message.from_user.first_name,
     )
+    lang = get_user_lang(user_id)
 
     if has_used_share_trial(user_id):
-        await message.answer(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
+        await message.answer(t("ft_already_used", lang), parse_mode="HTML")
         return
 
     # Resume wherever this user left off (rounds persist in the DB across
@@ -539,7 +556,7 @@ async def cmd_freetrial(message: Message):
     rounds_done = get_share_trial_rounds(user_id)
     if rounds_done >= SHARE_TRIAL_ROUNDS_REQUIRED:
         await message.answer(
-            _FREETRIAL_CONFIRM_TEXT, parse_mode="HTML", reply_markup=_FREETRIAL_CONFIRM_KEYBOARD
+            _ft_confirm_text(lang), parse_mode="HTML", reply_markup=_FREETRIAL_CONFIRM_KEYBOARD
         )
         return
 
@@ -549,15 +566,16 @@ async def cmd_freetrial(message: Message):
 @router.callback_query(F.data == "freetrial:done")
 async def callback_freetrial_done(call: CallbackQuery):
     user_id = call.from_user.id
+    lang = get_user_lang(user_id)
     if has_used_share_trial(user_id):
-        await call.message.edit_text(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
+        await call.message.edit_text(t("ft_already_used", lang), parse_mode="HTML")
         await call.answer()
         return
 
     rounds_done = increment_share_trial_round(user_id)
     if rounds_done >= SHARE_TRIAL_ROUNDS_REQUIRED:
         await call.message.edit_text(
-            _FREETRIAL_CONFIRM_TEXT, parse_mode="HTML", reply_markup=_FREETRIAL_CONFIRM_KEYBOARD
+            _ft_confirm_text(lang), parse_mode="HTML", reply_markup=_FREETRIAL_CONFIRM_KEYBOARD
         )
     else:
         await _show_round(call.message, call.bot, user_id, rounds_done, is_new_message=False)
@@ -568,7 +586,7 @@ async def callback_freetrial_done(call: CallbackQuery):
 async def callback_freetrial_retry(call: CallbackQuery):
     user_id = call.from_user.id
     if has_used_share_trial(user_id):
-        await call.message.edit_text(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
+        await call.message.edit_text(t("ft_already_used", get_user_lang(user_id)), parse_mode="HTML")
         await call.answer()
         return
 
@@ -580,11 +598,12 @@ async def callback_freetrial_retry(call: CallbackQuery):
 @router.callback_query(F.data == "freetrial:confirm")
 async def callback_freetrial_confirm(call: CallbackQuery):
     user_id = call.from_user.id
+    lang = get_user_lang(user_id)
     granted, updated = activate_share_trial(user_id)
 
     if not granted:
         if has_used_share_trial(user_id):
-            await call.message.edit_text(_FREETRIAL_ALREADY_USED_TEXT, parse_mode="HTML")
+            await call.message.edit_text(t("ft_already_used", lang), parse_mode="HTML")
         else:
             # Rounds incomplete (e.g. a stale button tapped after a Retry
             # reset the counter elsewhere) — send them back to the real
@@ -597,10 +616,7 @@ async def callback_freetrial_confirm(call: CallbackQuery):
     info = compute_access(updated)
     days_left = max(0, round(info.days_remaining or 0, 1))
     await call.message.edit_text(
-        f"✅ <b>Free trial activated!</b>\n\n"
-        f"Thanks for sharing Ullu Alert — you now have <b>{days_left} day(s)</b> "
-        f"of access. Use /add to start tracking products!",
-        parse_mode="HTML",
+        t("ft_success", lang, days=days_left), parse_mode="HTML",
     )
     await call.answer()
 
@@ -620,16 +636,7 @@ async def cmd_add(message: Message, state: FSMContext, command: CommandObject):
             return
 
     await state.set_state(AddProductStates.waiting_for_name)
-    await message.answer(
-        "📦 <b>Add product(s)</b>\n\n"
-        "<b>Option A — Bulk (one per line):</b>\n"
-        "<code>Watch | https://amazon.in/…\n"
-        "Shirt | https://flipkart.com/…</code>\n\n"
-        "<b>Option B — Single:</b> just send the product name, "
-        "then the URL in the next step.\n\n"
-        "Type /cancel to abort.",
-        parse_mode="HTML",
-    )
+    await message.answer(t("add_instructions", get_user_lang(message.from_user.id)), parse_mode="HTML")
 
 
 @router.message(Command("cancel"), AddProductStates.waiting_for_name)
@@ -638,14 +645,15 @@ async def cmd_add(message: Message, state: FSMContext, command: CommandObject):
 @router.message(Command("cancel"), SearchStates.waiting_for_keyword)
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Cancelled.")
+    await message.answer(t("cancelled", get_user_lang(message.from_user.id)))
 
 
 @router.message(AddProductStates.waiting_for_name)
 async def receive_name(message: Message, state: FSMContext):
+    lang = get_user_lang(message.from_user.id)
     raw = message.text.strip()
     if not raw:
-        await message.answer("Input cannot be empty. Please try again.")
+        await message.answer(t("add_empty_input", lang))
         return
 
     # ── Bulk format: lines of "name | URL" ──────────────────────────────────
@@ -659,12 +667,7 @@ async def receive_name(message: Message, state: FSMContext):
     await state.update_data(product_name=raw)
     await state.set_state(AddProductStates.waiting_for_link)
     await message.answer(
-        f"✅ Name saved: <b>{raw}</b>\n\n"
-        "Step 2 of 2 — Send me the <b>product URL</b>.\n"
-        "Paste <b>multiple URLs (one per line)</b> to add several products at once.\n"
-        f"Supported: {_SUPPORTED_SITES_TEXT}",
-        parse_mode="HTML",
-    )
+        t("add_name_saved", lang, name=raw, sites=_SUPPORTED_SITES_TEXT), parse_mode="HTML")
 
 
 @router.message(AddProductStates.waiting_for_link)
@@ -673,6 +676,7 @@ async def receive_link(message: Message, state: FSMContext):
     data = await state.get_data()
     name = data["product_name"]
     user_id = message.from_user.id
+    lang = get_user_lang(user_id)
 
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     urls = [ln for ln in lines if ln.startswith(("http://", "https://"))]
@@ -715,24 +719,17 @@ async def receive_link(message: Message, state: FSMContext):
     # ── Single-URL path (original flow) ─────────────────────────────────────
     url = lines[0] if lines else raw
     if not url.startswith(("http://", "https://")):
-        await message.answer(
-            "⚠️ That doesn't look like a valid URL. "
-            "Please paste the full link (starting with https://)."
-        )
+        await message.answer(t("add_invalid_url", lang))
         return
 
     site = detect_site(url)
     if site is None:
-        coming_soon = _coming_soon_message(url)
+        coming_soon = _coming_soon_message(url, lang)
         if coming_soon:
             await message.answer(coming_soon, parse_mode="HTML")
         else:
             await message.answer(
-                "❌ <b>Unsupported website.</b>\n\n"
-                f"Supported: {_SUPPORTED_SITES_TEXT}\n\n"
-                "Please send a link from one of these sites.",
-                parse_mode="HTML",
-            )
+                t("add_unsupported", lang, sites=_SUPPORTED_SITES_TEXT), parse_mode="HTML")
         return
 
     # Checked here (before the Amazon target-price sub-flow) so a user who's
@@ -747,14 +744,7 @@ async def receive_link(message: Message, state: FSMContext):
     if site == "amazon":
         await state.update_data(product_url=url, product_site=site)
         await state.set_state(AddProductStates.waiting_for_target_price)
-        await message.answer(
-            "💰 <b>Set a target price (optional)</b>\n\n"
-            f"Tracking: <b>{name}</b>\n\n"
-            "Send a target price (e.g. <code>1299</code> or <code>1299.99</code>) "
-            "to only get alerted when the price drops to or below that amount.\n\n"
-            "Or send /skip to get alerted at any price.",
-            parse_mode="HTML",
-        )
+        await message.answer(t("amazon_target_prompt", lang, name=name), parse_mode="HTML")
         return
 
     ok, msg = add_product(user_id, name, url, site)
@@ -762,13 +752,7 @@ async def receive_link(message: Message, state: FSMContext):
 
     if ok:
         await message.answer(
-            f"🎉 <b>Product added!</b>\n\n"
-            f"📌 <b>Name:</b> {name}\n"
-            f"🛒 <b>Site:</b> {site.capitalize()}\n"
-            f"🔗 <b>URL:</b> {url}\n\n"
-            "I'll notify you as soon as it's back in stock!",
-            parse_mode="HTML",
-        )
+            t("product_added", lang, name=name, site=site.capitalize(), url=url), parse_mode="HTML")
     else:
         await message.answer(f"⚠️ {msg}")
 
@@ -781,6 +765,7 @@ async def receive_target_price(message: Message, state: FSMContext):
     url = data["product_url"]
     site = data["product_site"]
     user_id = message.from_user.id
+    lang = get_user_lang(user_id)
 
     target_price: float | None = None
     if raw.lower() not in ("/skip", "skip"):
@@ -790,12 +775,7 @@ async def receive_target_price(message: Message, state: FSMContext):
             if target_price <= 0:
                 raise ValueError("price must be positive")
         except (ValueError, TypeError):
-            await message.answer(
-                "⚠️ That doesn't look like a valid price. "
-                "Send a number like <code>1299</code> or <code>1299.99</code>, "
-                "or /skip to track at any price.",
-                parse_mode="HTML",
-            )
+            await message.answer(t("target_invalid", lang), parse_mode="HTML")
             return
 
     # Re-checked here too (not just when the URL was first submitted) in case
@@ -810,16 +790,10 @@ async def receive_target_price(message: Message, state: FSMContext):
     await state.clear()
 
     if ok:
-        price_line = f"\n💰 <b>Target price:</b> ₹{target_price:,.0f}" if target_price else ""
-        tail = " at or below your target price!" if target_price else "!"
-        await message.answer(
-            f"🎉 <b>Product added!</b>\n\n"
-            f"📌 <b>Name:</b> {name}\n"
-            f"🛒 <b>Site:</b> {site.capitalize()}\n"
-            f"🔗 <b>URL:</b> {url}{price_line}\n\n"
-            f"I'll notify you as soon as it's back in stock{tail}",
-            parse_mode="HTML",
-        )
+        body = t("product_added", lang, name=name, site=site.capitalize(), url=url)
+        if target_price:
+            body += f"\n💰 ₹{target_price:,.0f}"
+        await message.answer(body, parse_mode="HTML")
     else:
         await message.answer(f"⚠️ {msg}")
 
@@ -831,16 +805,14 @@ async def receive_target_price(message: Message, state: FSMContext):
 @router.message(Command("list"))
 async def cmd_list(message: Message):
     user_id = message.from_user.id
+    lang = get_user_lang(user_id)
     products = list_products(user_id)
 
     if not products:
-        await message.answer(
-            "📭 You have no tracked products yet.\n"
-            "Use /add to start tracking one!"
-        )
+        await message.answer(t("list_empty", lang))
         return
 
-    lines = ["📋 <b>Your Tracked Products</b>\n"]
+    lines = [t("list_header", lang)]
     for p in products:
         stock_emoji = "✅" if p["in_stock"] else "❌"
         checked = _format_last_checked(p["last_checked"])
@@ -867,13 +839,11 @@ async def cmd_list(message: Message):
 @router.message(Command("remove"))
 async def cmd_remove(message: Message):
     user_id = message.from_user.id
+    lang = get_user_lang(user_id)
     products = list_products(user_id)
 
     if not products:
-        await message.answer(
-            "📭 You have no products to remove.\n"
-            "Use /add to start tracking one!"
-        )
+        await message.answer(t("remove_empty", lang))
         return
 
     buttons = [
@@ -890,7 +860,7 @@ async def cmd_remove(message: Message):
     )
 
     await message.answer(
-        "🗑 <b>Select a product to remove:</b>",
+        t("remove_prompt", lang),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
@@ -931,18 +901,15 @@ async def callback_remove(call: CallbackQuery):
 @router.message(Command("check"))
 async def cmd_check(message: Message):
     user_id = message.from_user.id
+    lang = get_user_lang(user_id)
     products = list_products(user_id)
 
     if not products:
-        await message.answer(
-            "📭 You have no tracked products yet.\n"
-            "Use /add to start tracking one!"
-        )
+        await message.answer(t("check_empty", lang))
         return
 
     await message.answer(
-        "🏪 <b>Filter by store</b>\n\n"
-        "Pick a store to check, or check all at once:",
+        t("check_filter_prompt", lang),
         parse_mode="HTML",
         reply_markup=_check_store_filter_keyboard(products),
     )
@@ -1096,10 +1063,7 @@ async def cmd_select(message: Message, state: FSMContext):
     user_id = message.from_user.id
     products = list_products(user_id)
     if not products:
-        await message.answer(
-            "📭 You have no tracked products yet.\n"
-            "Use /add to start tracking one!"
-        )
+        await message.answer(t("check_empty", get_user_lang(user_id)))
         return
     await state.set_state(SelectStates.selecting)
     await state.update_data(selected_ids=[])
@@ -1316,8 +1280,7 @@ async def callback_search_prompt(call: CallbackQuery, state: FSMContext):
 
 @router.message(Command("stores"))
 async def cmd_stores(message: Message):
-    lines = ["🏪 <b>Supported Stores</b>\n\n"
-             "We currently support tracking on these stores:\n"]
+    lines = [t("stores_intro", get_user_lang(message.from_user.id))]
     for site, domains in SUPPORTED_SITES.items():
         domain_str = ", ".join(domains)
         lines.append(f"• <b>{site.capitalize()}</b> — {domain_str}")

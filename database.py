@@ -141,6 +141,15 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # Migration: add per-user language preference for the /language feature
+        # (en | hi | hinglish). Defaults to 'en' so existing users are
+        # unchanged until they pick a language.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN lang TEXT NOT NULL DEFAULT 'en'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
         # ── Approvals (full approve/reject/extend/block/unblock audit trail) ──
         conn.execute("""
             CREATE TABLE IF NOT EXISTS approvals (
@@ -508,6 +517,32 @@ def get_user(user_id: int) -> Optional[dict]:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
     return dict(row) if row else None
+
+
+_VALID_LANGS = ("en", "hi", "hinglish")
+
+
+def get_user_lang(user_id: int) -> str:
+    """Return the user's language preference ('en'|'hi'|'hinglish'), defaulting
+    to 'en' for unknown users or an unrecognized stored value. Safe to call
+    from any thread (opens its own connection), so the dashboard and the
+    background alert loop can both resolve a recipient's language."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if row and row["lang"] in _VALID_LANGS:
+        return row["lang"]
+    return "en"
+
+
+def set_user_lang(user_id: int, lang: str) -> bool:
+    """Set the user's language preference. Returns False for an invalid lang or
+    a user row that doesn't exist yet."""
+    if lang not in _VALID_LANGS:
+        return False
+    with get_connection() as conn:
+        cursor = conn.execute("UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id))
+        conn.commit()
+    return cursor.rowcount > 0
 
 
 def list_all_users() -> list[dict]:

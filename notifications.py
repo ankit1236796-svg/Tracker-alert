@@ -5,6 +5,11 @@ Shared proactive-alert logic used by both the automatic background loop
 (bot.py) and manual check flows (handlers.py). Kept in its own module because
 bot.py imports `router` from handlers.py — handlers.py importing back from
 bot.py would be circular.
+
+All user-facing text comes from translations.t(). Text builders take an
+explicit `lang` (the dashboard passes the recipient's stored language); the
+async senders resolve it themselves via database.get_user_lang so their
+callers don't have to.
 """
 
 import html
@@ -13,6 +18,8 @@ import logging
 from aiogram import Bot
 
 from config import UNRELIABLE_SITES
+from database import get_user_lang
+from translations import t
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +37,9 @@ def should_alert_for_price(product: dict, current_price: float | None) -> bool:
 
 async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
     """
-    Send an in-stock notification to the product owner. Sites in
-    config.UNRELIABLE_SITES are gated here — the single call site every
-    alert path (background loop, bulk /check, single-item /check) shares —
-    so a site with confirmed-flaky results can never trigger a false
-    "back in stock" push while still under investigation.
+    Send an in-stock notification to the product owner, in their language.
+    Sites in config.UNRELIABLE_SITES are gated here — the single call site
+    every alert path shares — so a flaky site can't trigger a false push.
     """
     if product["site"] in UNRELIABLE_SITES:
         logger.warning(
@@ -44,12 +49,14 @@ async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
             f"once the root cause is fixed."
         )
         return
-    price_line = f"\n💰 <b>Current price: ₹{price:,.0f}</b>" if price is not None else ""
-    text = (
-        "🚨 <b>Back in Stock!</b>\n\n"
-        f"📦 <b>{product['name']}</b> is now available on "
-        f"<b>{product['site'].capitalize()}</b>!{price_line}\n\n"
-        f"🛒 <a href=\"{product['url']}\">Buy it now →</a>"
+    lang = get_user_lang(product["user_id"])
+    price_line = ""
+    if price is not None:
+        price_line = t("stock_alert_price_line", lang, price=f"{price:,.0f}")
+    text = t(
+        "stock_alert", lang,
+        name=product["name"], site=product["site"].capitalize(),
+        price_line=price_line, url=product["url"],
     )
     try:
         await bot.send_message(
@@ -76,93 +83,63 @@ async def _safe_send(bot: Bot, user_id: int, text: str) -> bool:
         return False
 
 
-# ── Message-text builders ────────────────────────────────────────────────────
-# Pure functions returning the HTML message body, kept separate from the async
-# senders so the web dashboard (which sends via the Telegram HTTP API from a
-# non-async thread, not via the aiogram Bot object) reuses the EXACT same text
-# the bot sends — one source of truth, no drift between the two surfaces.
+# ── Message-text builders (lang-aware) ───────────────────────────────────────
+# Pure functions returning the HTML message body in the given language, kept
+# separate from the async senders so the web dashboard (which sends via the
+# Telegram HTTP API from a non-async thread, resolving the recipient's lang
+# from the DB) reuses the EXACT same text the bot sends.
 
-def approval_notice_text(plan_name: str, days: int, access_until: str) -> str:
-    return (
-        "✅ <b>Access approved!</b>\n\n"
-        f"📦 Plan: <b>{plan_name}</b>\n"
-        f"➕ Days added: <b>{days}</b>\n"
-        f"📅 Access until: <b>{access_until}</b>\n\n"
-        "Thanks for your payment — you're all set. Use /list to see your tracked items."
-    )
+def approval_notice_text(plan_name: str, days: int, access_until: str, lang: str = "en") -> str:
+    return t("approval_notice", lang, plan=plan_name, days=days, until=access_until)
 
 
-def rejection_notice_text(reason: str | None) -> str:
-    reason_line = f"\n\nReason: {reason}" if reason else ""
-    return (
-        "❌ <b>Your access request was not approved.</b>"
-        f"{reason_line}\n\nContact the admin if you have questions."
-    )
+def rejection_notice_text(reason: str | None, lang: str = "en") -> str:
+    reason_line = t("rejection_reason", lang, reason=reason) if reason else ""
+    return t("rejection_notice", lang, reason=reason_line)
 
 
-_ITEM_REMOVED_TAIL = (
-    "To keep the bot fast, accurate, and running smoothly for everyone, "
-    "some items get cleared. Re-add anytime with /add!"
-)
-
-
-def items_removed_text(product_names: list[str]) -> str:
-    # Default notice when the admin removes one or more tracked items from the
-    # dashboard. Product names are user-supplied and this goes out as
-    # parse_mode=HTML, so each is escaped to avoid breaking the message (or
-    # injecting markup) on names containing <, >, or &. A single item keeps the
-    # original one-line form; multiple items are bulleted.
+def items_removed_text(product_names: list[str], lang: str = "en") -> str:
+    # Product names are user-supplied and this goes out as parse_mode=HTML, so
+    # each is escaped. Single item keeps the one-line form; many are bulleted.
     names = [html.escape(n or "your item") for n in product_names] or ["your item"]
+    tail = t("item_removed_tail", lang)
     if len(names) == 1:
-        header = f"🦉 Ullu removed: {names[0]}"
+        header = t("item_removed_single", lang, name=names[0])
     else:
         listed = "\n".join(f"• {n}" for n in names)
-        header = f"🦉 Ullu removed the following items:\n{listed}"
-    return f"{header}\n\n{_ITEM_REMOVED_TAIL}"
+        header = f"{t('item_removed_multi_header', lang)}\n{listed}"
+    return f"{header}\n\n{tail}"
 
 
-def block_notice_text() -> str:
-    return (
-        "🚫 <b>Your access has been blocked by the admin.</b>\n\n"
-        "Contact the admin if you believe this is a mistake."
-    )
+def block_notice_text(lang: str = "en") -> str:
+    return t("block_notice", lang)
 
 
-def unblock_notice_text() -> str:
-    return "✅ <b>Your access has been restored.</b> Welcome back!"
+def unblock_notice_text(lang: str = "en") -> str:
+    return t("unblock_notice", lang)
 
 
 async def send_approval_notice(bot: Bot, user_id: int, plan_name: str, days: int, access_until: str):
-    await _safe_send(bot, user_id, approval_notice_text(plan_name, days, access_until))
+    await _safe_send(bot, user_id, approval_notice_text(plan_name, days, access_until, get_user_lang(user_id)))
 
 
 async def send_rejection_notice(bot: Bot, user_id: int, reason: str | None):
-    await _safe_send(bot, user_id, rejection_notice_text(reason))
+    await _safe_send(bot, user_id, rejection_notice_text(reason, get_user_lang(user_id)))
 
 
 async def send_expiry_reminder(bot: Bot, user_id: int, hours_left: float, is_trial: bool):
-    kind = "trial" if is_trial else "paid access"
-    await _safe_send(
-        bot, user_id,
-        f"⏰ <b>Your {kind} expires in about {round(hours_left)} hour(s).</b>\n\n"
-        "💳 To keep your alerts running, send an Amazon Gift Card to the admin "
-        "(details to be shared) and include your Telegram user ID.\n\n"
-        "📩 The admin will review and extend your access after payment.",
-    )
+    lang = get_user_lang(user_id)
+    kind = t("expiry_kind_trial" if is_trial else "expiry_kind_paid", lang)
+    await _safe_send(bot, user_id, t("expiry_reminder", lang, kind=kind, hours=round(hours_left)))
 
 
 async def send_block_notice(bot: Bot, user_id: int):
-    await _safe_send(bot, user_id, block_notice_text())
+    await _safe_send(bot, user_id, block_notice_text(get_user_lang(user_id)))
 
 
 async def send_unblock_notice(bot: Bot, user_id: int):
-    await _safe_send(bot, user_id, unblock_notice_text())
+    await _safe_send(bot, user_id, unblock_notice_text(get_user_lang(user_id)))
 
 
 async def send_data_purged_notice(bot: Bot, user_id: int, count: int):
-    await _safe_send(
-        bot, user_id,
-        f"🗑 Your <b>{count}</b> tracked item(s) have been permanently deleted "
-        "after your access grace period expired without renewal.\n\n"
-        "You can start fresh any time once your access is restored.",
-    )
+    await _safe_send(bot, user_id, t("data_purged", get_user_lang(user_id), count=count))
