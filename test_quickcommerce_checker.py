@@ -1,7 +1,17 @@
 """
-Manually verify the disabled-button-detection fix (bigbasket/zepto/blinkit)
-against a real product URL, using the EXACT production code path the live
-bot uses — stock_checker.check_stock() — not a separate test-only script.
+Manually verify the disabled-button-detection fix (bigbasket/zepto/blinkit/
+croma) against a real product URL, using the EXACT production code path the
+live bot uses — stock_checker.check_stock() — not a separate test-only
+script.
+
+Croma included here specifically to verify the BASIC (non-authenticated)
+approach: Scrape.do + render=true fetching the public product page, same
+pattern as the other 3 sites — as distinct from the authenticated
+/details-pwa inventory endpoint (see test_croma_inventory_endpoint.py),
+which is a different, separately-investigated dead end. This script exists
+to confirm the basic path (already deployed, was never itself shown to
+fail) still works, with a real 60s production timeout, not the 30s used
+while testing the authenticated endpoint.
 
 Not part of the app — bot.py never imports this.
 
@@ -17,8 +27,8 @@ For the clearest confirmation, right-click the Add/+ button in your browser
 _is_disabled=..." line this script prints — that's the direct correlation
 between what you see on the page and what the checker computed.
 
-The site (bigbasket/zepto/blinkit) is auto-detected from the URL — just
-pass the product URL, nothing else.
+The site (bigbasket/zepto/blinkit/croma) is auto-detected from the URL —
+just pass the product URL, nothing else.
 
 Usage (run via `railway run python3 test_quickcommerce_checker.py`, wherever
 SCRAPEDO_KEY is a real credential):
@@ -29,6 +39,7 @@ SCRAPEDO_KEY is a real credential):
     python3 test_quickcommerce_checker.py https://www.bigbasket.com/pd/...
     python3 test_quickcommerce_checker.py https://www.zeptonow.com/pn/.../pvid/...
     python3 test_quickcommerce_checker.py https://blinkit.com/prn/.../prid/...
+    python3 test_quickcommerce_checker.py https://www.croma.com/.../p/...
 """
 
 import asyncio
@@ -43,7 +54,7 @@ logging.basicConfig(
 from checkers import detect_site
 from stock_checker import check_stock
 
-_VALID_SITES = {"bigbasket", "zepto", "blinkit"}
+_VALID_SITES = {"bigbasket", "zepto", "blinkit", "croma"}
 
 
 async def main():
