@@ -38,7 +38,7 @@ from database import (
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
 from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
-from translations import t, LANG_LABEL
+from translations import t, LANG_LABEL, LANGS
 from config import (
     SUPPORTED_SITES,
     TRIAL_DAYS,
@@ -338,12 +338,13 @@ def _select_keyboard(products: list[dict], selected_ids: set[int]) -> InlineKeyb
 # ---------------------------------------------------------------------------
 
 def _language_keyboard(*, first_run: bool) -> InlineKeyboardMarkup:
-    # first_run=True chains into showing the welcome after the pick.
+    # first_run=True chains into showing the welcome after the pick. Built
+    # from translations.LANGS/LANG_LABEL (7 languages) rather than a hardcoded
+    # list, so adding a language there is the only change needed here too.
     suffix = ":firstrun" if first_run else ""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="English", callback_data=f"setlang:en{suffix}")],
-        [InlineKeyboardButton(text="हिंदी", callback_data=f"setlang:hi{suffix}")],
-        [InlineKeyboardButton(text="Hinglish", callback_data=f"setlang:hinglish{suffix}")],
+        [InlineKeyboardButton(text=LANG_LABEL[lang], callback_data=f"setlang:{lang}{suffix}")]
+        for lang in LANGS
     ])
 
 
@@ -361,7 +362,7 @@ async def callback_setlang(call: CallbackQuery):
     payload = call.data.split(":", 1)[1]
     first_run = payload.endswith(":firstrun")
     lang = payload.replace(":firstrun", "")
-    if lang not in ("en", "hi", "hinglish"):
+    if lang not in LANGS:
         await call.answer()
         return
     # ensure a row exists (new users hitting the first-run prompt), then set

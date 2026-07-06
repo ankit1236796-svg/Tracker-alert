@@ -1,18 +1,25 @@
 """
 translations.py
 ~~~~~~~~~~~~~~~
-Single source of truth for user-facing message text in the three supported
-languages: English ('en'), Hindi/Devanagari formal-आप ('hi'), and balanced
-Hinglish/Roman ('hinglish').
+Single source of truth for user-facing message text in the seven supported
+languages: English ('en'), Hindi/Devanagari formal-आप ('hi'), balanced
+Hinglish/Roman ('hinglish'), Punjabi/Gurmukhi with a witty, masti tone
+('punjabi'), Haryanvi/Devanagari with a cheeky, local-slang tone ('haryanvi'),
+Tamil script ('tamil'), and Gujarati script ('gujarati').
 
 Every in-scope string is a key in _T mapping lang -> template. Templates use
 str.format named fields (e.g. {name}, {price}) and keep HTML tags + command
 tokens (/add) + emoji identical across languages — only the words change.
+Bot/technical terms (site names, "URL", "stock", "admin", "plan", "trial",
+command names) are deliberately kept in English/Latin script across every
+language, mirroring how these terms are actually used in spoken/typed
+regional-language tech conversation in India — this matches the existing
+hi/hinglish code-switching convention and is intentional, not an oversight.
 
 Resolve text with t(key, lang, **vars). Callers get the recipient's lang from
 the DB (database.get_user_lang) — the aiogram handlers, the background stock
 alert loop, and the web dashboard's notifier all funnel through here so the
-three surfaces can't drift.
+surfaces can't drift.
 
 NOTE: admin-only commands, rare/technical errors, store names, product names,
 URLs and numbers are intentionally NOT translated (English/literal).
@@ -22,10 +29,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-LANGS = ("en", "hi", "hinglish")
+LANGS = ("en", "hi", "hinglish", "punjabi", "haryanvi", "tamil", "gujarati")
 DEFAULT_LANG = "en"
 
-LANG_LABEL = {"en": "English", "hi": "हिंदी", "hinglish": "Hinglish"}
+LANG_LABEL = {
+    "en": "English",
+    "hi": "हिंदी",
+    "hinglish": "Hinglish",
+    "punjabi": "ਪੰਜਾਬੀ",
+    "haryanvi": "हरियाणवी",
+    "tamil": "தமிழ்",
+    "gujarati": "ગુજરાતી",
+}
 
 
 def t(key: str, lang: str = DEFAULT_LANG, **kwargs) -> str:
@@ -64,6 +79,26 @@ _T: dict[str, dict[str, str]] = {
             "Main bohot saari online shopping sites pe products track karta hoon "
             "aur jaise hi wo wapas stock me aate hain, turant alert bhej deta hoon.\n\n"
         ),
+        "punjabi": (
+            "👋 <b>Ullu Alert 'ch tuhada swagat hai ji!</b>\n\n{trial_line}"
+            "Main kayi online shopping sites te products nu 24/7 nazar rakhda haan, te "
+            "jiven hi stock wapas aave, tuhanu sabse pehla dassda haan — koi mauka miss nahi! 🦉\n\n"
+        ),
+        "haryanvi": (
+            "👋 <b>Ullu Alert म्ह थारा स्वागत सै भाई!</b>\n\n{trial_line}"
+            "मैं भोत सारी online shopping sites पै तेरे products पै नजर राखूं सूं, अर ज्यूं ए "
+            "स्टॉक म्ह वापस आया, तन्नै फट से बता दयुँगा — अबकी बार मौका ना चूकैगा! 🦉\n\n"
+        ),
+        "tamil": (
+            "👋 <b>Ullu Alert-க்கு வரவேற்கிறோம்!</b>\n\n{trial_line}"
+            "நான் பல online shopping sites-ல் products-ஐ கண்காணித்து, அவை stock-க்கு "
+            "திரும்பி வந்தவுடன் உங்களுக்கு உடனே alert அனுப்புவேன்.\n\n"
+        ),
+        "gujarati": (
+            "👋 <b>Ullu Alert માં તમારું સ્વાગત છે!</b>\n\n{trial_line}"
+            "હું ઘણી online shopping sites પર products ને monitor કરું છું અને "
+            "તે stock માં પાછા આવે કે તરત જ તમને alert મોકલું છું.\n\n"
+        ),
     },
     "welcome_commands": {
         "en": (
@@ -76,7 +111,7 @@ _T: dict[str, dict[str, str]] = {
             "  /search  – Search your tracked products by name\n"
             "  /stores  – List all supported stores\n"
             "  /pins    – Manage your delivery pin codes\n"
-            "  /language – Change language (English / हिंदी / Hinglish)\n"
+            "  /language – Change language (7 languages available)\n"
             "  /freetrial – Get a bonus free trial by sharing on WhatsApp\n\n"
             "Use /add to get started!"
         ),
@@ -90,7 +125,7 @@ _T: dict[str, dict[str, str]] = {
             "  /search  – अपने products नाम से खोजें\n"
             "  /stores  – सभी supported stores देखें\n"
             "  /pins    – अपने delivery pin codes manage करें\n"
-            "  /language – भाषा बदलें (English / हिंदी / Hinglish)\n"
+            "  /language – भाषा बदलें (7 भाषाएं उपलब्ध)\n"
             "  /freetrial – WhatsApp पर share करके bonus free trial पाएं\n\n"
             "शुरू करने के लिए /add इस्तेमाल करें!"
         ),
@@ -104,20 +139,84 @@ _T: dict[str, dict[str, str]] = {
             "  /search  – Apne products naam se search karo\n"
             "  /stores  – Saare supported stores dekho\n"
             "  /pins    – Apne delivery pin codes manage karo\n"
-            "  /language – Language badlo (English / हिंदी / Hinglish)\n"
+            "  /language – Language badlo (7 languages available)\n"
             "  /freetrial – WhatsApp pe share karke bonus free trial pao\n\n"
             "Shuru karne ke liye /add use karo!"
+        ),
+        "punjabi": (
+            "<b>Commands:</b>\n"
+            "  /add     – Product(s) track karo; bulk format: <code>Name | URL</code> ik line 'ch ik\n"
+            "  /list    – Apne tracked products vekho\n"
+            "  /remove  – Kise product nu track karna band karo\n"
+            "  /check   – Stock check karo (store choose karo, ja sare iko vaar)\n"
+            "  /select  – Bulk check ja delete layi items choose karo\n"
+            "  /search  – Apne products naam naal labho\n"
+            "  /stores  – Sare supported stores vekho\n"
+            "  /pins    – Apne delivery pin codes manage karo\n"
+            "  /language – Boli badlo (7 bolian available ne)\n"
+            "  /freetrial – WhatsApp te share karke bonus free trial jitto\n\n"
+            "Shuru karan layi /add use karo, chalo lag jao kamm te! 😎"
+        ),
+        "haryanvi": (
+            "<b>Commands:</b>\n"
+            "  /add     – Product(s) track कर; bulk format: <code>Name | URL</code> एक लाइन म्ह एक\n"
+            "  /list    – अपणे tracked products देख\n"
+            "  /remove  – कोए product ट्रैक करणा बंद कर\n"
+            "  /check   – स्टॉक चैक कर (स्टोर छाँट, या सारे एक साथ)\n"
+            "  /select  – Bulk check या delete खात्तर items छाँट\n"
+            "  /search  – अपणे products नाम तै ढूंढ\n"
+            "  /stores  – सारे supported stores देख\n"
+            "  /pins    – अपणे delivery pin codes manage कर\n"
+            "  /language – भाषा बदल (7 भाषा उपलब्ध सैं)\n"
+            "  /freetrial – WhatsApp पै share करके बोनस free trial ले\n\n"
+            "चल भाई, शुरू करण खात्तर /add दबा दे!"
+        ),
+        "tamil": (
+            "<b>Commands:</b>\n"
+            "  /add     – Product(s) track செய்யுங்கள்; bulk format: <code>Name | URL</code> ஒரு வரிக்கு ஒன்று\n"
+            "  /list    – உங்கள் tracked products பாருங்கள்\n"
+            "  /remove  – ஒரு product-ஐ track செய்வதை நிறுத்துங்கள்\n"
+            "  /check   – Stock check செய்யுங்கள் (store வாரியாக, அல்லது எல்லாமே ஒரே நேரத்தில்)\n"
+            "  /select  – Bulk check அல்லது delete செய்ய items தேர்ந்தெடுங்கள்\n"
+            "  /search  – உங்கள் products பெயரால் தேடுங்கள்\n"
+            "  /stores  – ஆதரிக்கப்படும் அனைத்து stores பட்டியல்\n"
+            "  /pins    – உங்கள் delivery pin codes நிர்வகிக்கவும்\n"
+            "  /language – மொழி மாற்றவும் (7 மொழிகள் உள்ளன)\n"
+            "  /freetrial – WhatsApp-ல் share செய்து bonus free trial பெறுங்கள்\n\n"
+            "தொடங்க /add-ஐ பயன்படுத்துங்கள்!"
+        ),
+        "gujarati": (
+            "<b>Commands:</b>\n"
+            "  /add     – Product(s) track કરો; bulk format: <code>Name | URL</code> એક લાઇનમાં એક\n"
+            "  /list    – તમારા tracked products જુઓ\n"
+            "  /remove  – કોઈ product track કરવાનું બંધ કરો\n"
+            "  /check   – Stock check કરો (store પસંદ કરો, અથવા બધા એકસાથે)\n"
+            "  /select  – Bulk check અથવા delete માટે items પસંદ કરો\n"
+            "  /search  – તમારા products નામ પરથી શોધો\n"
+            "  /stores  – બધા supported stores જુઓ\n"
+            "  /pins    – તમારા delivery pin codes manage કરો\n"
+            "  /language – ભાષા બદલો (7 ભાષાઓ ઉપલબ્ધ)\n"
+            "  /freetrial – WhatsApp પર share કરીને bonus free trial મેળવો\n\n"
+            "શરૂ કરવા માટે /add નો ઉપયોગ કરો!"
         ),
     },
     "status_trial": {
         "en": "🎁 <b>Free trial active</b> — {days} day(s) left (started with a {trial_days}-day trial).\n\n",
         "hi": "🎁 <b>Free trial चालू है</b> — {days} दिन बाकी ({trial_days}-दिन के trial से शुरू)।\n\n",
         "hinglish": "🎁 <b>Free trial active hai</b> — {days} din bache ({trial_days}-din ke trial se shuru).\n\n",
+        "punjabi": "🎁 <b>Free trial chalu hai ji</b> — {days} din bache ne ({trial_days}-din de trial toh shuru hoya si).\n\n",
+        "haryanvi": "🎁 <b>Free trial चालू सै भाई</b> — {days} दिन बाकी सैं ({trial_days}-दिन के trial तै शुरू होया था)।\n\n",
+        "tamil": "🎁 <b>Free trial செயலில் உள்ளது</b> — {days} நாள்(கள்) மீதம் ({trial_days}-நாள் trial-ஆக தொடங்கியது).\n\n",
+        "gujarati": "🎁 <b>Free trial ચાલુ છે</b> — {days} દિવસ બાકી ({trial_days}-દિવસના trial થી શરૂ થયું).\n\n",
     },
     "status_plan": {
         "en": "✅ <b>{plan}</b> active — {days} day(s) left.\n\n",
         "hi": "✅ <b>{plan}</b> चालू है — {days} दिन बाकी।\n\n",
         "hinglish": "✅ <b>{plan}</b> active hai — {days} din bache.\n\n",
+        "punjabi": "✅ <b>{plan}</b> chalu hai ji — {days} din bache ne.\n\n",
+        "haryanvi": "✅ <b>{plan}</b> चालू सै — {days} दिन बाकी सैं।\n\n",
+        "tamil": "✅ <b>{plan}</b> செயலில் உள்ளது — {days} நாள்(கள்) மீதம்.\n\n",
+        "gujarati": "✅ <b>{plan}</b> ચાલુ છે — {days} દિવસ બાકી.\n\n",
     },
 
     # ── Access / lockout ─────────────────────────────────────────────────────
@@ -128,6 +227,14 @@ _T: dict[str, dict[str, str]] = {
                "अगर आपको लगता है कि ये गलती है, तो admin से संपर्क करें।"),
         "hinglish": ("🚫 <b>Aapka access admin ne block kar diya hai.</b>\n\n"
                      "Agar aapko lagta hai ye galti hai, to admin se contact karo."),
+        "punjabi": ("🚫 <b>Tuhada access admin ne block kar dita hai ji.</b>\n\n"
+                    "Je tuhanu lagda hai ehh galti hai, tan admin nu sampark karo."),
+        "haryanvi": ("🚫 <b>थारा access admin नै block कर दिया सै भाई।</b>\n\n"
+                     "जै तन्नै लागे सै के ये गलती सै, तो admin तै बात कर।"),
+        "tamil": ("🚫 <b>உங்கள் access-ஐ admin block செய்துவிட்டார்.</b>\n\n"
+                  "இது தவறு என்று நினைத்தால், தயவுசெய்து admin-ஐ தொடர்பு கொள்ளுங்கள்."),
+        "gujarati": ("🚫 <b>તમારો access admin દ્વારા block કરવામાં આવ્યો છે.</b>\n\n"
+                     "જો તમને લાગે કે આ ભૂલ છે, તો કૃપા કરી admin નો સંપર્ક કરો."),
     },
     "access_no_trial": {
         "en": ("👋 <b>You don't have an active trial yet.</b>\n\n"
@@ -139,6 +246,18 @@ _T: dict[str, dict[str, str]] = {
         "hinglish": ("👋 <b>Abhi aapke paas koi active trial nahi hai.</b>\n\n"
                      "WhatsApp pe Ullu Alert share karke free trial paane ke liye /freetrial "
                      "use karo, ya manual approval ke liye admin se contact karo."),
+        "punjabi": ("👋 <b>Abhi tuhade kol koi active trial nahi hai ji.</b>\n\n"
+                    "WhatsApp te Ullu Alert share karke free trial layi /freetrial "
+                    "use karo, ja manual approval layi admin nu sampark karo."),
+        "haryanvi": ("👋 <b>अभी तेरे पाच कोए active trial कोनी भाई।</b>\n\n"
+                     "WhatsApp पै Ullu Alert शेयर करके free trial पाण खात्तर /freetrial "
+                     "दबा, या फेर admin तै मिलकै approval ले ले।"),
+        "tamil": ("👋 <b>தற்போது உங்களுக்கு active trial இல்லை.</b>\n\n"
+                  "WhatsApp-ல் Ullu Alert-ஐ share செய்து free trial பெற /freetrial-ஐ "
+                  "பயன்படுத்துங்கள், அல்லது manual approval-க்கு admin-ஐ தொடர்பு கொள்ளுங்கள்."),
+        "gujarati": ("👋 <b>અત્યારે તમારી પાસે કોઈ active trial નથી.</b>\n\n"
+                     "WhatsApp પર Ullu Alert share કરીને free trial મેળવવા /freetrial "
+                     "નો ઉપયોગ કરો, અથવા manual approval માટે admin નો સંપર્ક કરો."),
     },
     "access_expired_grace": {
         "en": ("⏰ <b>Your access has expired.</b>\n\n"
@@ -153,6 +272,22 @@ _T: dict[str, dict[str, str]] = {
                      "Aapke tracked items <b>{grace} aur din</b> tak safe rahenge — is beech "
                      "renew karo aur aapki poori list apne aap wapas aa jayegi. Uske baad wo "
                      "hamesha ke liye delete ho jaate hain.\n\n{payment}"),
+        "punjabi": ("⏰ <b>Tuhada access expire ho gaya hai ji.</b>\n\n"
+                    "Tuhade tracked items <b>{grace} hor din</b> tak safe rahinge — es vich "
+                    "renew karo te tuhadi puri list aap hi wapas aa javegi. Us tou baad ohh hamesha "
+                    "layi delete ho jaan ge.\n\n{payment}"),
+        "haryanvi": ("⏰ <b>थारा access खतम होग्या सै।</b>\n\n"
+                     "थारे tracked items <b>{grace} अर दिन</b> ताहीं सम्भाल के राखे सैं — इस बिचाल्ले "
+                     "renew कर दे, अर थारी पूरी लिस्ट अपने आप वापस आज्यागी। बाद म्ह वो सारी हमेशा खात्तर "
+                     "मिट जावैगी।\n\n{payment}"),
+        "tamil": ("⏰ <b>உங்கள் access காலாவதியாகிவிட்டது.</b>\n\n"
+                  "உங்கள் tracked items <b>இன்னும் {grace} நாள்(கள்)</b> பாதுகாப்பாக வைக்கப்படும் — "
+                  "இந்த நேரத்தில் renew செய்தால் உங்கள் முழு பட்டியலும் தானாக மீட்கப்படும். அதற்குப் பின், "
+                  "அவை நிரந்தரமாக நீக்கப்படும்.\n\n{payment}"),
+        "gujarati": ("⏰ <b>તમારો access expire થઈ ગયો છે.</b>\n\n"
+                     "તમારા tracked items <b>વધુ {grace} દિવસ</b> સુધી સુરક્ષિત રાખવામાં આવે છે — આ "
+                     "સમયમાં renew કરો અને તમારી આખી list આપોઆપ પાછી આવી જશે. ત્યાર પછી તે "
+                     "કાયમ માટે delete થઈ જશે.\n\n{payment}"),
     },
     "access_trial_ended": {
         "en": ("⏰ <b>Your trial has ended.</b>\n\n"
@@ -161,6 +296,14 @@ _T: dict[str, dict[str, str]] = {
                "इस bot को इस्तेमाल करते रहने के लिए आपको active plan चाहिए।\n\n{payment}"),
         "hinglish": ("⏰ <b>Aapka trial khatam ho gaya hai.</b>\n\n"
                      "Is bot ko use karte rehne ke liye aapko active plan chahiye.\n\n{payment}"),
+        "punjabi": ("⏰ <b>Tuhada trial khatam ho gaya hai ji.</b>\n\n"
+                    "Es bot nu use karde rehen layi tuhanu active plan chahida hai.\n\n{payment}"),
+        "haryanvi": ("⏰ <b>थारा trial खतम होग्या सै।</b>\n\n"
+                     "इस बोट नै चलाते रहण खात्तर थारे धोरै active plan होणा जरूरी सै।\n\n{payment}"),
+        "tamil": ("⏰ <b>உங்கள் trial முடிந்துவிட்டது.</b>\n\n"
+                  "இந்த bot-ஐ தொடர்ந்து பயன்படுத்த உங்களுக்கு active plan தேவை.\n\n{payment}"),
+        "gujarati": ("⏰ <b>તમારો trial પૂરો થઈ ગયો છે.</b>\n\n"
+                     "આ bot નો ઉપયોગ ચાલુ રાખવા માટે તમારે active plan જોઈએ.\n\n{payment}"),
     },
     "payment_instructions": {
         "en": ("💳 <b>To get access:</b>\n"
@@ -178,11 +321,35 @@ _T: dict[str, dict[str, str]] = {
                      "apna Telegram user ID zaroor likho.\n\n"
                      "📩 Contact: payment ke baad admin aapke access ko review karke jaldi approve "
                      "kar denge — apna status dekhne ke liye kabhi bhi /start use karo."),
+        "punjabi": ("💳 <b>Access lain layi:</b>\n"
+                    "Admin nu Amazon Gift Card bhejo (details baad vich share hongiyan) te message vich "
+                    "apna Telegram user ID zaroor likho ji.\n\n"
+                    "📩 Contact: payment tou baad admin tuhade access nu review karke jaldi approve "
+                    "kar denge — apna status vekhan layi kadi vi /start use karo."),
+        "haryanvi": ("💳 <b>Access पाण खात्तर:</b>\n"
+                     "Admin नै Amazon Gift Card भेज दे (details बाद म्ह मिलैगी) अर message म्ह "
+                     "अपणा Telegram user ID जरूर लिख दिए।\n\n"
+                     "📩 Contact: payment के बाद admin थारे access नै जांच के फट approve कर "
+                     "देवैगा — अपणा status देखण खात्तर कदे भी /start दबा दे।"),
+        "tamil": ("💳 <b>Access பெற:</b>\n"
+                  "Admin-க்கு ஒரு Amazon Gift Card அனுப்புங்கள் (விவரங்கள் பின்னர் பகிரப்படும்) மற்றும் "
+                  "message-ல் உங்கள் Telegram user ID-ஐ சேர்க்கவும்.\n\n"
+                  "📩 Contact: payment-க்குப் பிறகு admin உங்கள் access-ஐ review செய்து விரைவில் approve "
+                  "செய்வார் — உங்கள் status பார்க்க எப்போது வேண்டுமானாலும் /start பயன்படுத்தவும்."),
+        "gujarati": ("💳 <b>Access મેળવવા માટે:</b>\n"
+                     "Admin ને Amazon Gift Card મોકલો (વિગતો પછી share કરવામાં આવશે) અને message માં "
+                     "તમારો Telegram user ID જરૂર લખો.\n\n"
+                     "📩 Contact: payment પછી admin તમારો access review કરીને જલ્દી approve "
+                     "કરી દેશે — તમારો status જોવા માટે ગમે ત્યારે /start નો ઉપયોગ કરો."),
     },
     "no_active_plan": {
         "en": "⚠️ You don't have an active plan assigned. Contact the admin to get set up.",
         "hi": "⚠️ आपको कोई active plan assign नहीं है। Setup के लिए admin से संपर्क करें।",
         "hinglish": "⚠️ Aapko koi active plan assign nahi hai. Setup ke liye admin se contact karo.",
+        "punjabi": "⚠️ Tuhanu koi active plan assign nahi hai ji. Setup layi admin nu sampark karo.",
+        "haryanvi": "⚠️ थारे कोए active plan assign कोनी होया। Setup खात्तर admin तै बात कर।",
+        "tamil": "⚠️ உங்களுக்கு active plan assign செய்யப்படவில்லை. Setup செய்ய admin-ஐ தொடர்பு கொள்ளுங்கள்.",
+        "gujarati": "⚠️ તમને કોઈ active plan assign નથી થયો. Setup માટે admin નો સંપર્ક કરો.",
     },
     "item_limit": {
         "en": ("🚫 <b>Item limit reached.</b>\n\n"
@@ -197,6 +364,22 @@ _T: dict[str, dict[str, str]] = {
                      "Aapka <b>{plan}</b> plan max <b>{max}</b> items track karne deta hai, aur "
                      "abhi aap <b>{count}</b> track kar rahe ho.\n\n"
                      "/remove se koi item hatao, ya plan upgrade karne ke liye admin se contact karo."),
+        "punjabi": ("🚫 <b>Item limit puri ho gayi ji.</b>\n\n"
+                    "Tuhada <b>{plan}</b> plan vadh to vadh <b>{max}</b> items track karan dinda hai, "
+                    "te abhi tusi <b>{count}</b> track kar rahe ho.\n\n"
+                    "/remove naal koi item hatao, ja plan upgrade karan layi admin nu sampark karo."),
+        "haryanvi": ("🚫 <b>Item limit पूरी होगी।</b>\n\n"
+                     "थारा <b>{plan}</b> plan ज्यादा तै ज्यादा <b>{max}</b> items ट्रैक करण दे सै, "
+                     "अर अबार तू <b>{count}</b> ट्रैक कर रहया सै।\n\n"
+                     "/remove तै कोए item हटा दे, या फेर plan upgrade खात्तर admin तै बात कर।"),
+        "tamil": ("🚫 <b>Item limit முடிந்துவிட்டது.</b>\n\n"
+                  "உங்கள் <b>{plan}</b> plan அதிகபட்சம் <b>{max}</b> items track செய்ய அனுமதிக்கிறது, "
+                  "தற்போது நீங்கள் <b>{count}</b> track செய்கிறீர்கள்.\n\n"
+                  "/remove மூலம் ஒரு item-ஐ நீக்கவும், அல்லது plan-ஐ upgrade செய்ய admin-ஐ தொடர்பு கொள்ளுங்கள்."),
+        "gujarati": ("🚫 <b>Item limit પૂરી થઈ ગઈ.</b>\n\n"
+                     "તમારો <b>{plan}</b> plan વધુમાં વધુ <b>{max}</b> items track કરવાની છૂટ આપે છે, "
+                     "અને અત્યારે તમે <b>{count}</b> track કરી રહ્યા છો.\n\n"
+                     "/remove થી કોઈ item હટાવો, અથવા plan upgrade કરવા admin નો સંપર્ક કરો."),
     },
     "store_not_in_plan": {
         "en": ("🚫 <b>Store not included in your plan.</b>\n\n"
@@ -208,6 +391,18 @@ _T: dict[str, dict[str, str]] = {
         "hinglish": ("🚫 <b>Ye store aapke plan me nahi hai.</b>\n\n"
                      "Aapka <b>{plan}</b> plan sirf ye allow karta hai: <b>{sites}</b>.\n\n"
                      "Is store wale plan ke liye admin se upgrade karwao."),
+        "punjabi": ("🚫 <b>Eh store tuhade plan vich nahi hai ji.</b>\n\n"
+                    "Tuhada <b>{plan}</b> plan sirf eh allow karda hai: <b>{sites}</b>.\n\n"
+                    "Es store wale plan layi admin kolo upgrade karwao."),
+        "haryanvi": ("🚫 <b>ये स्टोर थारे plan म्ह कोनी।</b>\n\n"
+                     "थारा <b>{plan}</b> plan बस याई allow करै सै: <b>{sites}</b>.\n\n"
+                     "इस स्टोर आळे plan खात्तर admin तै upgrade करवा ले।"),
+        "tamil": ("🚫 <b>இந்த store உங்கள் plan-ல் இல்லை.</b>\n\n"
+                  "உங்கள் <b>{plan}</b> plan அனுமதிப்பது: <b>{sites}</b> மட்டுமே.\n\n"
+                  "இந்த store உள்ள plan-க்கு admin மூலம் upgrade செய்யுங்கள்."),
+        "gujarati": ("🚫 <b>આ store તમારા plan માં નથી.</b>\n\n"
+                     "તમારો <b>{plan}</b> plan ફક્ત આ allow કરે છે: <b>{sites}</b>.\n\n"
+                     "આ store વાળા plan માટે admin પાસેથી upgrade કરાવો."),
     },
     "store_locked": {
         "en": ("🔒 <b>{site} tracking is currently unavailable.</b>\n\n"
@@ -219,6 +414,18 @@ _T: dict[str, dict[str, str]] = {
         "hinglish": ("🔒 <b>{site} tracking abhi available nahi hai.</b>\n\n"
                      "Ye store filhaal disable kiya gaya hai. Koi aur store try karo, "
                      "ya baad me dobara check karo."),
+        "punjabi": ("🔒 <b>{site} tracking abhi available nahi hai ji.</b>\n\n"
+                    "Eh store filhaal disable kita gaya hai. Koi hor store try karo, "
+                    "ja baad vich dobara check karo."),
+        "haryanvi": ("🔒 <b>{site} tracking अबार उपलब्ध कोनी।</b>\n\n"
+                     "ये स्टोर फिलहाल बंद करया सै। कोए और स्टोर देख ले, "
+                     "या फेर बाद म्ह दोबारा चैक कर।"),
+        "tamil": ("🔒 <b>{site} tracking தற்போது கிடைக்கவில்லை.</b>\n\n"
+                  "இந்த store தற்காலிகமாக disable செய்யப்பட்டுள்ளது. வேறு "
+                  "store-ஐ முயற்சிக்கவும், அல்லது பின்னர் மீண்டும் check செய்யவும்."),
+        "gujarati": ("🔒 <b>{site} tracking હાલમાં ઉપલબ્ધ નથી.</b>\n\n"
+                     "આ store હાલ પૂરતું disable કરવામાં આવ્યું છે. કૃપા કરી બીજું "
+                     "store અજમાવો, અથવા પછી ફરી check કરો."),
     },
 
     # ── Notifications ────────────────────────────────────────────────────────
@@ -232,11 +439,27 @@ _T: dict[str, dict[str, str]] = {
         "hinglish": ("🚨 <b>Wapas Stock me aa gaya!</b>\n\n"
                      "📦 <b>{name}</b> ab <b>{site}</b> pe available hai!{price_line}\n\n"
                      "🛒 <a href=\"{url}\">Abhi kharido →</a>"),
+        "punjabi": ("🚨 <b>Oye hoi hoi! Stock wapas aa gaya!</b>\n\n"
+                    "📦 <b>{name}</b> hun <b>{site}</b> te available hai ji!{price_line}\n\n"
+                    "🛒 <a href=\"{url}\">Turant kharido, mauka na gawao →</a>"),
+        "haryanvi": ("🚨 <b>अरे भाई! स्टॉक म्ह आग्या!</b>\n\n"
+                     "📦 <b>{name}</b> अब <b>{site}</b> पै मिलण लाग्या सै!{price_line}\n\n"
+                     "🛒 <a href=\"{url}\">फट खरीद ले, मौका ना जावै →</a>"),
+        "tamil": ("🚨 <b>மீண்டும் Stock-ல் உள்ளது!</b>\n\n"
+                  "📦 <b>{name}</b> இப்போது <b>{site}</b>-ல் கிடைக்கிறது!{price_line}\n\n"
+                  "🛒 <a href=\"{url}\">இப்போதே வாங்குங்கள் →</a>"),
+        "gujarati": ("🚨 <b>પાછું Stock માં આવ્યું!</b>\n\n"
+                     "📦 <b>{name}</b> હવે <b>{site}</b> પર ઉપલબ્ધ છે!{price_line}\n\n"
+                     "🛒 <a href=\"{url}\">હમણાં જ ખરીદો →</a>"),
     },
     "stock_alert_price_line": {
         "en": "\n💰 <b>Current price: ₹{price}</b>",
         "hi": "\n💰 <b>अभी कीमत: ₹{price}</b>",
         "hinglish": "\n💰 <b>Abhi ka price: ₹{price}</b>",
+        "punjabi": "\n💰 <b>Hun da price: ₹{price}</b>",
+        "haryanvi": "\n💰 <b>अबार का प्राइस: ₹{price}</b>",
+        "tamil": "\n💰 <b>தற்போதைய price: ₹{price}</b>",
+        "gujarati": "\n💰 <b>હાલની price: ₹{price}</b>",
     },
     "item_removed_tail": {
         "en": ("To keep the bot fast, accurate, and running smoothly for everyone, "
@@ -245,16 +468,32 @@ _T: dict[str, dict[str, str]] = {
                "कभी भी /add से दोबारा जोड़ सकते हैं!"),
         "hinglish": ("Bot ko sabke liye fast, accurate aur smooth rakhne ke liye kuch items "
                      "clear ho jaate hain. Kabhi bhi /add se dobara add kar sakte ho!"),
+        "punjabi": ("Bot nu sabke layi fast, accurate te smooth rakhan layi kuch items "
+                    "clear kar dite jaande ne. Kadi vi /add naal dobara add kar sakde ho ji!"),
+        "haryanvi": ("बोट नै सबकै खात्तर fast, सही अर smooth राखण खात्तर कुछ items हटा दिए जावै सैं। "
+                     "कदे भी /add तै दोबारा जोड़ ले!"),
+        "tamil": ("Bot-ஐ அனைவருக்கும் fast, accurate மற்றும் smooth ஆக வைத்திருக்க சில items "
+                  "நீக்கப்படும். எப்போது வேண்டுமானாலும் /add மூலம் மீண்டும் சேர்க்கலாம்!"),
+        "gujarati": ("Bot ને બધા માટે fast, accurate અને smooth રાખવા માટે કેટલાક items "
+                     "દૂર કરવામાં આવે છે. ગમે ત્યારે /add થી ફરીથી ઉમેરી શકો છો!"),
     },
     "item_removed_single": {
         "en": "🦉 Ullu removed: {name}",
         "hi": "🦉 Ullu ने हटाया: {name}",
         "hinglish": "🦉 Ullu ne hataya: {name}",
+        "punjabi": "🦉 Ullu ne hataya: {name}",
+        "haryanvi": "🦉 Ullu नै हटाया: {name}",
+        "tamil": "🦉 Ullu நீக்கியது: {name}",
+        "gujarati": "🦉 Ulluએ દૂર કર્યું: {name}",
     },
     "item_removed_multi_header": {
         "en": "🦉 Ullu removed the following items:",
         "hi": "🦉 Ullu ने ये items हटाए:",
         "hinglish": "🦉 Ullu ne ye items hataye:",
+        "punjabi": "🦉 Ullu ne eh items hataye:",
+        "haryanvi": "🦉 Ullu नै ये items हटाए:",
+        "tamil": "🦉 Ullu பின்வரும் items-ஐ நீக்கியது:",
+        "gujarati": "🦉 Ulluએ નીચેના items દૂર કર્યા:",
     },
     "approval_notice": {
         "en": ("✅ <b>Access approved!</b>\n\n"
@@ -269,16 +508,40 @@ _T: dict[str, dict[str, str]] = {
                      "📦 Plan: <b>{plan}</b>\n➕ Din add hue: <b>{days}</b>\n"
                      "📅 Access kab tak: <b>{until}</b>\n\n"
                      "Payment ke liye thanks — ab sab set hai. Apne tracked items dekhne ke liye /list use karo."),
+        "punjabi": ("✅ <b>Access approve ho gaya ji, mubarakan!</b>\n\n"
+                    "📦 Plan: <b>{plan}</b>\n➕ Din add hoye: <b>{days}</b>\n"
+                    "📅 Access kadon tak: <b>{until}</b>\n\n"
+                    "Payment layi tuhada dhanwaad — hun sab set hai. Apne tracked items vekhan layi /list use karo."),
+        "haryanvi": ("✅ <b>Access approve होग्या, बधाई हो भाई!</b>\n\n"
+                     "📦 Plan: <b>{plan}</b>\n➕ जोड़े गए दिन: <b>{days}</b>\n"
+                     "📅 Access कद ताहीं: <b>{until}</b>\n\n"
+                     "payment खात्तर धन्यवाद — अब सारा सेट सै। अपणे tracked items देखण खात्तर /list दबा दे।"),
+        "tamil": ("✅ <b>Access approve ஆகிவிட்டது!</b>\n\n"
+                  "📦 Plan: <b>{plan}</b>\n➕ சேர்க்கப்பட்ட நாட்கள்: <b>{days}</b>\n"
+                  "📅 Access இது வரை: <b>{until}</b>\n\n"
+                  "உங்கள் payment-க்கு நன்றி — எல்லாம் தயார். உங்கள் tracked items பார்க்க /list பயன்படுத்துங்கள்."),
+        "gujarati": ("✅ <b>Access approve થઈ ગયો!</b>\n\n"
+                     "📦 Plan: <b>{plan}</b>\n➕ ઉમેરાયેલા દિવસો: <b>{days}</b>\n"
+                     "📅 Access ક્યાં સુધી: <b>{until}</b>\n\n"
+                     "તમારા payment માટે આભાર — હવે બધું તૈયાર છે. તમારા tracked items જોવા /list નો ઉપયોગ કરો."),
     },
     "rejection_notice": {
         "en": "❌ <b>Your access request was not approved.</b>{reason}\n\nContact the admin if you have questions.",
         "hi": "❌ <b>आपका access request approve नहीं हुआ।</b>{reason}\n\nकोई सवाल हो तो admin से संपर्क करें।",
         "hinglish": "❌ <b>Aapka access request approve nahi hua.</b>{reason}\n\nKoi sawaal ho to admin se contact karo.",
+        "punjabi": "❌ <b>Tuhada access request approve nahi hoya ji.</b>{reason}\n\nKoi sawaal hove tan admin nu sampark karo.",
+        "haryanvi": "❌ <b>थारा access request approve कोनी होया।</b>{reason}\n\nकोए सवाल हो तो admin तै बात कर ले।",
+        "tamil": "❌ <b>உங்கள் access request approve செய்யப்படவில்லை.</b>{reason}\n\nஏதேனும் கேள்வி இருந்தால் admin-ஐ தொடர்பு கொள்ளுங்கள்.",
+        "gujarati": "❌ <b>તમારો access request approve થયો નથી.</b>{reason}\n\nકોઈ પ્રશ્ન હોય તો admin નો સંપર્ક કરો.",
     },
     "rejection_reason": {
         "en": "\n\nReason: {reason}",
         "hi": "\n\nकारण: {reason}",
         "hinglish": "\n\nReason: {reason}",
+        "punjabi": "\n\nKaaran: {reason}",
+        "haryanvi": "\n\nकारण: {reason}",
+        "tamil": "\n\nகாரணம்: {reason}",
+        "gujarati": "\n\nકારણ: {reason}",
     },
     "block_notice": {
         "en": ("🚫 <b>Your access has been blocked by the admin.</b>\n\n"
@@ -287,11 +550,23 @@ _T: dict[str, dict[str, str]] = {
                "अगर आपको लगता है कि ये गलती है, तो admin से संपर्क करें।"),
         "hinglish": ("🚫 <b>Aapka access admin ne block kar diya hai.</b>\n\n"
                      "Agar aapko lagta hai ye galti hai, to admin se contact karo."),
+        "punjabi": ("🚫 <b>Tuhada access admin ne block kar dita hai ji.</b>\n\n"
+                    "Je tuhanu lagda hai ehh galti hai, tan admin nu sampark karo."),
+        "haryanvi": ("🚫 <b>थारा access admin नै block कर दिया सै भाई।</b>\n\n"
+                     "जै तन्नै लागे सै के ये गलती सै, तो admin तै बात कर।"),
+        "tamil": ("🚫 <b>உங்கள் access-ஐ admin block செய்துவிட்டார்.</b>\n\n"
+                  "இது தவறு என்று நினைத்தால், admin-ஐ தொடர்பு கொள்ளுங்கள்."),
+        "gujarati": ("🚫 <b>તમારો access admin દ્વારા block કરવામાં આવ્યો છે.</b>\n\n"
+                     "જો તમને લાગે કે આ ભૂલ છે, તો admin નો સંપર્ક કરો."),
     },
     "unblock_notice": {
         "en": "✅ <b>Your access has been restored.</b> Welcome back!",
         "hi": "✅ <b>आपका access वापस चालू कर दिया गया है।</b> वापसी पर स्वागत है!",
         "hinglish": "✅ <b>Aapka access wapas chalu kar diya gaya hai.</b> Welcome back!",
+        "punjabi": "✅ <b>Tuhada access wapas chalu kar dita gaya hai ji.</b> Wapsi te khushamdeed!",
+        "haryanvi": "✅ <b>थारा access वापस चालू करदिया सै।</b> आजा भाई, फेर तै स्वागत सै!",
+        "tamil": "✅ <b>உங்கள் access மீண்டும் இயக்கப்பட்டது.</b> மீண்டும் வரவேற்கிறோம்!",
+        "gujarati": "✅ <b>તમારો access પાછો ચાલુ કરવામાં આવ્યો છે.</b> પાછા સ્વાગત છે!",
     },
     "expiry_reminder": {
         "en": ("⏰ <b>Your {kind} expires in about {hours} hour(s).</b>\n\n"
@@ -306,9 +581,31 @@ _T: dict[str, dict[str, str]] = {
                      "💳 Apne alerts chalu rakhne ke liye admin ko Amazon Gift Card bhejo "
                      "(details baad me) aur apna Telegram user ID zaroor likho.\n\n"
                      "📩 Payment ke baad admin aapka access review karke badha denge."),
+        "punjabi": ("⏰ <b>Tuhada {kind} takriban {hours} ghantiyan vich khatam ho javega ji.</b>\n\n"
+                    "💳 Apne alerts chaalu rakhan layi admin nu Amazon Gift Card bhejo "
+                    "(details baad vich) te apna Telegram user ID zaroor likho.\n\n"
+                    "📩 Payment tou baad admin tuhada access review karke vadha denge."),
+        "haryanvi": ("⏰ <b>थारा {kind} करीबन {hours} घंटे म्ह खतम हो ज्यागा।</b>\n\n"
+                     "💳 अपणे alerts चालू राखण खात्तर admin नै Amazon Gift Card भेज दे "
+                     "(details बाद म्ह) अर अपणा Telegram user ID जरूर लिख दिए।\n\n"
+                     "📩 payment के बाद admin थारा access देख के बढ़ा देवैगा।"),
+        "tamil": ("⏰ <b>உங்கள் {kind} கிட்டத்தட்ட {hours} மணி நேரத்தில் காலாவதியாகும்.</b>\n\n"
+                  "💳 உங்கள் alerts தொடர, admin-க்கு ஒரு Amazon Gift Card அனுப்புங்கள் "
+                  "(விவரங்கள் பின்னர்) மற்றும் உங்கள் Telegram user ID-ஐ சேர்க்கவும்.\n\n"
+                  "📩 payment-க்குப் பிறகு admin உங்கள் access-ஐ review செய்து நீட்டிப்பார்."),
+        "gujarati": ("⏰ <b>તમારો {kind} લગભગ {hours} કલાકમાં expire થઈ જશે.</b>\n\n"
+                     "💳 તમારા alerts ચાલુ રાખવા માટે admin ને Amazon Gift Card મોકલો "
+                     "(વિગતો પછી) અને તમારો Telegram user ID જરૂર લખો.\n\n"
+                     "📩 payment પછી admin તમારો access review કરીને વધારી દેશે."),
     },
-    "expiry_kind_trial": {"en": "trial", "hi": "trial", "hinglish": "trial"},
-    "expiry_kind_paid": {"en": "paid access", "hi": "paid access", "hinglish": "paid access"},
+    "expiry_kind_trial": {
+        "en": "trial", "hi": "trial", "hinglish": "trial",
+        "punjabi": "trial", "haryanvi": "trial", "tamil": "trial", "gujarati": "trial",
+    },
+    "expiry_kind_paid": {
+        "en": "paid access", "hi": "paid access", "hinglish": "paid access",
+        "punjabi": "paid access", "haryanvi": "paid access", "tamil": "paid access", "gujarati": "paid access",
+    },
     "data_purged": {
         "en": ("🗑 Your <b>{count}</b> tracked item(s) have been permanently deleted "
                "after your access grace period expired without renewal.\n\n"
@@ -319,6 +616,18 @@ _T: dict[str, dict[str, str]] = {
         "hinglish": ("🗑 Aapke <b>{count}</b> tracked item(s) hamesha ke liye delete kar diye gaye hain "
                      "kyunki grace period me access renew nahi hua.\n\n"
                      "Access wapas milne pe aap kabhi bhi naye sire se shuru kar sakte ho."),
+        "punjabi": ("🗑 Tuhade <b>{count}</b> tracked item(s) hamesha layi delete kar dite gaye ne "
+                    "kyunki grace period vich access renew nahi hoya ji.\n\n"
+                    "Access wapas milan te tusi kadi vi naveen sire tou shuru kar sakde ho."),
+        "haryanvi": ("🗑 थारे <b>{count}</b> tracked item(s) हमेशा खात्तर मिट गए सैं "
+                     "क्योंके grace period म्ह access renew कोनी होया।\n\n"
+                     "access वापस मिलते ए तू फेर तै नये सिरे तै शुरू कर सकै सै।"),
+        "tamil": ("🗑 உங்கள் <b>{count}</b> tracked item(s) grace period-ல் access renew "
+                  "செய்யாததால் நிரந்தரமாக நீக்கப்பட்டுவிட்டன.\n\n"
+                  "உங்கள் access மீட்கப்பட்டவுடன் எப்போது வேண்டுமானாலும் புதிதாக தொடங்கலாம்."),
+        "gujarati": ("🗑 તમારા <b>{count}</b> tracked item(s) grace period માં access renew "
+                     "ન થવાથી કાયમ માટે delete થઈ ગયા છે.\n\n"
+                     "તમારો access પાછો મળે ત્યારે ગમે ત્યારે નવેસરથી શરૂ કરી શકો છો."),
     },
 
     # ── Free trial ───────────────────────────────────────────────────────────
@@ -326,6 +635,10 @@ _T: dict[str, dict[str, str]] = {
         "en": "🎁 <b>Get a free trial!</b> (Round {n} of {total})\n\n",
         "hi": "🎁 <b>Free trial पाएं!</b> (Round {n} / {total})\n\n",
         "hinglish": "🎁 <b>Free trial pao!</b> (Round {n} / {total})\n\n",
+        "punjabi": "🎁 <b>Free trial jitto oye!</b> (Round {n} / {total})\n\n",
+        "haryanvi": "🎁 <b>Free trial ले भाई!</b> (Round {n} / {total})\n\n",
+        "tamil": "🎁 <b>Free trial பெறுங்கள்!</b> (Round {n} / {total})\n\n",
+        "gujarati": "🎁 <b>Free trial મેળવો!</b> (Round {n} / {total})\n\n",
     },
     "ft_progress_first": {
         "en": ("Share Ullu Alert with a friend or group on WhatsApp, then confirm below — "
@@ -334,11 +647,23 @@ _T: dict[str, dict[str, str]] = {
                "free trial unlock करने के लिए ये {total} बार करें।\n\n"),
         "hinglish": ("Ullu Alert ko WhatsApp pe kisi dost ya group ko share karo, phir niche confirm karo — "
                      "free trial unlock karne ke liye ye {total} baar karo.\n\n"),
+        "punjabi": ("Ullu Alert nu WhatsApp te kise dost ja group naal share karo, fer heth confirm karo — "
+                    "free trial unlock karan layi eh {total} vaar karo, chalo lag jao! 😄\n\n"),
+        "haryanvi": ("Ullu Alert नै WhatsApp पै किसे दोस्त या ग्रुप कै गैल शेयर कर, फेर तळै confirm कर दे — "
+                     "free trial अनलॉक करण खात्तर ये काम {total} बार कर, चल जुट ज्या! 😄\n\n"),
+        "tamil": ("Ullu Alert-ஐ WhatsApp-ல் ஒரு நண்பருடன் அல்லது group-ல் share செய்யுங்கள், பிறகு கீழே confirm செய்யுங்கள் — "
+                  "உங்கள் free trial unlock ஆக இதை {total} முறை செய்யுங்கள்.\n\n"),
+        "gujarati": ("Ullu Alert ને WhatsApp પર કોઈ મિત્ર અથવા group સાથે share કરો, પછી નીચે confirm કરો — "
+                     "તમારો free trial unlock કરવા આ {total} વાર કરો.\n\n"),
     },
     "ft_progress_more": {
         "en": "✅ {done}/{total} shares done — keep going!\n\n",
         "hi": "✅ {done}/{total} shares हो गए — बढ़ते रहें!\n\n",
         "hinglish": "✅ {done}/{total} shares ho gaye — lage raho!\n\n",
+        "punjabi": "✅ {done}/{total} shares ho gaye — banti rehndi ee lagi raho ji! 💪\n\n",
+        "haryanvi": "✅ {done}/{total} shares होगे — लाग्या रह भाई, बण जागी बात! 💪\n\n",
+        "tamil": "✅ {done}/{total} shares முடிந்தது — தொடருங்கள்!\n\n",
+        "gujarati": "✅ {done}/{total} shares થઈ ગયા — ચાલુ રાખો!\n\n",
     },
     "ft_waiting": {
         "en": ("⏳ Please wait {secs} seconds while you share...\n\n"
@@ -347,11 +672,23 @@ _T: dict[str, dict[str, str]] = {
                "नीचे <b>Share on WhatsApp</b> दबाएं — app खोलें, कोई contact या group चुनें, और भेज दें।"),
         "hinglish": ("⏳ Share karte waqt {secs} second ruko...\n\n"
                      "Niche <b>Share on WhatsApp</b> dabao — app kholo, koi contact ya group choose karo, aur bhej do."),
+        "punjabi": ("⏳ Share karde waqt {secs} second ruko ji, thodi der sabar rakho...\n\n"
+                    "Heth <b>Share on WhatsApp</b> dabao — app kholo, koi contact ja group choose karo, te bhej do."),
+        "haryanvi": ("⏳ Share करते बखत {secs} सैकंड रुक ले, ज्यादा तेजी ना दिखा...\n\n"
+                     "तळै <b>Share on WhatsApp</b> दबा दे — app खोल, कोए contact या group चुण, अर भेज दे।"),
+        "tamil": ("⏳ Share செய்யும் போது {secs} வினாடிகள் காத்திருங்கள்...\n\n"
+                  "கீழே <b>Share on WhatsApp</b>-ஐ tap செய்யுங்கள் — app-ஐ திறந்து, ஒரு contact அல்லது group-ஐ தேர்ந்தெடுத்து அனுப்புங்கள்."),
+        "gujarati": ("⏳ Share કરતી વખતે {secs} સેકન્ડ રાહ જુઓ...\n\n"
+                     "નીચે <b>Share on WhatsApp</b> દબાવો — app ખોલો, કોઈ contact અથવા group પસંદ કરો, અને મોકલો."),
     },
     "ft_ready": {
         "en": "✅ Shared? Tap <b>Done</b> below to continue.",
         "hi": "✅ Share कर दिया? आगे बढ़ने के लिए नीचे <b>Done</b> दबाएं।",
         "hinglish": "✅ Share kar diya? Aage badhne ke liye niche <b>Done</b> dabao.",
+        "punjabi": "✅ Share kar dita? Agge vadhan layi heth <b>Done</b> dabao ji.",
+        "haryanvi": "✅ शेयर करदिया के? अग्गै बढ़ण खात्तर तळै <b>Done</b> दबा दे।",
+        "tamil": "✅ Share செய்துவிட்டீர்களா? தொடர கீழே <b>Done</b>-ஐ tap செய்யுங்கள்.",
+        "gujarati": "✅ Share કરી દીધું? આગળ વધવા નીચે <b>Done</b> દબાવો.",
     },
     "ft_confirm": {
         "en": ("⚠️ <b>Are you sure you shared this in {total} WhatsApp groups/contacts?</b>\n\n"
@@ -363,6 +700,18 @@ _T: dict[str, dict[str, str]] = {
         "hinglish": ("⚠️ <b>Kya sach me aapne ise {total} WhatsApp groups/contacts pe share kiya hai?</b>\n\n"
                      "Cheating karne pe aapka free trial cancel ho jayega aur future free trials se "
                      "hamesha ke liye ban ho sakte ho.\n\nPhir bhi confirm karna hai?"),
+        "punjabi": ("⚠️ <b>Sacchi dasso, tusi eh {total} WhatsApp groups/contacts te share kita hai?</b>\n\n"
+                    "Jhooth bolna mehenga pave ga — free trial cancel ho javega te tusi hamesha layi "
+                    "future free trials tou ban ho sakde ho.\n\nFer vi confirm karna hai ji?"),
+        "haryanvi": ("⚠️ <b>सच बता, तन्नै ये सच म्ह {total} WhatsApp groups/contacts पै शेयर करया सै?</b>\n\n"
+                     "झूठ बोल्या तो free trial कैंसिल हो ज्यागा अर आग्गै खात्तर तन्नै हमेशा खात्तर "
+                     "ban भी कर सकां सैं।\n\nफेर भी confirm करणा सै भाई?"),
+        "tamil": ("⚠️ <b>நீங்கள் உண்மையாக இதை {total} WhatsApp groups/contacts-ல் share செய்தீர்களா?</b>\n\n"
+                  "ஏமாற்றினால் உங்கள் free trial நிராகரிக்கப்படும் மற்றும் எதிர்கால free trials-லிருந்து "
+                  "நிரந்தரமாக தடை செய்யப்படலாம்.\n\nஇன்னும் confirm செய்ய வேண்டுமா?"),
+        "gujarati": ("⚠️ <b>શું તમે ખરેખર આ {total} WhatsApp groups/contacts પર share કર્યું છે?</b>\n\n"
+                     "ચીટિંગ કરવાથી તમારો free trial રદ થઈ જશે અને તમને ભવિષ્યના free trials માંથી "
+                     "કાયમ માટે ban કરી શકાય છે.\n\nશું તમે હજુ પણ confirm કરવા માંગો છો?"),
     },
     # Inline-button labels for the /freetrial flow. Kept short — they render on
     # the buttons themselves, not in the message body.
@@ -370,21 +719,37 @@ _T: dict[str, dict[str, str]] = {
         "en": "📤 Share on WhatsApp",
         "hi": "📤 WhatsApp पर Share करें",
         "hinglish": "📤 WhatsApp pe Share karo",
+        "punjabi": "📤 WhatsApp te Share karo",
+        "haryanvi": "📤 WhatsApp पै Share कर",
+        "tamil": "📤 WhatsApp-ல் Share செய்யுங்கள்",
+        "gujarati": "📤 WhatsApp પર Share કરો",
     },
     "ft_btn_done": {
         "en": "✅ Done",
         "hi": "✅ हो गया",
         "hinglish": "✅ Ho gaya",
+        "punjabi": "✅ Ho gaya ji",
+        "haryanvi": "✅ होग्या भाई",
+        "tamil": "✅ முடிந்தது",
+        "gujarati": "✅ થઈ ગયું",
     },
     "ft_btn_confirm": {
         "en": "✅ Yes, I confirm",
         "hi": "✅ हाँ, confirm करता हूँ",
         "hinglish": "✅ Haan, confirm",
+        "punjabi": "✅ Haan ji, confirm",
+        "haryanvi": "✅ हाँ भाई, पक्का",
+        "tamil": "✅ ஆம், confirm செய்கிறேன்",
+        "gujarati": "✅ હા, confirm કરું છું",
     },
     "ft_btn_retry": {
         "en": "🔄 Retry",
         "hi": "🔄 दोबारा",
         "hinglish": "🔄 Retry",
+        "punjabi": "🔄 Fer koshish",
+        "haryanvi": "🔄 फेर तै",
+        "tamil": "🔄 மீண்டும்",
+        "gujarati": "🔄 ફરી પ્રયત્ન",
     },
     "ft_already_used": {
         "en": ("🚫 <b>You've already used this offer.</b>\n\n"
@@ -393,6 +758,14 @@ _T: dict[str, dict[str, str]] = {
                "WhatsApp-share free trial हर account पर सिर्फ़ एक बार मिल सकता है।"),
         "hinglish": ("🚫 <b>Aap ye offer pehle hi use kar chuke ho.</b>\n\n"
                      "WhatsApp-share free trial har account pe sirf ek baar mil sakta hai."),
+        "punjabi": ("🚫 <b>Tusi eh offer pehlan hi use kar chuke ho ji.</b>\n\n"
+                    "WhatsApp-share free trial har account te sirf ikk vaar milda hai."),
+        "haryanvi": ("🚫 <b>तू ये ऑफर तो पैहलेए ले चुक्या सै भाई।</b>\n\n"
+                     "WhatsApp-share free trial हर account पै बस एक ए बार मिलै सै।"),
+        "tamil": ("🚫 <b>நீங்கள் ஏற்கனவே இந்த offer-ஐ பயன்படுத்திவிட்டீர்கள்.</b>\n\n"
+                  "WhatsApp-share free trial ஒரு account-க்கு ஒரே ஒரு முறை மட்டுமே கிடைக்கும்."),
+        "gujarati": ("🚫 <b>તમે આ offer પહેલેથી જ વાપરી ચૂક્યા છો.</b>\n\n"
+                     "WhatsApp-share free trial દરેક account પર ફક્ત એક જ વાર મળી શકે છે."),
     },
     "ft_request_pending": {
         "en": ("✅ <b>Thanks for sharing!</b>\n\n"
@@ -407,6 +780,22 @@ _T: dict[str, dict[str, str]] = {
                      "Aapka free trial request admin approval ke liye pending hai. "
                      "Approve hote hi aapko bata diya jayega.\n\n"
                      "🦉 Updates ke liye join karo: https://t.me/UlluAlert"),
+        "punjabi": ("✅ <b>Share karan layi tuhada dhanwaad ji!</b>\n\n"
+                    "Tuhada free trial request admin approval layi pending hai. "
+                    "Approve hunde hi tuhanu dass dita javega.\n\n"
+                    "🦉 Updates layi join karo: https://t.me/UlluAlert"),
+        "haryanvi": ("✅ <b>शेयर करण खात्तर धन्यवाद भाई!</b>\n\n"
+                     "थारा free trial request admin approval खात्तर pending सै। "
+                     "Approve होते ए तन्नै बता दयुँगा।\n\n"
+                     "🦉 Updates खात्तर join कर: https://t.me/UlluAlert"),
+        "tamil": ("✅ <b>Share செய்ததற்கு நன்றி!</b>\n\n"
+                  "உங்கள் free trial request admin approval-க்காக pending-ல் உள்ளது. "
+                  "approve ஆனவுடன் உங்களுக்கு தெரிவிக்கப்படும்.\n\n"
+                  "🦉 Updates-க்கு https://t.me/UlluAlert-ஐ join செய்யுங்கள்!"),
+        "gujarati": ("✅ <b>Share કરવા બદલ આભાર!</b>\n\n"
+                     "તમારી free trial request admin approval માટે pending છે. "
+                     "Approve થતાં જ તમને જણાવવામાં આવશે.\n\n"
+                     "🦉 Updates માટે https://t.me/UlluAlert join કરો!"),
     },
     "ft_wa_share_text": {
         "en": ("🚨 PS5 restock? New iPhone drop? Don't miss it again!\n\n"
@@ -421,11 +810,31 @@ _T: dict[str, dict[str, str]] = {
                      "Main Ullu Alert use karta hoon (100% FREE) — ye products ko 24/7 watch karta hai aur "
                      "stock aate hi turant ping kar deta hai, to koi restock miss nahi hota. 🔥\n\n"
                      "Free try karo: {link}"),
+        "punjabi": ("🚨 PS5 restock? Naveen iPhone aa gaya? Hun mauka na gawao!\n\n"
+                    "Main Ullu Alert use karda haan (100% FREE) — eh products nu 24/7 nazar rakhda hai te "
+                    "stock aande hi turant ping kar denda hai, tan koi restock miss nahi hunda. 🔥\n\n"
+                    "Free try karo: {link}"),
+        "haryanvi": ("🚨 PS5 फेर आग्या? नया iPhone आग्या? इस बार मौका मत चूकिये!\n\n"
+                     "मैं Ullu Alert यूज़ करूं सूं (100% FREE) — ये products नै 24/7 नजर राखै सै अर "
+                     "स्टॉक आते ए फट ping कर देवै सै, तो कदे भी restock मिस कोनी होन्दा। 🔥\n\n"
+                     "Free म्ह try कर: {link}"),
+        "tamil": ("🚨 PS5 restock? புது iPhone வந்ததா? இனி மிஸ் பண்ணாதீங்க!\n\n"
+                  "நான் Ullu Alert பயன்படுத்துகிறேன் (100% FREE) — இது products-ஐ 24/7 கண்காணித்து "
+                  "stock வந்த உடனே எனக்கு ping அனுப்பும், அதனால் நான் ஒரு restock-ஐயும் தவறவிடுவதில்லை. 🔥\n\n"
+                  "இலவசமாக முயற்சிக்கவும்: {link}"),
+        "gujarati": ("🚨 PS5 restock? નવો iPhone આવ્યો? હવે ચૂકતા નહીં!\n\n"
+                     "હું Ullu Alert વાપરું છું (100% FREE) — તે products ને 24/7 જુએ છે અને stock "
+                     "આવતાં જ મને તરત ping કરે છે, એટલે હું ક્યારેય restock miss નથી કરતો. 🔥\n\n"
+                     "મફતમાં try કરો: {link}"),
     },
     "ft_admin_no_need": {
         "en": "The admin account doesn't need a trial.",
         "hi": "Admin account को trial की ज़रूरत नहीं है।",
         "hinglish": "Admin account ko trial ki zaroorat nahi hai.",
+        "punjabi": "Admin account nu trial di lod nahi hai.",
+        "haryanvi": "Admin account नै trial की जरूरत कोनी।",
+        "tamil": "Admin account-க்கு trial தேவையில்லை.",
+        "gujarati": "Admin account ને trial ની જરૂર નથી.",
     },
 
     # ── Add flow ─────────────────────────────────────────────────────────────
@@ -445,6 +854,26 @@ _T: dict[str, dict[str, str]] = {
                      "<code>Watch | https://amazon.in/…\nShirt | https://flipkart.com/…</code>\n\n"
                      "<b>Option B — Single:</b> bas product ka naam bhejo, phir agle step me URL.\n\n"
                      "Cancel karne ke liye /cancel likho."),
+        "punjabi": ("📦 <b>Product(s) add karo ji</b>\n\n"
+                    "<b>Option A — Bulk (ikk line 'ch ikk):</b>\n"
+                    "<code>Watch | https://amazon.in/…\nShirt | https://flipkart.com/…</code>\n\n"
+                    "<b>Option B — Single:</b> bas product da naam bhejo, fer agle step vich URL.\n\n"
+                    "Cancel karan layi /cancel likho."),
+        "haryanvi": ("📦 <b>Product(s) जोड़</b>\n\n"
+                     "<b>Option A — Bulk (एक लाइन म्ह एक):</b>\n"
+                     "<code>Watch | https://amazon.in/…\nShirt | https://flipkart.com/…</code>\n\n"
+                     "<b>Option B — Single:</b> बस product का नाम भेज दे, फेर अगले step म्ह URL।\n\n"
+                     "रद्द करण खात्तर /cancel लिख दे।"),
+        "tamil": ("📦 <b>Product(s) சேர்க்கவும்</b>\n\n"
+                  "<b>Option A — Bulk (ஒரு வரிக்கு ஒன்று):</b>\n"
+                  "<code>Watch | https://amazon.in/…\nShirt | https://flipkart.com/…</code>\n\n"
+                  "<b>Option B — Single:</b> product பெயரை மட்டும் அனுப்புங்கள், பிறகு அடுத்த step-ல் URL.\n\n"
+                  "நிறுத்த /cancel-ஐ type செய்யவும்."),
+        "gujarati": ("📦 <b>Product(s) ઉમેરો</b>\n\n"
+                     "<b>Option A — Bulk (એક લાઇનમાં એક):</b>\n"
+                     "<code>Watch | https://amazon.in/…\nShirt | https://flipkart.com/…</code>\n\n"
+                     "<b>Option B — Single:</b> ફક્ત product નું નામ મોકલો, પછી આગલા step માં URL.\n\n"
+                     "રદ કરવા /cancel લખો."),
     },
     "add_name_saved": {
         "en": ("✅ Name saved: <b>{name}</b>\n\n"
@@ -459,16 +888,40 @@ _T: dict[str, dict[str, str]] = {
                      "Step 2 of 2 — Mujhe <b>product URL</b> bhejo.\n"
                      "Ek saath kai products add karne ke liye <b>kai URLs (ek line me ek)</b> paste karo.\n"
                      "Supported: {sites}"),
+        "punjabi": ("✅ Naam save ho gaya: <b>{name}</b>\n\n"
+                    "Step 2 of 2 — Mainu <b>product URL</b> bhejo ji.\n"
+                    "Ikko vaari kayi products add karan layi <b>kayi URLs (ikk line 'ch ikk)</b> paste karo.\n"
+                    "Supported: {sites}"),
+        "haryanvi": ("✅ नाम सेव होग्या: <b>{name}</b>\n\n"
+                     "Step 2 of 2 — मन्नै <b>product URL</b> भेज दे।\n"
+                     "एक साथ भोत सारे products जोड़ण खात्तर <b>भोत सारे URLs (एक लाइन म्ह एक)</b> paste कर दे।\n"
+                     "Supported: {sites}"),
+        "tamil": ("✅ பெயர் save ஆனது: <b>{name}</b>\n\n"
+                  "Step 2 of 2 — எனக்கு <b>product URL</b>-ஐ அனுப்புங்கள்.\n"
+                  "ஒரே நேரத்தில் பல products சேர்க்க <b>பல URLs (ஒரு வரிக்கு ஒன்று)</b> paste செய்யுங்கள்.\n"
+                  "Supported: {sites}"),
+        "gujarati": ("✅ નામ save થયું: <b>{name}</b>\n\n"
+                     "Step 2 of 2 — મને <b>product URL</b> મોકલો.\n"
+                     "એકસાથે ઘણા products ઉમેરવા <b>ઘણા URLs (એક લાઇનમાં એક)</b> paste કરો.\n"
+                     "Supported: {sites}"),
     },
     "add_empty_input": {
         "en": "Input cannot be empty. Please try again.",
         "hi": "Input खाली नहीं हो सकता। कृपया दोबारा try करें।",
         "hinglish": "Input khaali nahi ho sakta. Dobara try karo.",
+        "punjabi": "Input khaali nahi ho sakda ji. Dobara try karo.",
+        "haryanvi": "Input खाली कोनी हो सकता। फेर तै try कर।",
+        "tamil": "Input காலியாக இருக்கக்கூடாது. மீண்டும் முயற்சிக்கவும்.",
+        "gujarati": "Input ખાલી ન હોઈ શકે. કૃપા કરી ફરી try કરો.",
     },
     "add_invalid_url": {
         "en": "⚠️ That doesn't look like a valid URL. Please paste the full link (starting with https://).",
         "hi": "⚠️ ये सही URL नहीं लग रहा। कृपया पूरा link paste करें (https:// से शुरू)।",
         "hinglish": "⚠️ Ye sahi URL nahi lag raha. Poora link paste karo (https:// se shuru hone wala).",
+        "punjabi": "⚠️ Eh sahi URL nahi lagda ji. Poora link paste karo (https:// naal shuru hona chahida).",
+        "haryanvi": "⚠️ ये सही URL कोनी लाग रहा। पूरा link paste कर दे (https:// तै शुरू होणा चाहिए)।",
+        "tamil": "⚠️ இது சரியான URL போல் தெரியவில்லை. முழு link-ஐ paste செய்யுங்கள் (https:// உடன் தொடங்க வேண்டும்).",
+        "gujarati": "⚠️ આ યોગ્ય URL લાગતું નથી. કૃપા કરી પૂરી link paste કરો (https:// થી શરૂ થવી જોઈએ).",
     },
     "add_unsupported": {
         "en": ("❌ <b>Unsupported website.</b>\n\nSupported: {sites}\n\n"
@@ -477,6 +930,14 @@ _T: dict[str, dict[str, str]] = {
                "कृपया इनमें से किसी site का link भेजें।"),
         "hinglish": ("❌ <b>Ye website supported nahi hai.</b>\n\nSupported: {sites}\n\n"
                      "Inme se kisi site ka link bhejo."),
+        "punjabi": ("❌ <b>Eh website supported nahi hai ji.</b>\n\nSupported: {sites}\n\n"
+                    "Inhan 'cho kise site da link bhejo."),
+        "haryanvi": ("❌ <b>ये website supported कोनी।</b>\n\nSupported: {sites}\n\n"
+                     "इन म्हतै कोए site का link भेज दे।"),
+        "tamil": ("❌ <b>இந்த website ஆதரிக்கப்படவில்லை.</b>\n\nSupported: {sites}\n\n"
+                  "இவற்றில் ஒரு site-ன் link-ஐ அனுப்புங்கள்."),
+        "gujarati": ("❌ <b>આ website supported નથી.</b>\n\nSupported: {sites}\n\n"
+                     "કૃપા કરી આમાંથી કોઈ site ની link મોકલો."),
     },
     "amazon_target_prompt": {
         "en": ("💰 <b>Set a target price (optional)</b>\n\nTracking: <b>{name}</b>\n\n"
@@ -491,6 +952,22 @@ _T: dict[str, dict[str, str]] = {
                      "Target price bhejo (jaise <code>1299</code> ya <code>1299.99</code>) taki alert tabhi mile "
                      "jab price utni ya usse kam ho jaye.\n\n"
                      "Ya kisi bhi price pe alert paane ke liye /skip bhejo."),
+        "punjabi": ("💰 <b>Target price set karo (optional)</b>\n\nTracking: <b>{name}</b>\n\n"
+                    "Target price bhejo (jiven <code>1299</code> ja <code>1299.99</code>) tan ke alert tadon mile "
+                    "jado price ohna jinni ja usto ghatt ho jave.\n\n"
+                    "Ja kise vi price te alert layi /skip bhejo."),
+        "haryanvi": ("💰 <b>Target price सेट कर (optional)</b>\n\nTracking: <b>{name}</b>\n\n"
+                     "Target price भेज दे (जिसा <code>1299</code> या <code>1299.99</code>) ताके alert तबी मिलै "
+                     "जब price उतणी या उस्तै कम हो ज्या।\n\n"
+                     "या फेर किसे भी price पै alert पाण खात्तर /skip भेज दे।"),
+        "tamil": ("💰 <b>Target price அமைக்கவும் (optional)</b>\n\nTracking: <b>{name}</b>\n\n"
+                  "Price அந்த அளவுக்கு அல்லது அதற்குக் கீழ் வரும்போது மட்டும் alert பெற target price அனுப்புங்கள் "
+                  "(எ.கா. <code>1299</code> அல்லது <code>1299.99</code>).\n\n"
+                  "அல்லது எந்த price-லும் alert பெற /skip அனுப்புங்கள்."),
+        "gujarati": ("💰 <b>Target price set કરો (optional)</b>\n\nTracking: <b>{name}</b>\n\n"
+                     "Price એટલી અથવા તેનાથી ઓછી થાય ત્યારે જ alert મેળવવા target price મોકલો "
+                     "(દા.ત. <code>1299</code> અથવા <code>1299.99</code>).\n\n"
+                     "અથવા કોઈપણ price પર alert મેળવવા /skip મોકલો."),
     },
     "target_invalid": {
         "en": ("⚠️ That doesn't look like a valid price. Send a number like <code>1299</code> or "
@@ -499,6 +976,14 @@ _T: dict[str, dict[str, str]] = {
                "या किसी भी price पर track करने के लिए /skip भेजें।"),
         "hinglish": ("⚠️ Ye sahi price nahi lag rahi. <code>1299</code> ya <code>1299.99</code> jaisa number bhejo, "
                      "ya kisi bhi price pe track karne ke liye /skip bhejo."),
+        "punjabi": ("⚠️ Eh sahi price nahi lagdi ji. <code>1299</code> ja <code>1299.99</code> jehda number bhejo, "
+                    "ja kise vi price te track karan layi /skip bhejo."),
+        "haryanvi": ("⚠️ ये सही price कोनी लाग रही। <code>1299</code> या <code>1299.99</code> जिसा नंबर भेज दे, "
+                     "या फेर किसे भी price पै track करण खात्तर /skip भेज दे।"),
+        "tamil": ("⚠️ இது சரியான price போல் தெரியவில்லை. <code>1299</code> அல்லது <code>1299.99</code> போன்ற எண்ணை அனுப்புங்கள், "
+                  "அல்லது எந்த price-லும் track செய்ய /skip அனுப்புங்கள்."),
+        "gujarati": ("⚠️ આ યોગ્ય price લાગતી નથી. <code>1299</code> અથવા <code>1299.99</code> જેવો number મોકલો, "
+                     "અથવા કોઈપણ price પર track કરવા /skip મોકલો."),
     },
     "product_added": {
         "en": ("🎉 <b>Product added!</b>\n\n📌 <b>Name:</b> {name}\n🛒 <b>Site:</b> {site}\n"
@@ -507,11 +992,23 @@ _T: dict[str, dict[str, str]] = {
                "🔗 <b>URL:</b> {url}\n\nStock में वापस आते ही मैं आपको बता दूँगा!"),
         "hinglish": ("🎉 <b>Product add ho gaya!</b>\n\n📌 <b>Name:</b> {name}\n🛒 <b>Site:</b> {site}\n"
                      "🔗 <b>URL:</b> {url}\n\nStock me wapas aate hi main aapko bata dunga!"),
+        "punjabi": ("🎉 <b>Product add ho gaya ji!</b>\n\n📌 <b>Name:</b> {name}\n🛒 <b>Site:</b> {site}\n"
+                    "🔗 <b>URL:</b> {url}\n\nStock vich wapas aunde hi main tuhanu dass devanga, promise! 🦉"),
+        "haryanvi": ("🎉 <b>Product जुड़ग्या भाई!</b>\n\n📌 <b>Name:</b> {name}\n🛒 <b>Site:</b> {site}\n"
+                     "🔗 <b>URL:</b> {url}\n\nस्टॉक म्ह वापस आते ए मैं तन्नै फट बता दयुँगा, पक्का! 🦉"),
+        "tamil": ("🎉 <b>Product சேர்க்கப்பட்டது!</b>\n\n📌 <b>Name:</b> {name}\n🛒 <b>Site:</b> {site}\n"
+                  "🔗 <b>URL:</b> {url}\n\nStock-க்கு திரும்பி வந்தவுடன் உங்களுக்கு தெரிவிப்பேன்!"),
+        "gujarati": ("🎉 <b>Product ઉમેરાયું!</b>\n\n📌 <b>Name:</b> {name}\n🛒 <b>Site:</b> {site}\n"
+                     "🔗 <b>URL:</b> {url}\n\nStock માં પાછું આવે કે તરત જ હું તમને જણાવીશ!"),
     },
     "cancelled": {
         "en": "❌ Cancelled.",
         "hi": "❌ रद्द कर दिया।",
         "hinglish": "❌ Cancel kar diya.",
+        "punjabi": "❌ Cancel kar dita ji.",
+        "haryanvi": "❌ Cancel करदिया।",
+        "tamil": "❌ Cancel செய்யப்பட்டது.",
+        "gujarati": "❌ Cancel કરી દીધું.",
     },
 
     # ── List / remove / check / search / stores empties+headers ──────────────
@@ -519,41 +1016,73 @@ _T: dict[str, dict[str, str]] = {
         "en": "📭 You have no tracked products yet.\nUse /add to start tracking one!",
         "hi": "📭 अभी आपके कोई tracked products नहीं हैं।\nTrack करना शुरू करने के लिए /add इस्तेमाल करें!",
         "hinglish": "📭 Abhi aapke koi tracked products nahi hain.\nTrack karna shuru karne ke liye /add use karo!",
+        "punjabi": "📭 Abhi tuhade kol koi tracked products nahi ne ji.\nShuru karan layi /add use karo!",
+        "haryanvi": "📭 अबार थारे कोए tracked products कोनी।\nशुरू करण खात्तर /add दबा दे!",
+        "tamil": "📭 தற்போது உங்களிடம் tracked products இல்லை.\nதொடங்க /add-ஐ பயன்படுத்துங்கள்!",
+        "gujarati": "📭 અત્યારે તમારી પાસે કોઈ tracked products નથી.\nશરૂ કરવા /add નો ઉપયોગ કરો!",
     },
     "list_header": {
         "en": "📋 <b>Your Tracked Products</b>\n",
         "hi": "📋 <b>आपके Tracked Products</b>\n",
         "hinglish": "📋 <b>Aapke Tracked Products</b>\n",
+        "punjabi": "📋 <b>Tuhade Tracked Products</b>\n",
+        "haryanvi": "📋 <b>थारे Tracked Products</b>\n",
+        "tamil": "📋 <b>உங்கள் Tracked Products</b>\n",
+        "gujarati": "📋 <b>તમારા Tracked Products</b>\n",
     },
     "remove_empty": {
         "en": "📭 You have no products to remove.\nUse /add to start tracking one!",
         "hi": "📭 हटाने के लिए आपके कोई products नहीं हैं।\nTrack करने के लिए /add इस्तेमाल करें!",
         "hinglish": "📭 Hataane ke liye aapke koi products nahi hain.\nTrack karne ke liye /add use karo!",
+        "punjabi": "📭 Hatan layi tuhade kol koi products nahi ne.\nTrack karan layi /add use karo!",
+        "haryanvi": "📭 हटाण खात्तर थारे कोए products कोनी।\nट्रैक करण खात्तर /add दबा दे!",
+        "tamil": "📭 நீக்க உங்களிடம் products இல்லை.\ntrack செய்ய /add-ஐ பயன்படுத்துங்கள்!",
+        "gujarati": "📭 હટાવવા માટે તમારી પાસે products નથી.\nTrack કરવા /add નો ઉપયોગ કરો!",
     },
     "remove_prompt": {
         "en": "🗑 <b>Select a product to remove:</b>",
         "hi": "🗑 <b>हटाने के लिए कोई product चुनें:</b>",
         "hinglish": "🗑 <b>Hataane ke liye koi product choose karo:</b>",
+        "punjabi": "🗑 <b>Hatan layi koi product choose karo ji:</b>",
+        "haryanvi": "🗑 <b>हटाण खात्तर कोए product छाँट ले:</b>",
+        "tamil": "🗑 <b>நீக்க ஒரு product-ஐ தேர்ந்தெடுங்கள்:</b>",
+        "gujarati": "🗑 <b>હટાવવા માટે કોઈ product પસંદ કરો:</b>",
     },
     "check_empty": {
         "en": "📭 You have no tracked products yet.\nUse /add to start tracking one!",
         "hi": "📭 अभी आपके कोई tracked products नहीं हैं।\nTrack करने के लिए /add इस्तेमाल करें!",
         "hinglish": "📭 Abhi aapke koi tracked products nahi hain.\nTrack karne ke liye /add use karo!",
+        "punjabi": "📭 Abhi tuhade kol koi tracked products nahi ne.\nTrack karan layi /add use karo!",
+        "haryanvi": "📭 अबार थारे कोए tracked products कोनी।\nट्रैक करण खात्तर /add दबा दे!",
+        "tamil": "📭 தற்போது உங்களிடம் tracked products இல்லை.\ntrack செய்ய /add-ஐ பயன்படுத்துங்கள்!",
+        "gujarati": "📭 અત્યારે તમારી પાસે કોઈ tracked products નથી.\nTrack કરવા /add નો ઉપયોગ કરો!",
     },
     "check_filter_prompt": {
         "en": "🏪 <b>Filter by store</b>\n\nPick a store to check, or check all at once:",
         "hi": "🏪 <b>Store से filter करें</b>\n\nCheck करने के लिए कोई store चुनें, या सब एक साथ check करें:",
         "hinglish": "🏪 <b>Store se filter karo</b>\n\nCheck karne ke liye koi store choose karo, ya sab ek saath check karo:",
+        "punjabi": "🏪 <b>Store naal filter karo</b>\n\nCheck karan layi koi store choose karo, ja sare iko vaari check karo:",
+        "haryanvi": "🏪 <b>Store तै filter कर</b>\n\nCheck करण खात्तर कोए store छाँट, या सारे एक साथ check कर:",
+        "tamil": "🏪 <b>Store மூலம் filter செய்யவும்</b>\n\nCheck செய்ய ஒரு store-ஐ தேர்ந்தெடுக்கவும், அல்லது எல்லாவற்றையும் ஒரே நேரத்தில் check செய்யவும்:",
+        "gujarati": "🏪 <b>Store દ્વારા filter કરો</b>\n\nCheck કરવા કોઈ store પસંદ કરો, અથવા બધા એકસાથે check કરો:",
     },
     "search_empty": {
         "en": "📭 You have no tracked products to search.\nUse /add to start tracking one!",
         "hi": "📭 खोजने के लिए आपके कोई tracked products नहीं हैं।\nTrack करने के लिए /add इस्तेमाल करें!",
         "hinglish": "📭 Search karne ke liye aapke koi tracked products nahi hain.\nTrack karne ke liye /add use karo!",
+        "punjabi": "📭 Search karan layi tuhade kol koi tracked products nahi ne.\nTrack karan layi /add use karo!",
+        "haryanvi": "📭 ढूंढण खात्तर थारे कोए tracked products कोनी।\nट्रैक करण खात्तर /add दबा दे!",
+        "tamil": "📭 தேட உங்களிடம் tracked products இல்லை.\ntrack செய்ய /add-ஐ பயன்படுத்துங்கள்!",
+        "gujarati": "📭 શોધવા માટે તમારી પાસે tracked products નથી.\nTrack કરવા /add નો ઉપયોગ કરો!",
     },
     "stores_intro": {
         "en": "🏪 <b>Supported Stores</b>\n\nWe currently support tracking on these stores:\n",
         "hi": "🏪 <b>Supported Stores</b>\n\nअभी हम इन stores पर tracking support करते हैं:\n",
         "hinglish": "🏪 <b>Supported Stores</b>\n\nAbhi hum in stores pe tracking support karte hain:\n",
+        "punjabi": "🏪 <b>Supported Stores</b>\n\nAbhi asi enna stores te tracking support karde haan:\n",
+        "haryanvi": "🏪 <b>Supported Stores</b>\n\nअबार हम इन stores पै tracking support करां सां:\n",
+        "tamil": "🏪 <b>ஆதரிக்கப்படும் Stores</b>\n\nதற்போது இந்த stores-ல் tracking support செய்கிறோம்:\n",
+        "gujarati": "🏪 <b>Supported Stores</b>\n\nહાલમાં અમે આ stores પર tracking support કરીએ છીએ:\n",
     },
     "coming_soon_croma": {
         "en": ("🚧 <b>Croma tracking is temporarily unavailable.</b>\n\n"
@@ -568,6 +1097,22 @@ _T: dict[str, dict[str, str]] = {
                      "Croma ke stock detection me kuch reliability issues mile, isliye galat alerts bhejne ke "
                      "risk se bachne ke liye humne ise filhaal hata diya hai. Jald wapas check karo, ya tab tak "
                      "kisi aur supported store pe ye product track karo."),
+        "punjabi": ("🚧 <b>Croma tracking abhi temporarily unavailable hai ji.</b>\n\n"
+                    "Croma de stock detection vich kuch reliability issues labhe, es layi galat alerts bhejan de "
+                    "risk to bachan layi asi ise filhaal hata dita hai. Jaldi wapas check karo, ja odon tak "
+                    "kise hor supported store te eh product track karo."),
+        "haryanvi": ("🚧 <b>Croma tracking अबार खात्तर बंद सै।</b>\n\n"
+                     "Croma के stock detection म्ह कुछ गड़बड़ मिली, इस खात्तर गलत alerts भेजण के risk "
+                     "तै बचण खात्तर म्हने इसनै फिलहाल हटा दिया सै। जल्दी वापस चैक कर, या फेर तब ताहीं कोए और "
+                     "supported store पै ये product ट्रैक कर ले।"),
+        "tamil": ("🚧 <b>Croma tracking தற்காலிகமாக கிடைக்கவில்லை.</b>\n\n"
+                  "Croma-வின் stock detection-ல் சில reliability issues கண்டோம், தவறான alerts அனுப்பும் "
+                  "risk-ஐ தவிர்க்க தற்காலிகமாக நீக்கியுள்ளோம். விரைவில் மீண்டும் check செய்யுங்கள், அல்லது இதற்கிடையில் வேறு "
+                  "ஆதரிக்கப்படும் store-ல் இந்த product-ஐ track செய்யுங்கள்."),
+        "gujarati": ("🚧 <b>Croma tracking હાલ પૂરતું ઉપલબ્ધ નથી.</b>\n\n"
+                     "Croma ના stock detection માં અમને reliability issues મળ્યા, એટલે ખોટા alerts મોકલવાના "
+                     "risk થી બચવા અમે તેને હાલ પૂરતું હટાવી દીધું છે. જલ્દી પાછા check કરો, અથવા ત્યાં સુધી બીજા "
+                     "supported store પર આ product track કરો."),
     },
 
     # ── /language ────────────────────────────────────────────────────────────
@@ -575,15 +1120,27 @@ _T: dict[str, dict[str, str]] = {
         "en": "🌐 <b>Choose your language</b>\nAffects the main messages you see — commands stay the same.",
         "hi": "🌐 <b>अपनी भाषा चुनें</b>\nइससे आपके main messages बदलेंगे — commands वही रहेंगे।",
         "hinglish": "🌐 <b>Apni language choose karo</b>\nIsse aapke main messages badlenge — commands wahi rahenge.",
+        "punjabi": "🌐 <b>Apni boli choose karo ji</b>\nEsse tuhade main messages badalange — commands ohi rahinge.",
+        "haryanvi": "🌐 <b>अपणी भाषा चुण</b>\nइस्तै थारे main messages बदलैंगे — commands वोही रहवैंगे।",
+        "tamil": "🌐 <b>உங்கள் மொழியை தேர்ந்தெடுங்கள்</b>\nஇது நீங்கள் காணும் main messages-ஐ மாற்றும் — commands அப்படியே இருக்கும்.",
+        "gujarati": "🌐 <b>તમારી ભાષા પસંદ કરો</b>\nઆ તમારા main messages બદલશે — commands એ જ રહેશે.",
     },
     "language_set": {
         "en": "✅ Language set to <b>English</b>.",
         "hi": "✅ भाषा <b>हिंदी</b> set कर दी गई है।",
         "hinglish": "✅ Language <b>Hinglish</b> set kar di gayi hai.",
+        "punjabi": "✅ Boli <b>ਪੰਜਾਬੀ</b> set kar ditti gayi hai, waah ji waah! 🎉",
+        "haryanvi": "✅ भाषा <b>हरियाणवी</b> सेट होगी भाई, मजा आग्या! 🎉",
+        "tamil": "✅ மொழி <b>தமிழ்</b> ஆக அமைக்கப்பட்டது.",
+        "gujarati": "✅ ભાષા <b>ગુજરાતી</b> set કરવામાં આવી છે.",
     },
     "language_welcome_prompt": {
         "en": "👋 Welcome! First, choose your language:",
         "hi": "👋 स्वागत है! पहले, अपनी भाषा चुनें:",
         "hinglish": "👋 Welcome! Pehle, apni language choose karo:",
+        "punjabi": "👋 Welcome ji! Pehlan, apni boli choose karo:",
+        "haryanvi": "👋 आजा भाई, स्वागत सै! पैहले, अपणी भाषा चुण:",
+        "tamil": "👋 வரவேற்கிறோம்! முதலில், உங்கள் மொழியை தேர்ந்தெடுங்கள்:",
+        "gujarati": "👋 સ્વાગત છે! પહેલા, તમારી ભાષા પસંદ કરો:",
     },
 }

@@ -49,8 +49,9 @@ STATUS_LOCKED = "locked"
 # expired users regaining access via a WhatsApp share is exactly this
 # feature's point — gating it behind access they don't have would be
 # circular — and /language so a brand-new, not-yet-approved user can pick
-# Hindi/English/Hinglish immediately during onboarding, before doing
-# anything else (every message they'll see afterwards depends on it).
+# their preferred language (see translations.LANGS for the full list)
+# immediately during onboarding, before doing anything else (every message
+# they'll see afterwards depends on it).
 _ALWAYS_ALLOWED_COMMANDS = {"/start", "/cancel", "/freetrial", "/language"}
 
 # Callback-data prefixes for button flows that must stay reachable for the

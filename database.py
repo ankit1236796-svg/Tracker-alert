@@ -4,6 +4,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from config import DB_PATH, SHARE_TRIAL_ROUNDS_REQUIRED, ADMIN_USER_ID
+# Single source of truth for valid language codes lives in translations.LANGS
+# — imported rather than duplicated here so the two can never drift.
+from translations import LANGS as _VALID_LANGS
 
 logger = logging.getLogger(__name__)
 
@@ -163,8 +166,8 @@ def init_db():
             pass  # column already exists
 
         # Migration: add per-user language preference for the /language feature
-        # (en | hi | hinglish). Defaults to 'en' so existing users are
-        # unchanged until they pick a language.
+        # (see translations.LANGS for the full supported set). Defaults to
+        # 'en' so existing users are unchanged until they pick a language.
         try:
             conn.execute("ALTER TABLE users ADD COLUMN lang TEXT NOT NULL DEFAULT 'en'")
             conn.commit()
@@ -659,13 +662,11 @@ def get_user(user_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
-_VALID_LANGS = ("en", "hi", "hinglish")
-
 
 def get_user_lang(user_id: int) -> str:
-    """Return the user's language preference ('en'|'hi'|'hinglish'), defaulting
-    to 'en' for unknown users or an unrecognized stored value. Safe to call
-    from any thread (opens its own connection), so the dashboard and the
+    """Return the user's language preference (one of translations.LANGS),
+    defaulting to 'en' for unknown users or an unrecognized stored value. Safe
+    to call from any thread (opens its own connection), so the dashboard and the
     background alert loop can both resolve a recipient's language."""
     with get_connection() as conn:
         row = conn.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,)).fetchone()
