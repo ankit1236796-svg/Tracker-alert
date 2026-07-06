@@ -372,16 +372,16 @@ _T: dict[str, dict[str, str]] = {
         "hinglish": ("🚫 <b>Aap ye offer pehle hi use kar chuke ho.</b>\n\n"
                      "WhatsApp-share free trial har account pe sirf ek baar mil sakta hai."),
     },
-    "ft_success": {
-        "en": ("✅ <b>Free trial activated!</b>\n\n"
-               "Thanks for sharing Ullu Alert — you now have <b>{days} day(s)</b> of access. "
-               "Use /add to start tracking products!"),
-        "hi": ("✅ <b>Free trial चालू हो गया!</b>\n\n"
-               "Ullu Alert share करने के लिए धन्यवाद — अब आपके पास <b>{days} दिन</b> का access है। "
-               "Products track करना शुरू करने के लिए /add इस्तेमाल करें!"),
-        "hinglish": ("✅ <b>Free trial chalu ho gaya!</b>\n\n"
-                     "Ullu Alert share karne ke liye thanks — ab aapke paas <b>{days} din</b> ka access hai. "
-                     "Products track karna shuru karne ke liye /add use karo!"),
+    "ft_request_pending": {
+        "en": ("✅ <b>Thanks for sharing!</b>\n\n"
+               "Your free trial request is pending admin approval. "
+               "You'll be notified once approved."),
+        "hi": ("✅ <b>Share करने के लिए धन्यवाद!</b>\n\n"
+               "आपका free trial request admin approval के लिए pending है। "
+               "Approve होते ही आपको बता दिया जाएगा।"),
+        "hinglish": ("✅ <b>Share karne ke liye thanks!</b>\n\n"
+                     "Aapka free trial request admin approval ke liye pending hai. "
+                     "Approve hote hi aapko bata diya jayega."),
     },
     "ft_wa_share_text": {
         "en": ("🚨 PS5 restock? New iPhone drop? Don't miss it again!\n\n"

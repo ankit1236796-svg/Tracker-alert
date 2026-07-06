@@ -28,7 +28,7 @@ from database import (
     get_user,
     get_or_create_user,
     has_used_share_trial,
-    activate_share_trial,
+    request_share_trial,
     get_share_trial_rounds,
     increment_share_trial_round,
     reset_share_trial_rounds,
@@ -599,9 +599,9 @@ async def callback_freetrial_retry(call: CallbackQuery):
 async def callback_freetrial_confirm(call: CallbackQuery):
     user_id = call.from_user.id
     lang = get_user_lang(user_id)
-    granted, updated = activate_share_trial(user_id)
+    requested, _updated = request_share_trial(user_id)
 
-    if not granted:
+    if not requested:
         if has_used_share_trial(user_id):
             await call.message.edit_text(t("ft_already_used", lang), parse_mode="HTML")
         else:
@@ -613,11 +613,9 @@ async def callback_freetrial_confirm(call: CallbackQuery):
         await call.answer()
         return
 
-    info = compute_access(updated)
-    days_left = max(0, round(info.days_remaining or 0, 1))
-    await call.message.edit_text(
-        t("ft_success", lang, days=days_left), parse_mode="HTML",
-    )
+    # No longer auto-activates: this creates a pending request the admin
+    # must approve via /approve or the dashboard (see request_share_trial).
+    await call.message.edit_text(t("ft_request_pending", lang), parse_mode="HTML")
     await call.answer()
 
 

@@ -312,15 +312,24 @@ async def cmd_pending(message: Message):
             continue  # deliberately blocked, not "pending"
         info = compute_access(u)
         if info.status in (STATUS_TRIAL, STATUS_EXPIRED_GRACE):
-            rows.append((u, info))
+            rows.append((u, info, False))
+        elif u.get("share_trial_requested"):
+            # Completed the 5-round WhatsApp-share cycle but has no access yet
+            # (status is usually LOCKED — they never had access before) —
+            # surfaced here so the admin can /approve or /reject it like any
+            # other pending request.
+            rows.append((u, info, True))
 
     if not rows:
         await message.answer("📭 No users currently in trial or awaiting approval.")
         return
 
     lines = [f"⏳ <b>Pending ({len(rows)})</b>\n"]
-    for u, info in rows:
-        label = "Trial" if info.status == STATUS_TRIAL else "Awaiting approval (in grace)"
+    for u, info, via_share in rows:
+        if via_share:
+            label = "Trial requested (via share)"
+        else:
+            label = "Trial" if info.status == STATUS_TRIAL else "Awaiting approval (in grace)"
         lines.append(
             f"👤 <code>{u['user_id']}</code> {_display_name(u)} — {label}\n"
             f"   {_fmt_days(info.days_remaining)}"

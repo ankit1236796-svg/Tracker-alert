@@ -335,6 +335,17 @@ def create_app() -> Flask:
                     "days": _fmt_days(info.days_remaining),
                     "grace_days": _fmt_days(info.grace_days_remaining) if info.grace_days_remaining else "—",
                 })
+            elif u.get("share_trial_requested"):
+                # Completed the 5-round WhatsApp-share cycle but has no
+                # access yet — surfaced here (distinct "kind" label) so the
+                # admin can /approve or reject it like any other request.
+                rows.append({
+                    "user_id": u["user_id"],
+                    "name": _display_name(u),
+                    "kind": "Trial requested (via share)",
+                    "days": _fmt_days(info.days_remaining),
+                    "grace_days": "—",
+                })
         return render_template("pending.html", rows=rows, plans=list_plans(active_only=True))
 
     @app.route("/plans")

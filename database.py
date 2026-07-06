@@ -3,7 +3,7 @@ import sqlite3
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from config import DB_PATH, TRIAL_DAYS, SHARE_TRIAL_ROUNDS_REQUIRED, ADMIN_USER_ID
+from config import DB_PATH, SHARE_TRIAL_ROUNDS_REQUIRED, ADMIN_USER_ID
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,17 @@ def init_db():
         # survives a bot restart or the user taking a break between shares.
         try:
             conn.execute("ALTER TABLE users ADD COLUMN share_trial_rounds_done INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # Migration: add share_trial_requested flag. Completing the 5-round
+        # share+confirm cycle no longer auto-grants the trial — it creates a
+        # pending request the admin must approve (see request_share_trial),
+        # so /freetrial has the same manual-approval checkpoint as any other
+        # new user. Cleared by grant_access/reject_user once the admin acts.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN share_trial_requested INTEGER NOT NULL DEFAULT 0")
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
@@ -707,8 +718,11 @@ def grant_access(user_id: int, plan_id: int | None, days: int, admin_id: int) ->
     top of it (so two 30-day gift cards correctly extend to 60 days from the
     current expiry); otherwise the new period starts from now. Clears
     `blocked`, sets is_trial=0 (formally approved, no longer just "trialing"),
-    and resets reminder_sent_until so the expiry reminder can fire again for
-    the new deadline. Records the approval and returns the updated user row.
+    resets reminder_sent_until so the expiry reminder can fire again for the
+    new deadline, and clears share_trial_requested (a no-op unless this
+    approval is resolving a share-trial pending request) so it stops showing
+    in /pending once acted on. Records the approval and returns the updated
+    user row.
     """
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -738,7 +752,8 @@ def grant_access(user_id: int, plan_id: int | None, days: int, admin_id: int) ->
             conn.execute(
                 """
                 UPDATE users
-                SET plan_id = ?, is_trial = 0, access_until = ?, blocked = 0, reminder_sent_until = NULL
+                SET plan_id = ?, is_trial = 0, access_until = ?, blocked = 0,
+                    reminder_sent_until = NULL, share_trial_requested = 0
                 WHERE user_id = ?
                 """,
                 (plan_id, new_until, user_id),
@@ -756,6 +771,12 @@ def reject_user(user_id: int, admin_id: int, reason: str | None = None) -> bool:
     row = get_user(user_id)
     if row is None:
         return False
+    # Clears any pending share-trial request too, so a rejected request stops
+    # showing in /pending — share_trial_used stays 1 (the one-time bonus is
+    # still considered consumed; a reject doesn't refund another attempt).
+    with get_connection() as conn:
+        conn.execute("UPDATE users SET share_trial_requested = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
     _record_approval(user_id, None, None, None, "reject", reason, admin_id)
     return True
 
@@ -811,25 +832,27 @@ def reset_share_trial_rounds(user_id: int) -> None:
         conn.commit()
 
 
-def activate_share_trial(user_id: int) -> tuple[bool, Optional[dict]]:
+def request_share_trial(user_id: int) -> tuple[bool, Optional[dict]]:
     """
-    One-time WhatsApp-share-gated trial bonus (see /freetrial in handlers.py).
-    Returns (granted, row): granted=False (row unchanged) if this user
-    already claimed it before, hasn't completed all SHARE_TRIAL_ROUNDS_REQUIRED
-    share+confirm rounds yet, or has no user row at all — the check-and-set
-    happens inside this one DB call so it's the single source of truth (safe
-    against a double-tapped confirm button), not just the handler-level UX
-    checks.
+    Called when a user completes all SHARE_TRIAL_ROUNDS_REQUIRED share+confirm
+    rounds and taps Confirm (see /freetrial in handlers.py). Does NOT grant
+    access directly: it marks share_trial_requested=1, which surfaces the
+    request in /pending (admin_handlers.py) and the dashboard's Pending list
+    alongside regular pending approvals — the admin still grants the trial
+    manually via /approve or the dashboard, exactly like any other new user.
+    This gives the admin final say even over the share-gated path.
 
-    Stacks TRIAL_DAYS onto access_until using the same "extend from whichever
-    is later: now or the current expiry" logic as grant_access. If this user
-    never had any access before (access_until was NULL — the common case now
-    that get_or_create_user no longer auto-grants a trial), this IS their
-    first real trial: the trial plan and is_trial=1 are assigned, exactly as
-    the old auto-grant used to do, so item-limit enforcement and /start's
-    "Free trial active" label work correctly. If they already have (or had)
-    real access — an admin-assigned paid plan, most likely — plan_id/is_trial
-    are left untouched: this is a bonus-days grant on top, not a plan change.
+    share_trial_used is set here too (not only at grant time) so the
+    one-time bonus can't be requested a second time while awaiting approval
+    or after being rejected — grant_access/reject_user clear
+    share_trial_requested once the admin acts, but share_trial_used stays 1
+    permanently, consistent with the offer being one-time per account.
+
+    Returns (requested, row): requested=False (row unchanged) if this user
+    already claimed/requested it before, hasn't completed all rounds yet, or
+    has no user row at all — the check-and-set happens inside this one DB
+    call so it's the single source of truth (safe against a double-tapped
+    confirm button), not just the handler-level UX checks.
     """
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -838,40 +861,14 @@ def activate_share_trial(user_id: int) -> tuple[bool, Optional[dict]]:
         if (row["share_trial_rounds_done"] or 0) < SHARE_TRIAL_ROUNDS_REQUIRED:
             return False, dict(row)
 
-        now = datetime.now(IST)
-        never_had_access = not row["access_until"]
-        base = now
-        if row["access_until"]:
-            try:
-                current_until = parse_ist(row["access_until"])
-                if current_until > now:
-                    base = current_until
-            except ValueError:
-                pass
-        new_until = (base + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-
-        if never_had_access:
-            trial_plan = conn.execute(
-                "SELECT id FROM plans WHERE is_trial_plan = 1 AND is_active = 1 LIMIT 1"
-            ).fetchone()
-            plan_id = trial_plan["id"] if trial_plan else row["plan_id"]
-            conn.execute(
-                """
-                UPDATE users
-                SET plan_id = ?, is_trial = 1, access_until = ?, share_trial_used = 1
-                WHERE user_id = ?
-                """,
-                (plan_id, new_until, user_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE users SET access_until = ?, share_trial_used = 1 WHERE user_id = ?",
-                (new_until, user_id),
-            )
+        conn.execute(
+            "UPDATE users SET share_trial_used = 1, share_trial_requested = 1 WHERE user_id = ?",
+            (user_id,),
+        )
         conn.commit()
         updated = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
 
-    logger.info(f"[share_trial] user {user_id} claimed WhatsApp-share trial bonus — new access_until={new_until}")
+    logger.info(f"[share_trial] user {user_id} completed share rounds — request pending admin approval")
     return True, dict(updated)
 
 
