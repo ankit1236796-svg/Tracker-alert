@@ -19,6 +19,27 @@ _OOS_PATTERNS = [
     "notify me when available", "coming soon",
 ]
 
+# Class tokens that mark a button/anchor as DISABLED via CSS alone, with no
+# `disabled`/`aria-disabled` HTML attribute present — the "Croma lesson" (see
+# checkers/croma.py's history). Apple's storefront greys out "Add to Bag" via
+# class styling in some states, so without this a disabled button could be
+# read as active → false in-stock. JSON-LD is checked first and is usually
+# authoritative on apple.com/in, so this button scan is only a fallback, but
+# it should still respect a class-styled disabled state.
+_DISABLED_CLASS_MARKERS = ("disable", "inactive")
+
+
+def _is_disabled(el) -> bool:
+    """Return True if a BS4 element is visually/semantically disabled — via
+    the `disabled` attribute, `aria-disabled="true"`, or a _DISABLED_CLASS_MARKERS
+    substring in its class list."""
+    if el.get("disabled") is not None:
+        return True
+    if el.get("aria-disabled", "").lower() == "true":
+        return True
+    classes = " ".join(el.get("class", [])).lower()
+    return any(marker in classes for marker in _DISABLED_CLASS_MARKERS)
+
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     html_lower = html.lower()
@@ -40,30 +61,32 @@ def check(soup: BeautifulSoup, html: str) -> bool:
         except Exception:
             pass
 
-    # ── Buttons ───────────────────────────────────────────────────────────────
+    # ── Negative signals (checked BEFORE buttons — a disabled Add-to-Bag
+    # button's surrounding page usually carries an unambiguous OOS text signal
+    # too, and this order is the safer default even where it doesn't) ─────────
+    for pattern in _OOS_PATTERNS:
+        if pattern in html_lower:
+            logger.info(f"[apple] OOS signal: '{pattern}' → False")
+            return False
+
+    # ── Buttons — skip disabled (attr, aria, OR class-styled) ─────────────────
     for btn in soup.find_all("button"):
-        if btn.get("disabled") is not None or btn.get("aria-disabled", "") == "true":
+        if _is_disabled(btn):
             continue
         text = btn.get_text(strip=True).lower()
         if any(p in text for p in _ADD_PATTERNS):
             logger.info(f"[apple] active button '{text[:40]}' → True")
             return True
 
-    # ── Attrs ─────────────────────────────────name: "buy", "add to bag" ──────
+    # ── Attrs — skip disabled — name: "buy", "add to bag" ─────────────────────
     for attr in ("data-testid", "aria-label", "id"):
         for el in soup.find_all(attrs={attr: True}):
-            if el.get("disabled") is not None or el.get("aria-disabled", "") == "true":
+            if _is_disabled(el):
                 continue
             val = (el.get(attr) or "").lower()
             if "add-to-bag" in val or "addtobag" in val or any(p in val for p in _ADD_PATTERNS):
                 logger.info(f"[apple] active attr {attr}='{val[:40]}' → True")
                 return True
-
-    # ── Negative signals ──────────────────────────────────────────────────────
-    for pattern in _OOS_PATTERNS:
-        if pattern in html_lower:
-            logger.info(f"[apple] OOS signal: '{pattern}' → False")
-            return False
 
     logger.info("[apple] no conclusive signal → defaulting OUT OF STOCK (False)")
     return False
