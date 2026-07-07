@@ -70,6 +70,11 @@ SUPPORTED_SITES = {
     "apple":           ["apple.com"],
     "oneplus":         ["oneplus.in"],
     "tataneu":         ["tataneu.com"],
+    # Brand storefronts (BBK group, like OnePlus). Bare-domain entries so the
+    # shopping subdomains resolve via detect_site's endswith("."+domain) check
+    # (e.g. mshop.vivo.com → vivo.com, mshop.iqoo.com/shop.iqoo.com → iqoo.com).
+    "vivo":            ["vivo.com"],
+    "iqoo":            ["iqoo.com"],
 }
 
 # Domains handled specially in /add with a "Coming Soon" message instead of

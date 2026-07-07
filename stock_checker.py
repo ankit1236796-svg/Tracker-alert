@@ -154,7 +154,7 @@ async def _fetch_html(scraper_url: str, site: str) -> str:
 # Digital/JioMart switch so it can be reverted independently.
 _JS_SITES = {
     "zepto", "bigbasket", "croma", "instamart", "myntra",
-    "oneplus", "tataneu",
+    "oneplus", "tataneu", "vivo", "iqoo",
 }
 
 # No sites currently support pincode-specific stock via simple cookie injection.
