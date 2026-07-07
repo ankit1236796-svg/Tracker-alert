@@ -20,6 +20,7 @@ from aiogram import Bot
 from config import UNRELIABLE_SITES
 from database import get_user_lang, is_site_locked
 from translations import t
+from affiliate import get_affiliate_url
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,15 @@ async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
     price_line = ""
     if price is not None:
         price_line = t("stock_alert_price_line", lang, price=f"{price:,.0f}")
+    # Affiliate-convert the URL at notification time (freshly generated per
+    # alert). For ineligible sites (Amazon, or anything not in
+    # AFFILIATE_ENABLED_SITES) or on any conversion failure this returns the
+    # original URL unchanged, so the alert always carries a working link.
+    alert_url = await get_affiliate_url(product["url"], product["site"])
     text = t(
         "stock_alert", lang,
         name=product["name"], site=product["site"].capitalize(),
-        price_line=price_line, url=product["url"],
+        price_line=price_line, url=alert_url,
     )
     try:
         await bot.send_message(

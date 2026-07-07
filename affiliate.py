@@ -29,6 +29,8 @@ import re
 
 import httpx
 
+from config import AFFILIATE_ENABLED_SITES
+
 logger = logging.getLogger(__name__)
 
 _API_URL = "https://ekaro-api.affiliaters.in/api/converter/public"
@@ -100,3 +102,22 @@ async def convert_url(url: str) -> str | None:
 
     logger.info(f"[affiliate] converted {url!r} -> {converted!r}")
     return converted
+
+
+async def get_affiliate_url(url: str, site: str) -> str:
+    """
+    Return an affiliate-converted URL for an eligible store, else the ORIGINAL
+    url. This is the single entry point callers (e.g. the stock alert) should
+    use — it applies the eligibility policy and guarantees a usable URL:
+
+      - Amazon is always excluded (handled separately via its own Associates
+        tag); returns the original url with no API call.
+      - Sites not in config.AFFILIATE_ENABLED_SITES return the original url
+        with no API call (no wasted request on stores EarnKaro doesn't cover).
+      - Eligible sites are converted; if conversion fails for ANY reason,
+        the original url is returned so the alert is never blocked or broken.
+    """
+    if site == "amazon" or site not in AFFILIATE_ENABLED_SITES:
+        return url
+    converted = await convert_url(url)
+    return converted or url

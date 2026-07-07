@@ -75,3 +75,23 @@ SUPPORTED_SITES = {
 # Domains handled specially in /add with a "Coming Soon" message instead of
 # the generic "unsupported site" one — see handlers.py's _coming_soon_message.
 COMING_SOON_DOMAINS = {"croma.com"}
+
+# ---------------------------------------------------------------------------
+# Affiliate-link conversion (EarnKaro / EK Affiliaters — see affiliate.py)
+# ---------------------------------------------------------------------------
+# Stores for which the bot attempts EarnKaro affiliate-link conversion on the
+# "back in stock" alert. Conversion is best-effort: any failure falls back to
+# the original URL, so a store listed here that EarnKaro doesn't actually
+# support just won't convert (no harm). Amazon is ALWAYS excluded (handled
+# separately via its own Associates tag) regardless of what's configured here.
+# Override without a redeploy via the AFFILIATE_ENABLED_SITES env var
+# (comma-separated site keys, e.g. "flipkart,myntra,ajio"); the default is the
+# set confirmed working against the live API. The API key itself is read
+# separately from EARNKARO_API_KEY at call time (see affiliate.py) and is never
+# stored in code.
+AFFILIATE_ENABLED_SITES = {
+    s.strip().lower()
+    for s in os.getenv("AFFILIATE_ENABLED_SITES", "flipkart,myntra").split(",")
+    if s.strip()
+}
+AFFILIATE_ENABLED_SITES.discard("amazon")  # never, regardless of config
