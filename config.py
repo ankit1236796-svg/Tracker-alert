@@ -48,6 +48,28 @@ PLAYWRIGHT_TIMEOUT = 30000  # ms
 
 # Supported sites
 #
+# Vijay Sales (vijaysales.com) deliberately NOT added — investigated and
+# skipped, not "not yet built". Four separate diagnostic passes (via
+# test_new_store_signals.py against real confirmed-OOS/in-stock product pages)
+# each found a real reliability problem: JSON-LD offers.availability is
+# static/stale (reads "InStock" on a confirmed-OOS page too); page-wide OOS
+# text ("currently unavailable", "notify me") appears near the buy box on BOTH
+# OOS and in-stock pages (likely a generic price-drop-alert widget, not real
+# stock text); the Add to Cart button's disabled-attribute was INCONSISTENT
+# across render modes for the same product (disabled=None at render=false,
+# disabled='' at render=true) — a headless-browser hydration-timing artifact,
+# not a real signal (the same trap that caused Croma's flip-flopping); and a
+# dedicated stock-status class element found on the page ("instock__text")
+# turned out to be identical + hidden (display:none) on both OOS and in-stock
+# pages, i.e. dead/unused markup. A targeted search for Magento/Adobe
+# Commerce's own internal GraphQL+MSI field names (stock_status, is_salable,
+# salable_quantity) — the last, most specific hypothesis tried — also came
+# back completely empty at both render modes, meaning the real stock data is
+# most likely fetched via a separate XHR call after page load that's invisible
+# to any HTML fetch regardless of render mode. Shipping a checker on any of
+# the four unreliable signals would produce false alerts; skip until a better
+# diagnostic approach is found or Vijay Sales changes its site architecture.
+#
 # Croma deliberately excluded (not "not yet built" — actively removed): the
 # checker was confirmed to flip between correct and fully-inverted results
 # across consecutive checks, then later degraded to reporting every product
