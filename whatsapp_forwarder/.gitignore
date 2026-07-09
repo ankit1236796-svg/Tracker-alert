@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Local-only WhatsApp browser profile / debug screenshots if ever run
+# outside Railway's volume — never commit a logged-in session.
+data/
