@@ -12,9 +12,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-# The browser profile + debug screenshots live on a Railway volume mounted
-# at /data — WITHOUT a volume here, every redeploy loses the WhatsApp login
-# and a fresh QR scan is needed. See README.md.
-VOLUME ["/data"]
+# The browser profile + debug screenshots are meant to live on a volume
+# mounted at /data — WITHOUT one, every redeploy loses the WhatsApp login
+# and a fresh QR scan is needed. Deliberately no Dockerfile VOLUME
+# instruction here: Railway rejects it at build time ("Invalid docker
+# volume") since it attaches volumes through its own service config/UI,
+# not native Docker volumes — attach the volume at /data there instead.
+# See README.md.
 
 CMD ["python", "main.py"]
