@@ -154,9 +154,21 @@ _LOGGED_IN_SELECTORS = [
     '#pane-side',
     'div[data-testid="chat-list"]',
 ]
-_CONTINUE_TO_CHAT_SELECTORS = [
+_INTERSTITIAL_CONTINUE_SELECTORS = [
+    # Group/Community invite links (chat.whatsapp.com/...) land on a
+    # "Continue to Chat" interstitial before the conversation opens.
     'text="Continue to Chat"',
     'a:has-text("Continue to Chat")',
+    # Channel invite links (whatsapp.com/channel/...) land on a different
+    # preview/landing page instead, showing the channel icon plus "Open App"
+    # and "Continue in web" buttons — confirmed via a live screenshot. We
+    # want "Continue in web" specifically; "Open App" tries to hand off to a
+    # native app deep link, which does nothing useful in a headless
+    # container.
+    'text="Continue in web"',
+    'button:has-text("Continue in web")',
+    'a:has-text("Continue in web")',
+    'div[role="button"]:has-text("Continue in web")',
 ]
 _MESSAGE_BOX_SELECTORS = [
     'div[contenteditable="true"][data-tab="10"]',
@@ -474,12 +486,27 @@ class WhatsAppWorker:
         page = self._page
         try:
             page.goto(invite_link, wait_until="domcontentloaded", timeout=30000)
+            # Give the landing/interstitial page a moment to render before
+            # looking for its "continue" button — same class of SPA-render
+            # delay as the QR bootstrap flow (domcontentloaded fires well
+            # before the app has actually drawn anything).
+            time.sleep(3)
 
-            # Invite links often land on an interstitial page with a
-            # "Continue to Chat" link before the actual conversation opens.
-            continue_loc, _ = _first_match(page, _CONTINUE_TO_CHAT_SELECTORS, timeout_ms=4000)
+            # Invite links land on an intermediate page before the real
+            # conversation opens — which one depends on the link type (see
+            # _INTERSTITIAL_CONTINUE_SELECTORS). Click whichever "continue"
+            # control is present; if neither is, we're probably already on
+            # the conversation itself (e.g. re-sending to a channel already
+            # open/followed in this session).
+            continue_loc, continue_sel = _first_match(
+                page, _INTERSTITIAL_CONTINUE_SELECTORS, timeout_ms=6000
+            )
             if continue_loc is not None:
+                logger.info(f"[forward] clicking interstitial continue button: {continue_sel!r}")
                 continue_loc.click()
+                time.sleep(2)  # let the actual chat/channel view start rendering
+            else:
+                logger.info("[forward] no interstitial continue button found — assuming already on the conversation")
 
             box, sel = _first_match(page, _MESSAGE_BOX_SELECTORS, timeout_ms=15000)
             if box is None:
