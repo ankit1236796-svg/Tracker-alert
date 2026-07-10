@@ -510,6 +510,7 @@ class WhatsAppWorker:
 
             box, sel = _first_match(page, _MESSAGE_BOX_SELECTORS, timeout_ms=15000)
             if box is None:
+                self._log_editable_elements()
                 raise RuntimeError("message box not found (selectors may be stale)")
 
             box.click()
@@ -527,6 +528,53 @@ class WhatsAppWorker:
             logger.error(f"[forward] failed for {invite_link}: {exc}")
             self.state.last_error = str(exc)
             self._save_debug_screenshot(invite_link)
+
+    def _log_editable_elements(self) -> None:
+        """When the message-box selector fails, dump every contenteditable /
+        input / textarea / role="textbox" element actually present on the
+        page (tag, id, class, role, aria-label, placeholder, data-tab,
+        title, visibility) to both the logs and a Telegram text message —
+        so the next selector fix can be made from real DOM data instead of
+        another guess."""
+        page = self._page
+        try:
+            elements = page.evaluate(
+                """() => {
+                    const sel = '[contenteditable], input, textarea, [role="textbox"]';
+                    return Array.from(document.querySelectorAll(sel)).slice(0, 20).map(el => ({
+                        tag: el.tagName,
+                        id: el.id,
+                        className: (el.className || '').toString(),
+                        role: el.getAttribute('role'),
+                        ariaLabel: el.getAttribute('aria-label'),
+                        placeholder: el.getAttribute('placeholder'),
+                        dataTab: el.getAttribute('data-tab'),
+                        title: el.getAttribute('title'),
+                        contentEditable: el.getAttribute('contenteditable'),
+                        visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),
+                        outerHtmlSnippet: el.outerHTML.slice(0, 200),
+                    }));
+                }"""
+            )
+        except Exception as exc:
+            logger.error(f"[forward] editable-elements dump failed: {exc}")
+            return
+
+        logger.warning(f"[forward] editable/input-like elements on page ({len(elements)} found): {elements}")
+        if not elements:
+            summary = "No contenteditable/input/textarea/role=textbox elements found on the page at all."
+        else:
+            lines = []
+            for i, el in enumerate(elements):
+                lines.append(
+                    f"{i + 1}. <{el['tag']}> id={el['id']!r} class={el['className']!r} "
+                    f"role={el['role']!r} aria-label={el['ariaLabel']!r} "
+                    f"placeholder={el['placeholder']!r} data-tab={el['dataTab']!r} "
+                    f"title={el['title']!r} contenteditable={el['contentEditable']!r} "
+                    f"visible={el['visible']}"
+                )
+            summary = "\n".join(lines)
+        _tg_send_text(f"🔍 Message box not found — editable-like elements on page:\n{summary}"[:4000])
 
     def _save_debug_screenshot(self, invite_link: str) -> None:
         try:
