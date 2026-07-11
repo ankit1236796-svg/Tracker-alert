@@ -240,6 +240,19 @@ def init_db():
                 approved_by_admin  INTEGER
             )
         """)
+        # Migration: add group_name so the forwarder can open a chat by
+        # searching WhatsApp Web's own sidebar (reliable — the account is
+        # already a member) instead of always navigating to the invite link
+        # fresh (unreliable — WhatsApp sometimes shows an interstitial
+        # landing page there instead of the chat). Nullable: resolved
+        # best-effort during admin approval via the forwarder's
+        # /resolve-name endpoint; forwarding falls back to invite-link
+        # navigation whenever this is empty. See whatsapp_forwarder/main.py.
+        try:
+            conn.execute("ALTER TABLE whatsapp_channels ADD COLUMN group_name TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
 
         # Migration: every pre-existing user (found via products/pin_codes) who
@@ -638,16 +651,22 @@ def register_whatsapp_channel(user_id: int, invite_link: str) -> None:
     status to 'pending' — even re-registering an already-active channel with a
     NEW link requires fresh admin approval (the admin manually joins each
     link; a changed link means they haven't joined that one yet), and clears
-    any prior approval bookkeeping.
+    any prior approval bookkeeping. Also ALWAYS clears group_name: a changed
+    invite_link may point at an entirely different group, so a previously
+    resolved name would be actively misleading (sidebar-search delivery
+    could match the WRONG chat by that stale name) rather than merely stale
+    — it gets re-resolved via set_whatsapp_group_name during the next
+    approval.
     """
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO whatsapp_channels (user_id, invite_link, status, registered_at, approved_at, approved_by_admin)
-            VALUES (?, ?, 'pending', ?, NULL, NULL)
+            INSERT INTO whatsapp_channels (user_id, invite_link, status, group_name, registered_at, approved_at, approved_by_admin)
+            VALUES (?, ?, 'pending', NULL, ?, NULL, NULL)
             ON CONFLICT(user_id) DO UPDATE SET
                 invite_link = excluded.invite_link,
                 status = 'pending',
+                group_name = NULL,
                 registered_at = excluded.registered_at,
                 approved_at = NULL,
                 approved_by_admin = NULL
@@ -666,16 +685,19 @@ def get_whatsapp_channel(user_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def get_active_whatsapp_channel(user_id: int) -> Optional[str]:
-    """This user's invite_link IF their registration is currently 'active',
-    else None. The single lookup whatsapp_client.py uses before forwarding —
-    pending/disabled/never-registered are all treated identically (no forward)."""
+def get_active_whatsapp_channel(user_id: int) -> Optional[dict]:
+    """{'invite_link', 'group_name'} IF this user's registration is currently
+    'active', else None. group_name may be None if it hasn't been resolved
+    yet (see set_whatsapp_group_name) — callers should fall back to
+    invite-link-only delivery in that case. The single lookup
+    whatsapp_client.py uses before forwarding — pending/disabled/
+    never-registered are all treated identically (no forward)."""
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT invite_link FROM whatsapp_channels WHERE user_id = ? AND status = 'active'",
+            "SELECT invite_link, group_name FROM whatsapp_channels WHERE user_id = ? AND status = 'active'",
             (user_id,),
         ).fetchone()
-    return row["invite_link"] if row else None
+    return dict(row) if row else None
 
 
 def approve_whatsapp_channel(user_id: int, admin_id: int) -> bool:
@@ -701,6 +723,19 @@ def disable_whatsapp_channel(user_id: int) -> bool:
         cursor = conn.execute(
             "UPDATE whatsapp_channels SET status = 'disabled' WHERE user_id = ?",
             (user_id,),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def set_whatsapp_group_name(user_id: int, group_name: str) -> bool:
+    """Store the resolved display name for sidebar-search-based delivery
+    (see whatsapp_forwarder's /resolve-name endpoint, normally called during
+    admin approval). Returns False if no registration exists for this user."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE whatsapp_channels SET group_name = ? WHERE user_id = ?",
+            (group_name, user_id),
         )
         conn.commit()
     return cursor.rowcount > 0

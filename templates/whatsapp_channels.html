@@ -14,13 +14,17 @@
 <div class="tablewrap">
   <table>
     <thead>
-      <tr><th>User</th><th>Invite link</th><th>Status</th><th>Registered</th><th></th></tr>
+      <tr><th>User</th><th>Invite link</th><th>Group name</th><th>Status</th><th>Registered</th><th></th></tr>
     </thead>
     <tbody>
       {% for r in rows %}
       <tr>
         <td><a href="{{ url_for('user_detail', uid=r.user_id) }}">{{ r.display_name }}</a> <span class="note">#{{ r.user_id }}</span></td>
         <td><a href="{{ r.invite_link }}" target="_blank" rel="noopener">{{ r.invite_link }}</a></td>
+        <td>
+          {% if r.group_name %}{{ r.group_name }}
+          {% else %}<span class="note">not resolved yet</span>{% endif %}
+        </td>
         <td>
           {% if r.status == 'active' %}<span class="pill ok">Active</span>
           {% elif r.status == 'pending' %}<span class="pill warn">Pending</span>
@@ -44,7 +48,7 @@
       </tr>
       {% endfor %}
       {% if not rows %}
-      <tr><td colspan="5" class="note">No WhatsApp channel registrations yet.</td></tr>
+      <tr><td colspan="6" class="note">No WhatsApp channel registrations yet.</td></tr>
       {% endif %}
     </tbody>
   </table>

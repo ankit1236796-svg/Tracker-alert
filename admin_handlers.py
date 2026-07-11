@@ -43,7 +43,10 @@ from database import (
     list_pending_whatsapp_channels,
     approve_whatsapp_channel,
     disable_whatsapp_channel,
+    get_whatsapp_channel,
+    set_whatsapp_group_name,
 )
+import whatsapp_client
 from notifications import (
     send_approval_notice,
     send_rejection_notice,
@@ -511,10 +514,30 @@ async def cmd_whatsappapprove(message: Message, command: CommandObject):
         return
     user_id = int(command.args.strip())
     ok = approve_whatsapp_channel(user_id, message.from_user.id)
-    if ok:
-        await message.answer(f"✅ WhatsApp channel for user {user_id} approved — alerts will now forward there.")
-    else:
+    if not ok:
         await message.answer(f"⚠️ No WhatsApp channel registration found for user {user_id}.")
+        return
+
+    reply = f"✅ WhatsApp channel for user {user_id} approved — alerts will now forward there."
+    channel = get_whatsapp_channel(user_id)
+    # Best-effort: fetch the group/channel's display name (once) so future
+    # forwards can open it via WhatsApp Web's sidebar search instead of
+    # always navigating the invite link fresh — see whatsapp_client.py and
+    # whatsapp_forwarder/main.py. This involves a real page load on the
+    # forwarder side and can take up to ~35s; approval has already
+    # succeeded above regardless of how this turns out.
+    if channel and not channel.get("group_name"):
+        name = await whatsapp_client.resolve_group_name(channel["invite_link"])
+        if name:
+            set_whatsapp_group_name(user_id, name)
+            reply += f"\n📛 Group name resolved: {name!r} (enables faster sidebar-based delivery)."
+        else:
+            reply += (
+                "\n⚠️ Couldn't auto-resolve the group name (forwarder unreachable, "
+                "not logged in, or the page didn't load) — forwarding still works "
+                "via the invite link, just without the sidebar-search shortcut."
+            )
+    await message.answer(reply)
 
 
 @router.message(Command("whatsappdisable"))

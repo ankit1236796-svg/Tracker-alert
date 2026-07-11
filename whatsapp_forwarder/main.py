@@ -18,12 +18,26 @@ one invite link per forwarded message — see database.whatsapp_channels on
 the main bot side for how a user's own channel gets approved.
 
 HTTP surface:
-  POST /forward   Bearer-secret protected. Body: {"invite_link": str, "text": str}.
-                   Enqueues the message and returns immediately (202) — the
-                   actual browser work happens on a dedicated background
-                   thread, sequentially, with a pacing delay between sends.
-  GET  /status     Unauthenticated, no sensitive data: {"logged_in": bool,
-                   "queue_length": int, "last_error": str|None}.
+  POST /forward       Bearer-secret protected. Body: {"invite_link": str,
+                       "text": str, "group_name": str (optional)}. Enqueues
+                       the message and returns immediately (202) — the
+                       actual browser work happens on a dedicated background
+                       thread, sequentially, with a pacing delay between
+                       sends. If group_name is given, the worker tries
+                       WhatsApp Web's own sidebar search first (the account
+                       is already a member post-login) and only falls back
+                       to navigating the invite link fresh if that fails —
+                       see _process_forward.
+  POST /resolve-name  Bearer-secret protected. Body: {"invite_link": str}.
+                       Synchronous (blocks the calling HTTP request, up to
+                       ~30s): navigates to invite_link and reads back the
+                       group/channel's display name, {"name": str} on
+                       success. Called once per registration, normally
+                       during admin approval on the main-bot side, so
+                       future /forward calls for that user can use the
+                       sidebar-search path above.
+  GET  /status        Unauthenticated, no sensitive data: {"logged_in": bool,
+                       "queue_length": int, "last_error": str|None}.
 
 Bootstrapping a session (first deploy, or after a logout): this container
 has no screen, so the login QR code is screenshotted and sent to the admin
@@ -169,6 +183,10 @@ _INTERSTITIAL_CONTINUE_SELECTORS = [
     'button:has-text("Continue in web")',
     'a:has-text("Continue in web")',
     'div[role="button"]:has-text("Continue in web")',
+    # Some UI variants word it as "Continue to WhatsApp Web" instead.
+    'text="Continue to WhatsApp Web"',
+    'button:has-text("Continue to WhatsApp Web")',
+    'a:has-text("Continue to WhatsApp Web")',
 ]
 _MESSAGE_BOX_SELECTORS = [
     'div[contenteditable="true"][data-tab="10"]',
@@ -178,6 +196,31 @@ _MESSAGE_BOX_SELECTORS = [
 _SEND_BUTTON_SELECTORS = [
     'button[aria-label="Send"]',
     'span[data-icon="send"]',
+]
+# Sidebar search box (top of the chat list) — used to find an already-joined
+# group/channel by name rather than always navigating its invite link fresh
+# (see _open_chat_via_sidebar).
+_SEARCH_BOX_SELECTORS = [
+    'div[contenteditable="true"][data-tab="3"]',
+    'button[aria-label="Search"]',
+    'div[title="Search input textbox"]',
+    '[aria-label="Search input textbox"]',
+]
+# Containers that might hold the filtered results after typing into the
+# search box — tried in order; WhatsApp Web has used both "the same chat
+# list, just filtered" and a separate "Search results" pane across versions.
+_CHAT_LIST_CONTAINER_SELECTORS = [
+    'div[aria-label="Chat list"]',
+    'div[aria-label="Search results"]',
+    '#pane-side',
+]
+# Candidates for the group/channel's display name on its invite-link landing
+# page — used by /resolve-name (_extract_group_name_from_landing_page), NOT
+# by the sidebar-search path above (which uses the name we already resolved).
+_GROUP_NAME_SELECTORS = [
+    'div[data-testid="group-title"]',
+    'header h1',
+    'h1',
 ]
 
 
@@ -259,6 +302,25 @@ class WhatsAppWorker:
         self.state = WorkerState()
         self._page: Page | None = None
 
+    def submit_resolve_name(self, invite_link: str, timeout: float = 30.0) -> dict:
+        """Submit a name-resolution job to the worker thread and block
+        (called from a Flask request-handling thread) until it's processed
+        or timeout elapses. Playwright's sync API isn't thread-safe, so this
+        is the only way a Flask thread can get a page-derived result —
+        everything that touches `page` still runs exclusively on the worker
+        thread; this just waits on a threading.Event it sets when done."""
+        result_holder: dict = {}
+        done_event = threading.Event()
+        self.queue.put({
+            "type": "resolve_name",
+            "invite_link": invite_link,
+            "_result_holder": result_holder,
+            "_done_event": done_event,
+        })
+        if not done_event.wait(timeout):
+            return {"error": "timed_out"}
+        return result_holder.get("result", {"error": "unknown"})
+
     # -- lifecycle ----------------------------------------------------------
 
     def run_forever(self) -> None:
@@ -292,6 +354,11 @@ class WhatsAppWorker:
 
                 if not self.state.logged_in:
                     self._ensure_logged_in()
+
+                if item.get("type") == "resolve_name":
+                    self._process_resolve_name(item)
+                    continue
+
                 if self.state.logged_in:
                     self._process_forward(item)
                     time.sleep(FORWARD_PACING_SECONDS)
@@ -483,35 +550,34 @@ class WhatsAppWorker:
     def _process_forward(self, item: dict) -> None:
         invite_link = item["invite_link"]
         text = item["text"]
+        group_name = (item.get("group_name") or "").strip()
         page = self._page
         try:
-            page.goto(invite_link, wait_until="domcontentloaded", timeout=30000)
-            # Give the landing/interstitial page a moment to render before
-            # looking for its "continue" button — same class of SPA-render
-            # delay as the QR bootstrap flow (domcontentloaded fires well
-            # before the app has actually drawn anything).
-            time.sleep(3)
+            # Prefer opening the chat from WhatsApp Web's own sidebar (the
+            # account is already a member post-login, since the admin joined
+            # it before approving) — reliable, and never touches the invite
+            # link's own landing page at all. Only fall back to navigating
+            # the invite link fresh if no group_name is known yet, or the
+            # sidebar search doesn't find it (e.g. name mismatch, not
+            # actually joined, first-time send before this fully lands).
+            opened_via = None
+            if group_name:
+                if self._open_chat_via_sidebar(group_name):
+                    opened_via = "sidebar"
 
-            # Invite links land on an intermediate page before the real
-            # conversation opens — which one depends on the link type (see
-            # _INTERSTITIAL_CONTINUE_SELECTORS). Click whichever "continue"
-            # control is present; if neither is, we're probably already on
-            # the conversation itself (e.g. re-sending to a channel already
-            # open/followed in this session).
-            continue_loc, continue_sel = _first_match(
-                page, _INTERSTITIAL_CONTINUE_SELECTORS, timeout_ms=6000
+            if opened_via is None:
+                self._open_chat_via_invite_link(invite_link)
+                opened_via = "invite_link_fallback"
+
+            logger.info(
+                f"[forward] chat opened via {opened_via!r} "
+                f"(group_name={group_name!r}, invite_link={invite_link!r})"
             )
-            if continue_loc is not None:
-                logger.info(f"[forward] clicking interstitial continue button: {continue_sel!r}")
-                continue_loc.click()
-                time.sleep(2)  # let the actual chat/channel view start rendering
-            else:
-                logger.info("[forward] no interstitial continue button found — assuming already on the conversation")
 
-            box, sel = _first_match(page, _MESSAGE_BOX_SELECTORS, timeout_ms=15000)
+            box = self._wait_for_message_box()
             if box is None:
                 self._log_editable_elements()
-                raise RuntimeError("message box not found (selectors may be stale)")
+                raise RuntimeError("message box not found after retry loop (selectors may be stale)")
 
             box.click()
             box.type(text, delay=15)
@@ -522,12 +588,171 @@ class WhatsAppWorker:
             else:
                 page.keyboard.press("Enter")
 
-            logger.info(f"[forward] sent to {invite_link}")
+            logger.info(f"[forward] sent to {invite_link} (opened via {opened_via})")
             self.state.last_error = None
         except Exception as exc:
             logger.error(f"[forward] failed for {invite_link}: {exc}")
             self.state.last_error = str(exc)
             self._save_debug_screenshot(invite_link)
+
+    def _open_chat_via_sidebar(self, group_name: str) -> bool:
+        """Try to open group_name directly from the already-logged-in chat
+        list via WhatsApp Web's own search box, avoiding a fresh invite-link
+        navigation entirely (which can land on an interstitial landing page
+        instead of the actual chat — see _open_chat_via_invite_link).
+        Returns True if opened, False if not found or anything about the
+        search itself failed (caller falls back to the invite link either
+        way — this never raises)."""
+        page = self._page
+        try:
+            if not page.url.startswith("https://web.whatsapp.com"):
+                _goto_whatsapp(page)
+            self._refresh_login_state()
+            if not self.state.logged_in:
+                logger.info("[forward] sidebar search skipped — not logged in")
+                return False
+
+            search_loc, search_sel = _first_match(page, _SEARCH_BOX_SELECTORS, timeout_ms=5000)
+            if search_loc is None:
+                logger.warning("[forward] sidebar search box not found (selectors may be stale) — falling back to invite link")
+                return False
+
+            search_loc.click()
+            page.keyboard.type(group_name, delay=20)
+            time.sleep(1.5)  # let the filtered results render
+
+            item_loc = self._find_chat_list_item_by_text(group_name)
+            if item_loc is None:
+                logger.info(f"[forward] {group_name!r} not found in sidebar search results — falling back to invite link")
+                page.keyboard.press("Escape")
+                return False
+
+            item_loc.click()
+            page.keyboard.press("Escape")  # dismiss the search UI now that we've navigated in
+            logger.info(f"[forward] opened {group_name!r} via sidebar search (search box: {search_sel!r})")
+            return True
+        except Exception as exc:
+            logger.error(f"[forward] sidebar search for {group_name!r} failed: {exc} — falling back to invite link")
+            return False
+
+    def _find_chat_list_item_by_text(self, group_name: str):
+        """Search each candidate results-container for a visible element
+        containing group_name's text. Returns a Locator or None."""
+        page = self._page
+        for container_sel in _CHAT_LIST_CONTAINER_SELECTORS:
+            try:
+                container = page.locator(container_sel)
+                if container.count() == 0:
+                    continue
+                item = container.first.get_by_text(group_name, exact=False).first
+                item.wait_for(state="visible", timeout=4000)
+                return item
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+        return None
+
+    def _open_chat_via_invite_link(self, invite_link: str) -> None:
+        """Fallback path: navigate to the invite link fresh and click through
+        whatever interstitial landing page it shows (Channel or Community —
+        see _INTERSTITIAL_CONTINUE_SELECTORS). Raises on navigation failure;
+        the caller's try/except handles it the same as any other send
+        failure."""
+        page = self._page
+        page.goto(invite_link, wait_until="domcontentloaded", timeout=30000)
+        # Give the landing/interstitial page a moment to render before
+        # looking for its "continue" button — same class of SPA-render delay
+        # as the QR bootstrap flow (domcontentloaded fires well before the
+        # app has actually drawn anything).
+        time.sleep(3)
+
+        continue_loc, continue_sel = _first_match(
+            page, _INTERSTITIAL_CONTINUE_SELECTORS, timeout_ms=6000
+        )
+        if continue_loc is not None:
+            logger.info(f"[forward] clicking interstitial continue button: {continue_sel!r}")
+            continue_loc.click()
+            time.sleep(2)  # let the actual chat/channel view start rendering
+        else:
+            logger.info("[forward] no interstitial continue button found — assuming already on the conversation")
+
+    def _wait_for_message_box(
+        self, total_timeout_seconds: float = 20.0, poll_interval: float = 2.0, per_attempt_timeout_ms: int = 3000
+    ):
+        """Retry loop for the message box appearing, rather than a single
+        long wait — the chat/channel view can take a moment to finish
+        rendering right after opening (via either path above), and a single
+        miss shouldn't be treated as fatal. Returns a Locator or None."""
+        page = self._page
+        deadline = time.monotonic() + total_timeout_seconds
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            box, sel = _first_match(page, _MESSAGE_BOX_SELECTORS, timeout_ms=per_attempt_timeout_ms)
+            if box is not None:
+                logger.info(f"[forward] message box found on attempt {attempt} via selector {sel!r}")
+                return box
+            logger.info(f"[forward] message box not yet present (attempt {attempt}) — retrying")
+            time.sleep(poll_interval)
+        return None
+
+    # -- name resolution (for the sidebar-search path above) ------------------
+
+    def _extract_group_name_from_landing_page(self) -> str | None:
+        """Best-effort extraction of a group/channel's display name from its
+        invite-link landing page — tries a few candidate heading selectors,
+        then falls back to the page title (WhatsApp Web often sets it to the
+        chat's name, suffixed with " - WhatsApp")."""
+        page = self._page
+        loc, sel = _first_match(page, _GROUP_NAME_SELECTORS, timeout_ms=5000)
+        if loc is not None:
+            try:
+                txt = loc.inner_text().strip()
+                if txt:
+                    logger.info(f"[resolve-name] extracted via selector {sel!r}: {txt!r}")
+                    return txt
+            except Exception:
+                pass
+        try:
+            title = (page.title() or "").strip()
+            if title and title.lower() != "whatsapp":
+                name = title.replace(" - WhatsApp", "").strip()
+                if name:
+                    logger.info(f"[resolve-name] falling back to page title: {name!r}")
+                    return name
+        except Exception:
+            pass
+        return None
+
+    def _process_resolve_name(self, item: dict) -> None:
+        """Worker-thread handler for a submit_resolve_name() job — navigates
+        to the invite link and tries to read back a display name. Always
+        sets item['_result_holder']['result'] and signals item['_done_event']
+        exactly once, success or failure, so the waiting Flask thread never
+        hangs past its timeout."""
+        invite_link = item["invite_link"]
+        result_holder = item["_result_holder"]
+        done_event = item["_done_event"]
+        try:
+            if not self.state.logged_in:
+                result_holder["result"] = {"error": "not_logged_in"}
+                return
+            page = self._page
+            page.goto(invite_link, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+            name = self._extract_group_name_from_landing_page()
+            if name:
+                result_holder["result"] = {"name": name}
+                logger.info(f"[resolve-name] resolved {invite_link!r} -> {name!r}")
+            else:
+                result_holder["result"] = {"error": "name_not_found"}
+                logger.warning(f"[resolve-name] could not extract a name for {invite_link!r}")
+        except Exception as exc:
+            logger.error(f"[resolve-name] failed for {invite_link!r}: {exc}")
+            result_holder["result"] = {"error": str(exc)}
+        finally:
+            done_event.set()
 
     def _log_editable_elements(self) -> None:
         """When the message-box selector fails, dump every contenteditable /
@@ -612,11 +837,34 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         invite_link = (data.get("invite_link") or "").strip()
         text = data.get("text") or ""
+        group_name = (data.get("group_name") or "").strip()
         if not invite_link or not text:
             return jsonify({"error": "invite_link and text are required"}), 400
 
-        worker.queue.put({"invite_link": invite_link, "text": text})
+        worker.queue.put({
+            "type": "forward",
+            "invite_link": invite_link,
+            "text": text,
+            "group_name": group_name,
+        })
         return jsonify({"queued": True, "queue_length": worker.queue.qsize()}), 202
+
+    @app.route("/resolve-name", methods=["POST"])
+    def resolve_name():
+        auth = request.headers.get("Authorization", "")
+        expected = f"Bearer {FORWARDER_SECRET}"
+        if not FORWARDER_SECRET or auth != expected:
+            return jsonify({"error": "unauthorized"}), 401
+
+        data = request.get_json(silent=True) or {}
+        invite_link = (data.get("invite_link") or "").strip()
+        if not invite_link:
+            return jsonify({"error": "invite_link is required"}), 400
+
+        result = worker.submit_resolve_name(invite_link)
+        if "name" in result:
+            return jsonify(result), 200
+        return jsonify(result), 502
 
     @app.route("/status", methods=["GET"])
     def status():

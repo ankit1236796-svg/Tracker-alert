@@ -30,6 +30,11 @@ from translations import t
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 5.0
+# Group-name resolution involves a real page navigation on the forwarder side
+# (not just a queue push), and is only ever triggered by an infrequent,
+# on-demand admin action (approving a registration) — not a hot alert path —
+# so a much longer timeout than _TIMEOUT_SECONDS is fine here.
+_RESOLVE_NAME_TIMEOUT_SECONDS = 35.0
 
 # Matches exactly the two tags translations.py's alert templates use:
 # <a href="URL">text</a> and <b>text</b>. Anything else is stripped as plain
@@ -72,9 +77,13 @@ async def forward_alert(
         if not WHATSAPP_FORWARDER_URL:
             return  # feature not configured at all — fully inert
 
-        invite_link = get_active_whatsapp_channel(product["user_id"])
-        if not invite_link:
+        channel = get_active_whatsapp_channel(product["user_id"])
+        if not channel:
             return  # no active registration for this user
+        invite_link = channel["invite_link"]
+        # May be empty if never resolved (see resolve_group_name below) — the
+        # forwarder falls back to invite-link navigation in that case.
+        group_name = channel.get("group_name") or ""
 
         price_line = ""
         if price is not None:
@@ -89,9 +98,11 @@ async def forward_alert(
             resp = await client.post(
                 f"{WHATSAPP_FORWARDER_URL}/forward",
                 headers={"Authorization": f"Bearer {WHATSAPP_FORWARDER_SECRET}"},
-                json={"invite_link": invite_link, "text": wa_text},
+                json={"invite_link": invite_link, "text": wa_text, "group_name": group_name},
             )
-        if resp.status_code != 200:
+        # /forward returns 202 (queued for the background worker, not sent
+        # synchronously) on success — NOT 200.
+        if resp.status_code != 202:
             logger.error(
                 f"[whatsapp] forwarder returned HTTP {resp.status_code} for "
                 f"user {product['user_id']}: {resp.text[:200]}"
@@ -103,3 +114,62 @@ async def forward_alert(
             )
     except Exception as exc:
         logger.error(f"[whatsapp] forward failed (non-fatal): {exc}")
+
+
+def _extract_resolved_name(resp: httpx.Response) -> str | None:
+    if resp.status_code != 200:
+        logger.error(f"[whatsapp] resolve-name returned HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+    try:
+        name = (resp.json() or {}).get("name")
+    except Exception as exc:
+        logger.error(f"[whatsapp] resolve-name response wasn't valid JSON: {exc}")
+        return None
+    return name.strip() if name else None
+
+
+async def resolve_group_name(invite_link: str) -> str | None:
+    """
+    Best-effort: ask the forwarder to navigate to invite_link and read back
+    the group/channel's display name, so future forwards can open it via
+    WhatsApp Web's own sidebar search instead of always navigating the
+    invite link fresh (which can land on an interstitial landing page
+    instead of the actual chat — see whatsapp_forwarder/main.py). Returns
+    None on ANY failure (feature not configured, forwarder unreachable,
+    timeout, no name found) — callers should treat that as "still fine,
+    just degrades to invite-link-only delivery", not an error to surface
+    loudly. For use from async (aiogram) call sites; see
+    resolve_group_name_sync for Flask (dashboard.py).
+    """
+    if not WHATSAPP_FORWARDER_URL:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_RESOLVE_NAME_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                f"{WHATSAPP_FORWARDER_URL}/resolve-name",
+                headers={"Authorization": f"Bearer {WHATSAPP_FORWARDER_SECRET}"},
+                json={"invite_link": invite_link},
+            )
+        return _extract_resolved_name(resp)
+    except Exception as exc:
+        logger.error(f"[whatsapp] resolve-name failed (non-fatal): {exc}")
+        return None
+
+
+def resolve_group_name_sync(invite_link: str) -> str | None:
+    """Same as resolve_group_name but synchronous, for dashboard.py's Flask
+    routes (which aren't async) — mirrors the sync-httpx pattern dashboard.py
+    already uses for _tg_send."""
+    if not WHATSAPP_FORWARDER_URL:
+        return None
+    try:
+        with httpx.Client(timeout=_RESOLVE_NAME_TIMEOUT_SECONDS) as client:
+            resp = client.post(
+                f"{WHATSAPP_FORWARDER_URL}/resolve-name",
+                headers={"Authorization": f"Bearer {WHATSAPP_FORWARDER_SECRET}"},
+                json={"invite_link": invite_link},
+            )
+        return _extract_resolved_name(resp)
+    except Exception as exc:
+        logger.error(f"[whatsapp] resolve-name (sync) failed (non-fatal): {exc}")
+        return None

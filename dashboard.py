@@ -72,9 +72,12 @@ from database import (
     set_global_site_lock,
     set_user_site_lock,
     list_all_whatsapp_channels,
+    get_whatsapp_channel,
     approve_whatsapp_channel,
     disable_whatsapp_channel,
+    set_whatsapp_group_name,
 )
+import whatsapp_client
 from notifications import (
     approval_notice_text,
     rejection_notice_text,
@@ -791,14 +794,32 @@ def create_app() -> Flask:
     @app.route("/whatsapp/<int:uid>/approve", methods=["POST"])
     @login_required
     def whatsapp_channel_approve(uid):
-        if approve_whatsapp_channel(uid, ADMIN_USER_ID):
-            flash(
-                f"WhatsApp channel for user {uid} approved — make sure you've "
-                f"already joined it, otherwise alerts won't reach it.",
-                "ok",
-            )
-        else:
+        if not approve_whatsapp_channel(uid, ADMIN_USER_ID):
             flash(f"No WhatsApp channel registration found for user {uid}.", "bad")
+            return redirect(url_for("whatsapp_channels"))
+
+        msg = (
+            f"WhatsApp channel for user {uid} approved — make sure you've "
+            f"already joined it, otherwise alerts won't reach it."
+        )
+        channel = get_whatsapp_channel(uid)
+        # Best-effort, once: fetch the group/channel's display name so future
+        # forwards can open it via WhatsApp Web's sidebar search instead of
+        # always navigating the invite link fresh. This blocks the request
+        # for up to ~35s (a real page load on the forwarder side) — approval
+        # above has already succeeded regardless of how this turns out.
+        if channel and not channel.get("group_name"):
+            name = whatsapp_client.resolve_group_name_sync(channel["invite_link"])
+            if name:
+                set_whatsapp_group_name(uid, name)
+                msg += f" Group name resolved: {name!r}."
+            else:
+                msg += (
+                    " Couldn't auto-resolve the group name (forwarding still "
+                    "works via the invite link, just without the sidebar-search "
+                    "shortcut)."
+                )
+        flash(msg, "ok")
         return redirect(url_for("whatsapp_channels"))
 
     @app.route("/whatsapp/<int:uid>/disable", methods=["POST"])
