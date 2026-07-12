@@ -15,11 +15,14 @@ from calendar import monthrange
 from collections import Counter
 from datetime import datetime
 
+import httpx
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
+from bs4 import BeautifulSoup
 
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
+from checkers import build_scraper_url, HEADERS
 from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY
 from database import (
     IST,
@@ -551,3 +554,54 @@ async def cmd_whatsappdisable(message: Message, command: CommandObject):
         await message.answer(f"🚫 WhatsApp channel forwarding for user {user_id} disabled.")
     else:
         await message.answer(f"⚠️ No WhatsApp channel registration found for user {user_id}.")
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY debug command for tuning checkers/oneplus.py's visible-text
+# keyword logic against real product pages. NOT wired into CHECKER_MAP or
+# the regular check cycle — fetches on demand via the same render=true
+# Scrape.do path stock_checker.py uses, dumps the resulting visible text
+# back to the admin, and does nothing else. Safe to delete once no longer
+# needed.
+# ---------------------------------------------------------------------------
+_DEBUG_ONEPLUS_ADMIN_ID = 5004721766  # hardcoded on top of the router's own
+# ADMIN_USER_ID filter — this fetches an arbitrary caller-supplied URL via
+# Scrape.do (spends credits) and is meant for one specific admin's own
+# debugging, not general admin use.
+
+
+@router.message(Command("debugoneplus"))
+async def cmd_debugoneplus(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_ONEPLUS_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer("Usage: <code>/debugoneplus &lt;url&gt;</code>", parse_mode="HTML")
+        return
+
+    url = command.args.strip()
+    await message.answer(f"🔍 Fetching (render=true): {url}")
+
+    try:
+        scraper_url = build_scraper_url(url, render_js=True)
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
+            resp = await client.get(scraper_url)
+            resp.raise_for_status()
+        html = resp.text
+    except Exception as exc:
+        await message.answer(f"⚠️ Fetch failed: {exc}")
+        return
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    visible_text = soup.get_text(" ", strip=True)
+    snippet = visible_text[:3000]
+
+    await message.answer(
+        f"📄 Visible text: {len(visible_text)} chars total, showing first {len(snippet)}."
+    )
+    # 3000 chars always fits in one Telegram message (limit 4096), but chunk
+    # defensively anyway in case the snippet length above is ever changed.
+    _CHUNK_SIZE = 4000
+    for i in range(0, len(snippet), _CHUNK_SIZE):
+        await message.answer(snippet[i:i + _CHUNK_SIZE])
