@@ -20,4 +20,11 @@ _OOS_PATTERNS = [
 
 
 def check(soup: BeautifulSoup, html: str) -> bool:
-    return generic_marketplace_check(soup, html, _ADD_PATTERNS, _OOS_PATTERNS, "vijaysales")
+    # BUGFIX: real /check results showed this site's final status inverted
+    # — in-stock products were reported OOS and vice versa. The underlying
+    # signal detection (JSON-LD/embedded-JSON/OOS-text/button waterfall,
+    # shared with unicornstore/inventstore/sangeethamobiles via
+    # generic_marketplace_check) is untouched; only the final boolean is
+    # flipped here, scoped to vijaysales only.
+    detected_in_stock = generic_marketplace_check(soup, html, _ADD_PATTERNS, _OOS_PATTERNS, "vijaysales")
+    return not detected_in_stock
