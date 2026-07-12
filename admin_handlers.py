@@ -1011,13 +1011,33 @@ async def cmd_debugreliance(message: Message, command: CommandObject):
     if message.from_user.id != _DEBUG_RELIANCE_ADMIN_ID:
         return
     if not command.args:
-        await message.answer("Usage: <code>/debugreliance &lt;url&gt;</code>", parse_mode="HTML")
+        await message.answer(
+            "Usage: <code>/debugreliance &lt;url&gt; [pincode]</code>", parse_mode="HTML"
+        )
         return
 
-    url = command.args.strip()
-    await _debug_send(message, f"🔍 Fetching (super=true, premium proxy — default for RelianceDigital): {url}")
+    parts = command.args.strip().rsplit(maxsplit=1)
+    # A pincode is a bare 6-digit number; anything else in the trailing
+    # token (or no second token at all) means the whole args string is
+    # just the URL and no pincode was supplied.
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 6:
+        url, pincode = parts
+    else:
+        url, pincode = command.args.strip(), None
 
-    await _run_debug_reliance_trial(
-        message, "super=true (premium proxy, default)", url,
-        super_proxy=True,
-    )
+    if pincode:
+        label = "super=true + setCookies=pincode (premium proxy, default)"
+        await _debug_send(
+            message,
+            f"🔍 Fetching (super=true, premium proxy, pincode cookie={pincode!r}): {url}",
+        )
+        await _run_debug_reliance_trial(
+            message, label, url,
+            super_proxy=True, set_cookies=f"pincode={pincode}",
+        )
+    else:
+        await _debug_send(message, f"🔍 Fetching (super=true, premium proxy — default for RelianceDigital): {url}")
+        await _run_debug_reliance_trial(
+            message, "super=true (premium proxy, default)", url,
+            super_proxy=True,
+        )

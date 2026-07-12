@@ -129,6 +129,18 @@ signs of a login wall, captcha, or region-redirect page. Report back what's
 actually observed so the approach can be adjusted, same as every other
 live-tuning step this pilot has needed.
 
+**Update: for RelianceDigital specifically, `diagnostics.goto_status` came
+back `403` on both product URLs** — not a page-fingerprint issue the
+anti-detection measures above could fix, but an Akamai WAF block on
+Railway's outbound IP itself, at the network edge, before the page (real
+or challenge) is even served. Direct-Playwright-from-Railway is a dead end
+for this specific site; RelianceDigital checks have gone back to
+Scrape.do (whose proxy pool, at least with `super=true`, gets past this
+block — see the main bot's `/debugreliance <url> [pincode]` admin command
+and `checkers/reliancedigital.py`). `/debug-network` itself is unchanged
+and still useful for other sites/diagnostics that aren't behind an
+IP-level WAF block like this one.
+
 ```
 GET /health
 Response: {"ok": true, "max_concurrent_checks": 2, "proxy_configured": false,
