@@ -658,13 +658,13 @@ async def cmd_debugoneplus(message: Message, command: CommandObject):
 # check_stock fetch is completely untouched by this. Safe to delete once no
 # longer needed.
 #
-# Runs TWO isolated trials (each its own Scrape.do request) to separate two
-# competing hypotheses for why RelianceDigital pages show an anti-bot/stale-
-# cache wall: a rendering-timing issue (fixed by waiting longer) vs. a
-# proxy/IP-reputation issue (fixed by a better proxy pool). Each trial is
-# reported independently — see _run_debug_reliance_trial — so one failing
-# (e.g. super=true not being available on the current plan) never prevents
-# the other from running or being reported.
+# Previously ran two isolated trials to compare render=true alone against
+# super=true (premium proxy): render=true alone consistently failed to get
+# past RelianceDigital's anti-bot/stale-cache wall, so super=true is now
+# the default (and only) fetch this command makes going forward.
+# _run_debug_reliance_trial still takes arbitrary build_scraper_url()
+# kwargs and reports under a label, in case another comparison is ever
+# needed again.
 # ---------------------------------------------------------------------------
 _DEBUG_RELIANCE_ADMIN_ID = 5004721766  # same hardcoded restriction as
 # /debugoneplus, on top of the router's own ADMIN_USER_ID filter — this
@@ -683,10 +683,11 @@ _RELIANCE_ANTIBOT_PHRASE = "Please Update the Page in Theme"
 async def _run_debug_reliance_trial(message: Message, label: str, url: str, **scraper_kwargs) -> None:
     """Fetch `url` via Scrape.do with the given build_scraper_url() kwargs
     and send a labeled diagnostic report: HTTP status, raw HTML length,
-    where _RELIANCE_ANTIBOT_PHRASE was (or wasn't) found, then the first
-    3000 chars of visible text chunked under Telegram's 4096-char limit.
+    where _RELIANCE_ANTIBOT_PHRASE was (or wasn't) found, then the FULL
+    visible text chunked under Telegram's 4096-char limit (not truncated —
+    unlike /debugoneplus, which still only sends the first 3000 chars).
     Any failure here is reported under this trial's own label and does not
-    raise — the caller runs each trial independently."""
+    raise — safe to call multiple times/labels from the same command."""
     await _debug_send(message, f"— {label} —")
 
     try:
@@ -725,13 +726,10 @@ async def _run_debug_reliance_trial(message: Message, label: str, url: str, **sc
         message, f"[{label}] HTTP {status_code} | raw HTML length: {len(html)} chars\n{phrase_diag}"
     )
 
-    snippet = visible_text[:3000]
-    await _debug_send(
-        message, f"[{label}] visible text: {len(visible_text)} chars total, showing first {len(snippet)}."
-    )
+    await _debug_send(message, f"[{label}] visible text: {len(visible_text)} chars total (sending in full).")
     _CHUNK_SIZE = 4000
-    for i in range(0, len(snippet), _CHUNK_SIZE):
-        await _debug_send(message, snippet[i:i + _CHUNK_SIZE])
+    for i in range(0, len(visible_text), _CHUNK_SIZE):
+        await _debug_send(message, visible_text[i:i + _CHUNK_SIZE])
 
 
 @router.message(Command("debugreliance"))
@@ -743,13 +741,9 @@ async def cmd_debugreliance(message: Message, command: CommandObject):
         return
 
     url = command.args.strip()
-    await _debug_send(message, f"🔍 Running 2 diagnostic trials for: {url}")
+    await _debug_send(message, f"🔍 Fetching (super=true, premium proxy — default for RelianceDigital): {url}")
 
     await _run_debug_reliance_trial(
-        message, "Trial A: render=true only (no waitUntil/customWait)", url,
-        render_js=True,
-    )
-    await _run_debug_reliance_trial(
-        message, "Trial B: super=true (premium proxy)", url,
+        message, "super=true (premium proxy, default)", url,
         super_proxy=True,
     )
