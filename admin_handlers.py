@@ -557,13 +557,35 @@ async def cmd_whatsappdisable(message: Message, command: CommandObject):
 
 
 # ---------------------------------------------------------------------------
-# TEMPORARY debug command for tuning checkers/oneplus.py's visible-text
-# keyword logic against real product pages. NOT wired into CHECKER_MAP or
-# the regular check cycle — fetches on demand via the same render=true
-# Scrape.do path stock_checker.py uses, dumps the resulting visible text
-# back to the admin, and does nothing else. Safe to delete once no longer
-# needed.
+# TEMPORARY debug commands (oneplus + reliancedigital) for tuning checker
+# logic against real product pages. NOT wired into CHECKER_MAP or the
+# regular check cycle.
 # ---------------------------------------------------------------------------
+
+
+async def _debug_send(message: Message, text: str) -> None:
+    """Send debug-command output as plain text (parse_mode=None), never the
+    bot's default HTML parse mode — the extracted page text and the URLs
+    these commands echo back can contain <, >, & (e.g. any query string
+    with an "&", or literal "<script" in scraped text), which Telegram's
+    HTML entity parser rejects with TelegramBadRequest: can't parse
+    entities, previously failing the whole command with no visible error.
+    Wrapped in try/except so a send failure for any OTHER reason (message
+    too long despite chunking, a transient API error, etc.) is reported to
+    the admin instead of the command just going silent."""
+    try:
+        await message.answer(text, parse_mode=None)
+    except Exception as exc:
+        logger.error(f"[debug] failed to send a debug output message: {exc}")
+        try:
+            await message.answer(f"⚠️ Failed to send a debug output message: {exc}", parse_mode=None)
+        except Exception:
+            pass  # nothing more we can do — already logged above
+
+
+# /debugoneplus: fetches on demand via the same render=true Scrape.do path
+# stock_checker.py uses, dumps the resulting visible text back to the
+# admin, and does nothing else. Safe to delete once no longer needed.
 _DEBUG_ONEPLUS_ADMIN_ID = 5004721766  # hardcoded on top of the router's own
 # ADMIN_USER_ID filter — this fetches an arbitrary caller-supplied URL via
 # Scrape.do (spends credits) and is meant for one specific admin's own
@@ -592,9 +614,10 @@ async def cmd_debugoneplus(message: Message, command: CommandObject):
         return
 
     url = command.args.strip()
-    await message.answer(
+    await _debug_send(
+        message,
         f"🔍 Fetching (render=true, waitUntil={_DEBUG_ONEPLUS_WAIT_UNTIL}, "
-        f"customWait={_DEBUG_ONEPLUS_CUSTOM_WAIT_MS}ms): {url}"
+        f"customWait={_DEBUG_ONEPLUS_CUSTOM_WAIT_MS}ms): {url}",
     )
 
     try:
@@ -609,7 +632,7 @@ async def cmd_debugoneplus(message: Message, command: CommandObject):
             resp.raise_for_status()
         html = resp.text
     except Exception as exc:
-        await message.answer(f"⚠️ Fetch failed: {exc}")
+        await _debug_send(message, f"⚠️ Fetch failed: {exc}")
         return
 
     soup = BeautifulSoup(html, "html.parser")
@@ -618,14 +641,14 @@ async def cmd_debugoneplus(message: Message, command: CommandObject):
     visible_text = soup.get_text(" ", strip=True)
     snippet = visible_text[:3000]
 
-    await message.answer(
-        f"📄 Visible text: {len(visible_text)} chars total, showing first {len(snippet)}."
+    await _debug_send(
+        message, f"📄 Visible text: {len(visible_text)} chars total, showing first {len(snippet)}."
     )
     # 3000 chars always fits in one Telegram message (limit 4096), but chunk
     # defensively anyway in case the snippet length above is ever changed.
     _CHUNK_SIZE = 4000
     for i in range(0, len(snippet), _CHUNK_SIZE):
-        await message.answer(snippet[i:i + _CHUNK_SIZE])
+        await _debug_send(message, snippet[i:i + _CHUNK_SIZE])
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +687,7 @@ async def _run_debug_reliance_trial(message: Message, label: str, url: str, **sc
     3000 chars of visible text chunked under Telegram's 4096-char limit.
     Any failure here is reported under this trial's own label and does not
     raise — the caller runs each trial independently."""
-    await message.answer(f"— {label} —")
+    await _debug_send(message, f"— {label} —")
 
     try:
         scraper_url = build_scraper_url(url, **scraper_kwargs)
@@ -673,7 +696,7 @@ async def _run_debug_reliance_trial(message: Message, label: str, url: str, **sc
         status_code = resp.status_code
         html = resp.text
     except Exception as exc:
-        await message.answer(f"⚠️ [{label}] Fetch failed: {exc}")
+        await _debug_send(message, f"⚠️ [{label}] Fetch failed: {exc}")
         return
 
     soup = BeautifulSoup(html, "html.parser")
@@ -698,17 +721,17 @@ async def _run_debug_reliance_trial(message: Message, label: str, url: str, **sc
             f"JS, not present as static/visible text as fetched."
         )
 
-    await message.answer(
-        f"[{label}] HTTP {status_code} | raw HTML length: {len(html)} chars\n{phrase_diag}"
+    await _debug_send(
+        message, f"[{label}] HTTP {status_code} | raw HTML length: {len(html)} chars\n{phrase_diag}"
     )
 
     snippet = visible_text[:3000]
-    await message.answer(
-        f"[{label}] visible text: {len(visible_text)} chars total, showing first {len(snippet)}."
+    await _debug_send(
+        message, f"[{label}] visible text: {len(visible_text)} chars total, showing first {len(snippet)}."
     )
     _CHUNK_SIZE = 4000
     for i in range(0, len(snippet), _CHUNK_SIZE):
-        await message.answer(snippet[i:i + _CHUNK_SIZE])
+        await _debug_send(message, snippet[i:i + _CHUNK_SIZE])
 
 
 @router.message(Command("debugreliance"))
@@ -720,7 +743,7 @@ async def cmd_debugreliance(message: Message, command: CommandObject):
         return
 
     url = command.args.strip()
-    await message.answer(f"🔍 Running 2 diagnostic trials for: {url}")
+    await _debug_send(message, f"🔍 Running 2 diagnostic trials for: {url}")
 
     await _run_debug_reliance_trial(
         message, "Trial A: render=true only (no waitUntil/customWait)", url,
