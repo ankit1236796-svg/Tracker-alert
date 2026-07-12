@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery
 
-from config import ADMIN_USER_ID, GRACE_PERIOD_DAYS
+from config import ADMIN_USER_ID, GRACE_PERIOD_DAYS, get_site_label
 from database import (
     IST,
     parse_ist,
@@ -161,7 +161,7 @@ def check_can_add_item(user_id: int, site: str) -> tuple[bool, str | None, str |
     # Admin store lock (global or per-user) — checked before plan limits so a
     # locked store is refused regardless of the user's plan or remaining slots.
     if is_site_locked(site, user_id):
-        return False, REASON_SITE_LOCKED, t("store_locked", lang, site=site.capitalize())
+        return False, REASON_SITE_LOCKED, t("store_locked", lang, site=get_site_label(site))
 
     plan = info.plan
     if plan is None:

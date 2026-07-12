@@ -51,6 +51,7 @@ from config import (
     SHARE_TRIAL_TAP_DELAY_SECONDS,
     UNRELIABLE_SITES,
     COMING_SOON_DOMAINS,
+    get_site_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,7 @@ def _auto_name(url: str, site: str) -> str:
         slug = path.split("/")[-1][:40] if path else "product"
     except Exception:
         slug = "product"
-    return f"{site.capitalize()}: {slug}"
+    return f"{get_site_label(site)}: {slug}"
 
 
 def _parse_bulk_lines(text: str) -> list[tuple[str, str]]:
@@ -161,7 +162,7 @@ async def _process_bulk(message: Message, entries: list[tuple[str, str]]) -> Non
             continue
         ok, msg = add_product(user_id, name, url, site)
         if ok:
-            results.append(f"✅ <b>{name}</b> [{site.capitalize()}]")
+            results.append(f"✅ <b>{name}</b> [{get_site_label(site)}]")
         else:
             results.append(f"⚠️ {msg} — <b>{name}</b>")
 
@@ -190,7 +191,7 @@ async def _run_search(target: Message | CallbackQuery, user_id: int, keyword: st
         stock_emoji = "✅" if p["in_stock"] else "❌"
         checked = _format_last_checked(p["last_checked"])
         lines.append(
-            f"{stock_emoji} <b>{p['name']}</b> [{p['site'].capitalize()}]\n"
+            f"{stock_emoji} <b>{p['name']}</b> [{get_site_label(p['site'])}]\n"
             f"   🕒 Last checked: {checked}\n"
             f"   🔗 <a href=\"{p['url']}\">View product</a>\n"
         )
@@ -255,14 +256,14 @@ def _format_check_results(results: list[tuple[dict, bool]]) -> str:
     if in_stock:
         lines.append("✅ <b>In Stock:</b>")
         for p, _ in in_stock:
-            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]{_unreliable_note(p['site'])}")
+            lines.append(f"  • <b>{p['name']}</b> [{get_site_label(p['site'])}]{_unreliable_note(p['site'])}")
             lines.append(f"    <a href=\"{p['url']}\">View →</a>")
     if oos:
         if in_stock:
             lines.append("")
         lines.append("❌ <b>Out of Stock:</b>")
         for p, _ in oos:
-            lines.append(f"  • <b>{p['name']}</b> [{p['site'].capitalize()}]{_unreliable_note(p['site'])}")
+            lines.append(f"  • <b>{p['name']}</b> [{get_site_label(p['site'])}]{_unreliable_note(p['site'])}")
     return "\n".join(lines)
 
 
@@ -285,7 +286,7 @@ def _check_store_filter_keyboard(products: list[dict]) -> InlineKeyboardMarkup:
     stores = sorted({p["site"] for p in products})
     buttons = [
         [InlineKeyboardButton(
-            text=f"🏪 {site.capitalize()}",
+            text=f"🏪 {get_site_label(site)}",
             callback_data=f"check_filter:{site}",
         )]
         for site in stores
@@ -319,7 +320,7 @@ def _select_keyboard(products: list[dict], selected_ids: set[int]) -> InlineKeyb
         mark = "✅" if p["id"] in selected_ids else "⬜"
         buttons.append([
             InlineKeyboardButton(
-                text=f"{mark} {p['name']} [{p['site'].capitalize()}]",
+                text=f"{mark} {p['name']} [{get_site_label(p['site'])}]",
                 callback_data=f"sel_toggle:{p['id']}",
             )
         ])
@@ -711,7 +712,7 @@ async def receive_link(message: Message, state: FSMContext):
             auto_name = _auto_name(url, site)
             ok, msg = add_product(user_id, auto_name, url, site)
             if ok:
-                results.append(f"✅ <b>{auto_name}</b> [{site.capitalize()}]")
+                results.append(f"✅ <b>{auto_name}</b> [{get_site_label(site)}]")
             else:
                 results.append(f"⚠️ {msg}: <code>{url[:60]}</code>")
 
@@ -758,7 +759,7 @@ async def receive_link(message: Message, state: FSMContext):
 
     if ok:
         await message.answer(
-            t("product_added", lang, name=name, site=site.capitalize(), url=url), parse_mode="HTML")
+            t("product_added", lang, name=name, site=get_site_label(site), url=url), parse_mode="HTML")
     else:
         await message.answer(f"⚠️ {msg}")
 
@@ -796,7 +797,7 @@ async def receive_target_price(message: Message, state: FSMContext):
     await state.clear()
 
     if ok:
-        body = t("product_added", lang, name=name, site=site.capitalize(), url=url)
+        body = t("product_added", lang, name=name, site=get_site_label(site), url=url)
         if target_price:
             body += f"\n💰 ₹{target_price:,.0f}"
         await message.answer(body, parse_mode="HTML")
@@ -825,7 +826,7 @@ async def cmd_list(message: Message):
         target = p.get("target_price")
         price_line = f"\n   💰 Target price: ₹{target:,.0f}" if target is not None else ""
         lines.append(
-            f"{stock_emoji} <b>{p['name']}</b> [{p['site'].capitalize()}]\n"
+            f"{stock_emoji} <b>{p['name']}</b> [{get_site_label(p['site'])}]\n"
             f"   🆔 ID: <code>{p['id']}</code>\n"
             f"   🕒 Last checked: {checked}{price_line}\n"
             f"   🔗 <a href=\"{p['url']}\">View product</a>\n"
@@ -855,7 +856,7 @@ async def cmd_remove(message: Message):
     buttons = [
         [
             InlineKeyboardButton(
-                text=f"🗑 {p['name']} [{p['site'].capitalize()}]",
+                text=f"🗑 {p['name']} [{get_site_label(p['site'])}]",
                 callback_data=f"remove:{p['id']}",
             )
         ]
@@ -963,17 +964,17 @@ async def callback_check_filter(call: CallbackQuery):
 
     if not products:
         await call.message.edit_text(
-            f"📭 No products tracked for <b>{payload.capitalize()}</b>.",
+            f"📭 No products tracked for <b>{get_site_label(payload)}</b>.",
             parse_mode="HTML",
         )
         await call.answer()
         return
 
-    store_label = payload.capitalize() if payload != "all" else "All Stores"
+    store_label = get_site_label(payload) if payload != "all" else "All Stores"
     buttons = [
         [
             InlineKeyboardButton(
-                text=f"🔍 {p['name']} [{p['site'].capitalize()}]",
+                text=f"🔍 {p['name']} [{get_site_label(p['site'])}]",
                 callback_data=f"check:{p['id']}",
             )
         ]
@@ -1045,14 +1046,14 @@ async def callback_check(call: CallbackQuery):
     status_text = "IN STOCK" if in_stock else "OUT OF STOCK"
     price_line = f"\n💰 Current price: ₹{current_price:,.0f}" if current_price is not None else ""
     warning_line = (
-        f"\n⚠️ <i>{product['site'].capitalize()} results are currently unreliable "
+        f"\n⚠️ <i>{get_site_label(product['site'])} results are currently unreliable "
         f"(under investigation) — don't trust this status.</i>"
         if product["site"] in UNRELIABLE_SITES else ""
     )
     await call.message.edit_text(
         f"{status_emoji} <b>{product['name']}</b>\n\n"
         f"Status: <b>{status_text}</b>{price_line}\n"
-        f"Site: {product['site'].capitalize()}\n"
+        f"Site: {get_site_label(product['site'])}\n"
         f"🔗 <a href=\"{product['url']}\">View product</a>{warning_line}",
         parse_mode="HTML",
         disable_web_page_preview=True,
@@ -1289,7 +1290,7 @@ async def cmd_stores(message: Message):
     lines = [t("stores_intro", get_user_lang(message.from_user.id))]
     for site, domains in SUPPORTED_SITES.items():
         domain_str = ", ".join(domains)
-        lines.append(f"• <b>{site.capitalize()}</b> — {domain_str}")
+        lines.append(f"• <b>{get_site_label(site)}</b> — {domain_str}")
 
     await message.answer(
         "\n".join(lines),

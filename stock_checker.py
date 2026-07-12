@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 
 from checkers import detect_site, build_scraper_url, HEADERS, CHECKER_MAP, PRICE_EXTRACTOR_MAP
 from checkers import apple as apple_checker
+from checkers import shopatsc as shopatsc_checker
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,13 @@ _JS_SITES = {
     # _SUPER_PROXY_FALLBACK_SITES below for the render=true → super=true
     # escalation these four sites also get.
     "unicornstore", "vijaysales", "inventstore", "sangeethamobiles",
+    # ShopAtSC — only reached when the .js Shopify JSON endpoint (the
+    # primary signal, tried first — see shopatsc_checker.check_via_js_
+    # endpoint and the special-cased call near the top of check_stock())
+    # fails or isn't reachable. render=true is the fallback's safe
+    # default since this site's non-rendered page behavior hasn't been
+    # verified.
+    "shopatsc",
 }
 
 # OnePlus renders incompletely under a plain render=true (confirmed via the
@@ -270,6 +278,16 @@ async def check_stock(
     if checker is None:
         logger.warning(f"No checker for site '{site}'")
         return False, None
+
+    if site == "shopatsc":
+        # Primary signal: Shopify's '<product>.js' JSON endpoint (cheap, no
+        # HTML parsing, no render=true credits). Only falls through to the
+        # standard render=true page fetch + checkers.shopatsc.check() below
+        # when this returns None (endpoint unreachable/unusable).
+        js_result = await shopatsc_checker.check_via_js_endpoint(url)
+        if js_result is not None:
+            logger.info(f"[shopatsc] {url} → {'IN STOCK' if js_result else 'OUT OF STOCK'} (via .js endpoint)")
+            return js_result, None
 
     set_cookies = None
     if site in _QUICK_COMMERCE_SITES:

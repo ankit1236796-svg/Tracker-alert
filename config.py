@@ -101,11 +101,27 @@ SUPPORTED_SITES = {
     "vijaysales":       ["vijaysales.com"],
     "inventstore":      ["inventstore.in"],
     "sangeethamobiles": ["sangeethamobiles.com"],
+    "shopatsc":         ["shopatsc.com"],
 }
 
 # Domains handled specially in /add with a "Coming Soon" message instead of
 # the generic "unsupported site" one — see handlers.py's _coming_soon_message.
 COMING_SOON_DOMAINS = {"croma.com"}
+
+# Per-site display-name override for user-facing text (Telegram messages,
+# product listings, /stores). Falls back to site.capitalize() via
+# get_site_label() below for every site not listed here — most internal
+# keys capitalize fine on their own (e.g. "amazon" -> "Amazon"), so this
+# stays small and only covers sites where that would look wrong or omit
+# useful context (e.g. "shopatsc" -> "Shopatsc" loses the fact that it's
+# Sony India's official PS5 store).
+SITE_DISPLAY_NAMES = {
+    "shopatsc": "ShopAtSC (PS5 Official Site)",
+}
+
+
+def get_site_label(site: str) -> str:
+    return SITE_DISPLAY_NAMES.get(site, site.capitalize())
 
 # ---------------------------------------------------------------------------
 # Affiliate-link conversion (EarnKaro / EK Affiliaters — see affiliate.py)

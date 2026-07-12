@@ -18,7 +18,7 @@ import logging
 
 from aiogram import Bot
 
-from config import UNRELIABLE_SITES
+from config import UNRELIABLE_SITES, get_site_label
 from database import get_user_lang, is_site_locked
 from translations import t
 from affiliate import get_affiliate_url
@@ -72,7 +72,7 @@ async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
     alert_url = await get_affiliate_url(product["url"], product["site"])
     text = t(
         "stock_alert", lang,
-        name=product["name"], site=product["site"].capitalize(),
+        name=product["name"], site=get_site_label(product["site"]),
         price_line=price_line, url=alert_url,
     )
     try:

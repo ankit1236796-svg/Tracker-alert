@@ -26,7 +26,7 @@ from bs4 import BeautifulSoup
 
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
 from checkers import build_scraper_url, HEADERS
-from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY
+from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label
 from database import (
     IST,
     now_ist_str,
@@ -398,7 +398,7 @@ async def cmd_finduser(message: Message, command: CommandObject):
     ]
     if products:
         for p in products[:20]:
-            lines.append(f"  • {p['name']} [{p['site'].capitalize()}]")
+            lines.append(f"  • {p['name']} [{get_site_label(p['site'])}]")
         if len(products) > 20:
             lines.append(f"  … and {len(products) - 20} more")
     else:
