@@ -569,6 +569,19 @@ _DEBUG_ONEPLUS_ADMIN_ID = 5004721766  # hardcoded on top of the router's own
 # Scrape.do (spends credits) and is meant for one specific admin's own
 # debugging, not general admin use.
 
+# OnePlus product pages render incompletely with a plain render=true —
+# earlier /debugoneplus output showed the "Priority Delivery" text missing
+# even on pages that should have it. waitUntil="networkidle0" (Scrape.do's
+# Puppeteer-backed wait condition) waits for the page's JS/XHR activity to
+# settle before capturing content; customWait is a fixed extra buffer (ms)
+# on top of that, for any DOM mutation that keeps happening briefly after
+# the network itself goes idle. Scoped to this debug command only —
+# build_scraper_url's new wait_until/custom_wait_ms params are opt-in and
+# untouched by every other call site (the live check cycle's OnePlus
+# fetches are unaffected).
+_DEBUG_ONEPLUS_WAIT_UNTIL = "networkidle0"
+_DEBUG_ONEPLUS_CUSTOM_WAIT_MS = 4000
+
 
 @router.message(Command("debugoneplus"))
 async def cmd_debugoneplus(message: Message, command: CommandObject):
@@ -579,10 +592,18 @@ async def cmd_debugoneplus(message: Message, command: CommandObject):
         return
 
     url = command.args.strip()
-    await message.answer(f"🔍 Fetching (render=true): {url}")
+    await message.answer(
+        f"🔍 Fetching (render=true, waitUntil={_DEBUG_ONEPLUS_WAIT_UNTIL}, "
+        f"customWait={_DEBUG_ONEPLUS_CUSTOM_WAIT_MS}ms): {url}"
+    )
 
     try:
-        scraper_url = build_scraper_url(url, render_js=True)
+        scraper_url = build_scraper_url(
+            url,
+            render_js=True,
+            wait_until=_DEBUG_ONEPLUS_WAIT_UNTIL,
+            custom_wait_ms=_DEBUG_ONEPLUS_CUSTOM_WAIT_MS,
+        )
         async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
             resp = await client.get(scraper_url)
             resp.raise_for_status()
