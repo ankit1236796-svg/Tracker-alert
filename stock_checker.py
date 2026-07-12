@@ -155,6 +155,15 @@ async def _fetch_html(scraper_url: str, site: str) -> str:
 _JS_SITES = {
     "zepto", "bigbasket", "croma", "instamart", "myntra",
     "oneplus", "tataneu", "vivo", "iqoo",
+    # New marketplace checkers (unicornstore, vijaysales, inventstore,
+    # sangeethamobiles) — real markup hasn't been inspected from this
+    # sandbox (no live network access), so render=true is the safe
+    # starting default rather than the credit-saving render=false used
+    # for Flipkart/RelianceDigital/JioMart, which was only adopted after
+    # those sites' non-rendered behavior was specifically verified. See
+    # _SUPER_PROXY_FALLBACK_SITES below for the render=true → super=true
+    # escalation these four sites also get.
+    "unicornstore", "vijaysales", "inventstore", "sangeethamobiles",
 }
 
 # OnePlus renders incompletely under a plain render=true (confirmed via the
@@ -165,6 +174,40 @@ _JS_SITES = {
 # other site, which don't appear here and so get None → unchanged requests).
 _SITE_WAIT_UNTIL = {"oneplus": "networkidle0"}
 _SITE_CUSTOM_WAIT_MS = {"oneplus": 4000}
+
+# Sites that get a second fetch attempt with Scrape.do's super=true premium
+# proxy pool when the render=true fetch looks blocked/incomplete — the same
+# symptom (a near-empty or challenge page instead of the real one) that
+# real diagnostics confirmed for RelianceDigital as an Akamai WAF block on
+# the requesting IP (see playwright_scraper/README.md and the
+# /debugreliance admin command). Scoped to just these four new,
+# unverified-from-this-sandbox checkers rather than applied globally, so
+# no existing site's behavior/cost changes. super=true costs more Scrape.do
+# credits, so it's only spent when the first fetch actually looks bad.
+_SUPER_PROXY_FALLBACK_SITES = frozenset({
+    "unicornstore", "vijaysales", "inventstore", "sangeethamobiles",
+})
+
+# Heuristics for "the fetched page probably isn't the real one" — an
+# unusually short response, or a phrase commonly shown by bot-block/
+# challenge pages. Not confirmed against any of these four sites'
+# real block pages specifically (no live network access from this
+# sandbox); a conservative, generic trigger for retrying with super=true
+# rather than silently reporting a possibly-wrong stock result.
+_BLOCKED_PAGE_PHRASES = (
+    "access denied", "attention required", "are you a human",
+    "captcha", "just a moment", "checking your browser",
+    "please enable javascript and cookies", "bot detection",
+    "request unsuccessful",
+)
+_MIN_PLAUSIBLE_HTML_LENGTH = 2000
+
+
+def _looks_blocked_or_incomplete(html: str) -> bool:
+    if len(html) < _MIN_PLAUSIBLE_HTML_LENGTH:
+        return True
+    html_lower = html.lower()
+    return any(phrase in html_lower for phrase in _BLOCKED_PAGE_PHRASES)
 
 # No sites currently support pincode-specific stock via simple cookie injection.
 # Blinkit was here previously (`pincode=<value>`) but real captured Blinkit
@@ -298,6 +341,27 @@ async def check_stock(
         logger.info(f"[{site}] scraper_url (truncated)={scraper_url[:120]!r}")
 
         html = await _fetch_html(scraper_url, site)
+
+        if site in _SUPER_PROXY_FALLBACK_SITES and _looks_blocked_or_incomplete(html):
+            logger.warning(
+                f"[{site}] render=true fetch looks blocked/incomplete "
+                f"(len={len(html)}) — retrying with super=true (premium proxy)"
+            )
+            fallback_scraper_url = build_scraper_url(
+                url,
+                render_js=True,
+                set_cookies=set_cookies,
+                wait_until=_SITE_WAIT_UNTIL.get(site),
+                custom_wait_ms=_SITE_CUSTOM_WAIT_MS.get(site),
+                super_proxy=True,
+            )
+            html = await _fetch_html(fallback_scraper_url, site)
+            if _looks_blocked_or_incomplete(html):
+                logger.warning(
+                    f"[{site}] super=true retry STILL looks blocked/incomplete "
+                    f"(len={len(html)}) — proceeding with whatever HTML was returned"
+                )
+
         soup = BeautifulSoup(html, "html.parser")
         result = checker(soup, html)
 

@@ -97,6 +97,10 @@ SUPPORTED_SITES = {
     # (e.g. mshop.vivo.com → vivo.com, mshop.iqoo.com/shop.iqoo.com → iqoo.com).
     "vivo":            ["vivo.com"],
     "iqoo":            ["iqoo.com"],
+    "unicornstore":     ["unicornstore.in"],
+    "vijaysales":       ["vijaysales.com"],
+    "inventstore":      ["inventstore.in"],
+    "sangeethamobiles": ["sangeethamobiles.com"],
 }
 
 # Domains handled specially in /add with a "Coming Soon" message instead of
