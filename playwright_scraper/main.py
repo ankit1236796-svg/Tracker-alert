@@ -30,7 +30,16 @@ HTTP surface:
                         a serviceability/delivery/pincode/availability/
                         stock/fulfillment keyword. Returns {"url", "pincode",
                         "matched_requests": [{"url", "method", "status",
-                        "body"}...], "total_requests_seen", "matched_count"}.
+                        "body"}...], "total_requests_seen", "matched_count",
+                        "all_responses_seen": [{"url","status",
+                        "resource_type"}...] (lightweight, every response —
+                        not just matches, capped at 100), "diagnostics":
+                        {"goto_status", "goto_error", "final_url",
+                        "page_title", "page_crashed",
+                        "networkidle_timed_out", "networkidle_error",
+                        "html_length", "html_snippet", ...} so a silent
+                        navigation failure or anti-bot block page is visible
+                        in the response, not just a suspiciously low count.
                         For admin diagnostic use (e.g. RelianceDigital's
                         /debugreliance) — hit directly, no auth (matches
                         /check-stock; this whole service has none).
@@ -126,6 +135,54 @@ def _proxy_config() -> dict | None:
     if PROXY_PASSWORD:
         cfg["password"] = PROXY_PASSWORD
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Anti-detection: vanilla headless Chromium (no user-agent override, no
+# viewport, navigator.webdriver=true, empty plugins list) is commonly
+# fingerprinted and served a near-empty challenge/block page instead of the
+# real site — a live /debug-network run against two real RelianceDigital
+# URLs came back with total_requests_seen=1 for BOTH (only the document
+# itself, no scripts/XHR at all), which is exactly that symptom, not a
+# per-page fluke. The same class of issue was already confirmed and fixed
+# this same way for whatsapp_forwarder's WhatsApp Web automation earlier —
+# applied here too, to every browser this service launches (not just
+# /debug-network), since it's a systemic defense, not RelianceDigital-
+# specific.
+# ---------------------------------------------------------------------------
+_REALISTIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters)
+    );
+}
+"""
+
+
+def _new_browser_and_context(pw):
+    """Launch a browser + context with the anti-detection measures above —
+    shared by _render_page (/check-stock) and _capture_network_calls
+    (/debug-network) so both get the same defenses, not just whichever
+    endpoint happened to be under investigation when this was added."""
+    browser = pw.chromium.launch(headless=HEADLESS, proxy=_proxy_config())
+    context = browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        user_agent=_REALISTIC_USER_AGENT,
+        locale="en-US",
+    )
+    context.add_init_script(_STEALTH_INIT_SCRIPT)
+    return browser, context
 
 
 # ---------------------------------------------------------------------------
@@ -254,9 +311,8 @@ def _render_page(url: str) -> str:
         )
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=HEADLESS, proxy=_proxy_config())
+            browser, context = _new_browser_and_context(pw)
             try:
-                context = browser.new_context()
                 page = context.new_page()
                 stats: dict = {}
                 page.route("**/*", _make_resource_blocker(stats))
@@ -324,6 +380,9 @@ def _fetch_and_check(url: str, store: str) -> dict:
 # admin_handlers.py's /debugreliance on the main bot side).
 # ---------------------------------------------------------------------------
 
+_MAX_ALL_SEEN_REPORTED = 100  # cap the lightweight all-responses list
+
+
 def _capture_network_calls(url: str, pincode: str) -> dict:
     """Launch an isolated browser, apply `pincode` as a cookie, load `url`,
     and record every XHR/fetch response whose URL contains one of
@@ -338,6 +397,15 @@ def _capture_network_calls(url: str, pincode: str) -> dict:
     seen being nonzero) — report back what's actually observed so this can
     be adjusted, same as every other live-tuning step this pilot has needed.
 
+    Every step that can silently fail (navigation, the network-idle wait,
+    reading page content, an individual response's body) is wrapped and
+    logged into the returned "diagnostics" dict rather than left to fail
+    invisibly — a prior live run came back with total_requests_seen=1 for
+    two different real product pages, which pointed at either an
+    unhandled navigation error or the page being served an anti-bot
+    challenge instead of the real content; this makes either case visible
+    in the response instead of just a suspiciously low count.
+
     Bounded by the same _check_semaphore /check-stock uses, so total
     concurrent browser instances across both endpoints stays capped."""
     acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
@@ -348,9 +416,8 @@ def _capture_network_calls(url: str, pincode: str) -> dict:
         )
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=HEADLESS, proxy=_proxy_config())
+            browser, context = _new_browser_and_context(pw)
             try:
-                context = browser.new_context()
                 domain = urlparse(url).netloc
                 if domain:
                     context.add_cookies([{
@@ -362,45 +429,105 @@ def _capture_network_calls(url: str, pincode: str) -> dict:
                 stats: dict = {}
                 page.route("**/*", _make_resource_blocker(stats))
 
+                diagnostics: dict = {
+                    "goto_status": None,
+                    "goto_error": None,
+                    "final_url": None,
+                    "page_title": None,
+                    "page_crashed": False,
+                    "networkidle_timed_out": False,
+                    "networkidle_error": None,
+                    "content_error": None,
+                    "response_listener_errors": 0,
+                    "html_length": None,
+                    "html_snippet": None,
+                }
+
+                def _on_crash(_page):
+                    diagnostics["page_crashed"] = True
+                    logger.error(f"[debug-network] page CRASHED while loading {url}")
+
+                page.on("crash", _on_crash)
+
                 matched: list[dict] = []
-                total_seen = {"n": 0}
+                all_seen: list[dict] = []
 
                 def _on_response(response):
-                    total_seen["n"] += 1
-                    url_lower = response.url.lower()
-                    if not any(kw in url_lower for kw in _NETWORK_CAPTURE_KEYWORDS):
-                        return
                     try:
-                        body = response.text()
-                    except Exception as exc:
-                        body = f"<could not read response body: {exc}>"
-                    if body and len(body) > _MAX_BODY_CHARS:
-                        body = body[:_MAX_BODY_CHARS] + f"...(truncated, {len(body)} chars total)"
-                    matched.append({
-                        "url": response.url,
-                        "method": response.request.method,
-                        "status": response.status,
-                        "body": body,
+                        resource_type = response.request.resource_type
+                    except Exception:
+                        resource_type = "?"
+                    all_seen.append({
+                        "url": response.url, "status": response.status, "resource_type": resource_type,
                     })
+                    try:
+                        url_lower = response.url.lower()
+                        if not any(kw in url_lower for kw in _NETWORK_CAPTURE_KEYWORDS):
+                            return
+                        try:
+                            body = response.text()
+                        except Exception as exc:
+                            body = f"<could not read response body: {exc}>"
+                        if body and len(body) > _MAX_BODY_CHARS:
+                            body = body[:_MAX_BODY_CHARS] + f"...(truncated, {len(body)} chars total)"
+                        matched.append({
+                            "url": response.url,
+                            "method": response.request.method,
+                            "status": response.status,
+                            "body": body,
+                        })
+                    except Exception as exc:
+                        diagnostics["response_listener_errors"] += 1
+                        logger.error(f"[debug-network] response listener error on {response.url}: {exc}")
 
                 page.on("response", _on_response)
-                page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
                 try:
-                    page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    logger.info(
-                        f"[debug-network] networkidle wait timed out for {url} — "
-                        f"returning whatever was captured so far"
-                    )
+                    main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                    if main_response is not None:
+                        diagnostics["goto_status"] = main_response.status
+                except Exception as exc:
+                    diagnostics["goto_error"] = str(exc)
+                    logger.error(f"[debug-network] page.goto failed for {url}: {exc}")
+
+                try:
+                    diagnostics["final_url"] = page.url
+                except Exception as exc:
+                    logger.error(f"[debug-network] could not read page.url for {url}: {exc}")
+                try:
+                    diagnostics["page_title"] = page.title()
+                except Exception as exc:
+                    logger.error(f"[debug-network] could not read page.title() for {url}: {exc}")
+
+                if diagnostics["goto_error"] is None:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                    except PlaywrightTimeoutError:
+                        diagnostics["networkidle_timed_out"] = True
+                        logger.info(f"[debug-network] networkidle wait timed out for {url}")
+                    except Exception as exc:
+                        diagnostics["networkidle_error"] = str(exc)
+                        logger.error(f"[debug-network] networkidle wait raised for {url}: {exc}")
+
+                try:
+                    html = page.content()
+                    diagnostics["html_length"] = len(html)
+                    diagnostics["html_snippet"] = html[:500]
+                except Exception as exc:
+                    diagnostics["content_error"] = str(exc)
+                    logger.error(f"[debug-network] page.content() failed for {url}: {exc}")
 
                 logger.info(
-                    f"[debug-network] {url}: {total_seen['n']} response(s) seen, "
-                    f"{len(matched)} matched the capture keywords"
+                    f"[debug-network] {url}: {len(all_seen)} response(s) seen, "
+                    f"{len(matched)} matched; diagnostics={diagnostics}"
                 )
                 return {
                     "matched_requests": matched,
-                    "total_requests_seen": total_seen["n"],
+                    "total_requests_seen": len(all_seen),
                     "matched_count": len(matched),
+                    "all_responses_seen": all_seen[:_MAX_ALL_SEEN_REPORTED],
+                    "all_responses_truncated": len(all_seen) > _MAX_ALL_SEEN_REPORTED,
+                    "diagnostics": diagnostics,
                 }
             finally:
                 browser.close()

@@ -67,8 +67,20 @@ Response: {
      "status": 200, "body": "{\"serviceable\":true,...}"},
     ...
   ],
-  "total_requests_seen": 12,   // every XHR/fetch response observed, for context
-  "matched_count": 2           // how many matched the capture keywords
+  "total_requests_seen": 12,     // every XHR/fetch response observed, for context
+  "matched_count": 2,            // how many matched the capture keywords
+  "all_responses_seen": [        // lightweight (no body) list of EVERY response,
+    {"url": "...", "status": 200, "resource_type": "document"}, ...   // capped at 100
+  ],
+  "all_responses_truncated": false,
+  "diagnostics": {
+    "goto_status": 200, "goto_error": null,        // page.goto()'s own result/exception
+    "final_url": "...", "page_title": "...",        // where navigation actually ended up
+    "page_crashed": false,
+    "networkidle_timed_out": false, "networkidle_error": null,
+    "html_length": 45213, "html_snippet": "<!DOCTYPE html>...",
+    "response_listener_errors": 0
+  }
 }
 ```
 No auth on this endpoint (matches `/check-stock` — this whole service has
@@ -80,18 +92,42 @@ Built for `/debugreliance` on the main-bot side (RelianceDigital's stock
 signal appears to live behind a pincode-gated API call rather than in the
 page's own embedded JSON), but works against any URL.
 
-**The pincode-as-cookie approach is a best-effort guess**, not a confirmed
-mechanism — this sandbox has no live network access to check how
+**A live run against two real RelianceDigital URLs came back with
+`total_requests_seen: 1` for both** — only the document itself, no
+scripts/XHR at all, which pointed at either a silently swallowed
+navigation error or an anti-bot challenge page being served instead of the
+real site. Two things changed in response:
+1. **Anti-detection measures** were added to every browser this service
+   launches (not just this endpoint) — a realistic desktop Chrome
+   user-agent, a normal 1280×800 viewport, and an init script patching the
+   standard headless-Chromium tells (`navigator.webdriver`, `window.chrome`,
+   `navigator.plugins`, `navigator.languages`). Vanilla headless Chromium is
+   commonly fingerprinted and served a stripped-down page instead of the
+   real one; this exact symptom (near-empty response, minimal further
+   activity) was already confirmed and fixed the same way for
+   `whatsapp_forwarder`'s WhatsApp Web automation.
+2. **Every step that could silently fail is now caught and reported** in
+   `diagnostics` instead of just producing a suspiciously low count with no
+   explanation: `page.goto()`'s own error (if any) and HTTP status, the
+   final URL after any redirects, the page title, whether the page crashed,
+   whether the network-idle wait timed out or raised, and the first 500
+   chars of whatever HTML actually loaded. `all_responses_seen` lists every
+   response observed (not just keyword matches) so you can see exactly what
+   *did* load even when nothing matched the capture keywords.
+
+**The pincode-as-cookie approach is still a best-effort guess**, not a
+confirmed mechanism — this sandbox has no live network access to check how
 RelianceDigital's frontend actually reads a selected pincode (a cookie is
 the most common convention, matching what the main bot's own quick-commerce
 checkers already do, but it could instead be `localStorage`, a request
 header, or something only set after a UI interaction like typing into a
-pincode widget and clicking a button). If `matched_count` comes back 0
-despite `total_requests_seen` being nonzero, that itself is the useful
-signal — it means the serviceability call either didn't fire at all (cookie
-isn't how this site reads it) or fired with a URL/keyword this capture list
-doesn't recognize. Report back what's actually observed so the approach can
-be adjusted, same as every other live-tuning step this pilot has needed.
+pincode widget and clicking a button). If `matched_count` still comes back
+0 despite `total_requests_seen` now being a realistic number, check
+`all_responses_seen` for anything serviceability-shaped that just didn't
+match the keyword list, and `diagnostics.page_title`/`html_snippet` for
+signs of a login wall, captcha, or region-redirect page. Report back what's
+actually observed so the approach can be adjusted, same as every other
+live-tuning step this pilot has needed.
 
 ```
 GET /health
