@@ -305,7 +305,7 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="whatsappdisable", description="[admin] Disable a user's WhatsApp forwarding"),
         BotCommand(command="managetracking", description="[admin] Bulk stop tracking / stop plan"),
         BotCommand(command="linksbystore",   description="[admin] Tracked links grouped by store"),
-        BotCommand(command="zyteusage",      description="[admin] Zyte API usage & estimated cost per store"),
+        BotCommand(command="creditusage",    description="[admin] Zyte API credit usage per store (this month / all)"),
     ]
     # Scoped ONLY to the admin's own chat — regular users never see these in
     # their Telegram "/" menu, on top of being functionally unreachable to

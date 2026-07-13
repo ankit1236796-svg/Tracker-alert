@@ -97,6 +97,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+import database
+
 logger = logging.getLogger(__name__)
 
 ZYTE_API_URL = "https://api.zyte.com/v1/extract"
@@ -179,6 +181,7 @@ async def fetch_page(
     custom_headers: bool = False,
     play_with_browser: list[dict] | None = None,
     timeout: float = 60.0,
+    site: str | None = None,
 ) -> httpx.Response:
     """
     Fetch `url` via Zyte API and return a genuine httpx.Response synthesized
@@ -191,6 +194,15 @@ async def fetch_page(
     network-level exception (timeout, connection error) is NOT caught here
     and propagates to the caller, exactly matching Scrape.do's own
     plain-httpx-GET behavior that every existing call site already handles.
+
+    After every request Zyte's own endpoint actually served (HTTP 200 from
+    Zyte, regardless of the target site's own statusCode — Zyte bills for
+    those too), logs site/browser-tier/actions-used/response size to
+    database.zyte_usage_log via record_zyte_usage — see database.py's
+    get_zyte_usage_summary and admin_handlers.py's /creditusage for how
+    this is surfaced. site is purely for that tracking (optional, defaults
+    to None -> logged under "(debug/other)"); a tracking failure is caught
+    and logged rather than ever breaking a fetch that already succeeded.
     """
     if custom_headers:
         raise NotImplementedError(
@@ -255,6 +267,16 @@ async def fetch_page(
         html = ""
 
     logger.info(f"[zyte] target statusCode={target_status} html_length={len(html)}")
+
+    try:
+        database.record_zyte_usage(
+            site, use_browser, len(html.encode("utf-8")), actions_used=bool(actions),
+        )
+    except Exception as exc:
+        # Usage tracking must never take down a real fetch that already
+        # succeeded — log and move on.
+        logger.warning(f"[zyte] record_zyte_usage failed (fetch itself still succeeded): {exc}")
+
     return httpx.Response(status_code=target_status, content=html, request=request)
 
 

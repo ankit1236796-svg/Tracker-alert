@@ -244,8 +244,21 @@ def init_db():
                 created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # Migration: add actions_used — whether this request included a
+        # playWithBrowser/Zyte "actions" chain (click/type/wait...), tracked
+        # separately from render_js since actions add extra cost/latency on
+        # TOP of the browser tier they require, not just the browser tier
+        # itself. Defaults to 0 for every pre-existing row.
+        try:
+            conn.execute("ALTER TABLE zyte_usage_log ADD COLUMN actions_used INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_zyte_usage_log_site ON zyte_usage_log(site)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_zyte_usage_log_created_at ON zyte_usage_log(created_at)
         """)
 
         # ── WhatsApp channel forwarding (per-user, admin-approved) ────────────
@@ -687,48 +700,87 @@ ZYTE_COST_PER_REQUEST_HTTP = (0.13 / 1000, 1.27 / 1000)
 ZYTE_COST_PER_REQUEST_BROWSER = (1.00 / 1000, 16.08 / 1000)
 
 
-def record_zyte_usage(site: str | None, render_js: bool, response_bytes: int) -> None:
+def record_zyte_usage(
+    site: str | None, render_js: bool, response_bytes: int, actions_used: bool = False,
+) -> None:
     """
     Log one Zyte API fetch for later cost-estimation (see
-    get_zyte_usage_summary). Called from checkers/common.py's fetch_page()
-    after every successful Zyte-served fetch — never from the Scrape.do
-    code path, which has its own separate dashboard/billing the admin
-    already monitors directly. site is whatever the caller knows (a
+    get_zyte_usage_summary). Called from zyte_client.py's fetch_page()
+    after every successful Zyte-served fetch (i.e. Zyte's own endpoint
+    returned HTTP 200 — a target-site error like a 404 still counts as
+    "successful" here since Zyte still bills for it) — never from the
+    Scrape.do code path, which has its own separate dashboard/billing the
+    admin already monitors directly. site is whatever the caller knows (a
     tracked-product site key like "amazon", or None for an ad-hoc/debug
     fetch with no such concept, e.g. /debugzyte on an arbitrary URL).
+    render_js means "the browser tier was used" (covers render_js,
+    super_proxy, or an actions/custom_wait_ms request that forced it on).
+    actions_used is tracked separately since a playWithBrowser/Zyte
+    "actions" chain (click/type/wait...) adds cost/latency on TOP of the
+    browser tier it requires, not just the browser tier alone.
     """
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO zyte_usage_log (site, render_js, response_bytes, created_at) VALUES (?, ?, ?, ?)",
-            (site, 1 if render_js else 0, response_bytes, now_ist_str()),
+            """
+            INSERT INTO zyte_usage_log (site, render_js, response_bytes, actions_used, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (site, 1 if render_js else 0, response_bytes, 1 if actions_used else 0, now_ist_str()),
         )
         conn.commit()
 
 
-def get_zyte_usage_summary() -> list[dict]:
+def _month_start_ist() -> str:
+    """The current IST calendar month's start, as a stored-format string —
+    the default lower bound get_zyte_usage_summary uses, so the summary
+    "resets" automatically at each month boundary without deleting any
+    underlying log data (the full history stays queryable via since=None
+    is NOT the same as all-time — pass since='' explicitly for that)."""
+    now = datetime.now(IST)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_zyte_usage_summary(since: str | None = "__month__") -> list[dict]:
     """
     Per-site (site=None grouped as "(debug/other)") usage totals: request
-    count, total response bytes, how many of those requests were browser-
-    rendered vs plain HTTP, and an ESTIMATED cost range in dollars derived
-    from ZYTE_COST_PER_REQUEST_HTTP/BROWSER — NOT Zyte's actual billed
-    amount (no per-request cost field exists in Zyte API's own response;
-    see this module's zyte_usage_log schema comment). Ordered by total
-    request count, busiest site first.
+    count, total response bytes, how many requests were browser-rendered
+    vs plain HTTP, how many used a playWithBrowser/actions chain, and an
+    ESTIMATED cost range in dollars derived from
+    ZYTE_COST_PER_REQUEST_HTTP/BROWSER — NOT Zyte's actual billed amount
+    (no per-request cost field exists in Zyte API's own response; see this
+    module's zyte_usage_log schema comment). Ordered by request count,
+    busiest site first.
+
+    since controls the time window:
+      "__month__" (default) — from the start of the current IST calendar
+        month, i.e. a running counter that resets automatically every
+        month without ever deleting the underlying log.
+      None or ""            — all-time, every row ever logged.
+      any other string      — rows with created_at >= that exact value
+        (a stored-format 'YYYY-MM-DD HH:MM:SS' string, e.g. for a custom
+        reporting window).
     """
+    query = """
+        SELECT
+            site,
+            COUNT(*) AS request_count,
+            SUM(response_bytes) AS total_bytes,
+            SUM(CASE WHEN render_js = 1 THEN 1 ELSE 0 END) AS browser_count,
+            SUM(CASE WHEN render_js = 0 THEN 1 ELSE 0 END) AS http_count,
+            SUM(CASE WHEN actions_used = 1 THEN 1 ELSE 0 END) AS actions_count
+        FROM zyte_usage_log
+    """
+    params: tuple = ()
+    if since == "__month__":
+        query += " WHERE created_at >= ?"
+        params = (_month_start_ist(),)
+    elif since:
+        query += " WHERE created_at >= ?"
+        params = (since,)
+    query += " GROUP BY site ORDER BY request_count DESC"
+
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                site,
-                COUNT(*) AS request_count,
-                SUM(response_bytes) AS total_bytes,
-                SUM(CASE WHEN render_js = 1 THEN 1 ELSE 0 END) AS browser_count,
-                SUM(CASE WHEN render_js = 0 THEN 1 ELSE 0 END) AS http_count
-            FROM zyte_usage_log
-            GROUP BY site
-            ORDER BY request_count DESC
-            """
-        ).fetchall()
+        rows = conn.execute(query, params).fetchall()
 
     summary = []
     for row in rows:
@@ -742,6 +794,7 @@ def get_zyte_usage_summary() -> list[dict]:
             "total_bytes": row["total_bytes"] or 0,
             "browser_count": browser_count,
             "http_count": http_count,
+            "actions_count": row["actions_count"] or 0,
             "estimated_cost_low": low,
             "estimated_cost_high": high,
         })

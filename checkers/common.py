@@ -8,7 +8,6 @@ from urllib.parse import urlparse, urlencode
 
 import httpx
 
-import database
 import zyte_client
 from config import SUPPORTED_SITES, SCRAPING_PROVIDER
 
@@ -128,16 +127,17 @@ async def fetch_page(
     resp.text / resp.status_code / resp.json() / resp.raise_for_status()
     usage keeps working unchanged.
 
-    `site` is purely for usage-cost tracking (database.record_zyte_usage) —
-    optional, defaults to None (logged under "(debug/other)" — see
-    get_zyte_usage_summary) for callers with no tracked-product "site"
+    `site` is purely for usage-cost tracking (database.record_zyte_usage,
+    called from INSIDE zyte_client.fetch_page after every successful Zyte
+    request) — optional, defaults to None (logged under "(debug/other)" —
+    see get_zyte_usage_summary) for callers with no tracked-product "site"
     concept, e.g. /debugzyte on an arbitrary URL or Apple's fulfillment-
     messages API call. Only recorded on the zyte path; Scrape.do usage has
     its own separate dashboard the admin already monitors directly, so
     there's no matching tracking on that path.
     """
     if SCRAPING_PROVIDER == "zyte":
-        resp = await zyte_client.fetch_page(
+        return await zyte_client.fetch_page(
             url,
             render_js=render_js,
             super_proxy=super_proxy,
@@ -147,14 +147,8 @@ async def fetch_page(
             custom_headers=custom_headers,
             play_with_browser=play_with_browser,
             timeout=timeout,
+            site=site,
         )
-        try:
-            database.record_zyte_usage(site, render_js or super_proxy, len(resp.content))
-        except Exception as exc:
-            # Usage tracking must never take down a real fetch that already
-            # succeeded — log and move on.
-            logger.warning(f"[fetch_page] record_zyte_usage failed (fetch itself still succeeded): {exc}")
-        return resp
 
     # scrapedo — Scrape.do's original code path, untouched, only reached
     # when SCRAPING_PROVIDER is explicitly set back to "scrapedo".

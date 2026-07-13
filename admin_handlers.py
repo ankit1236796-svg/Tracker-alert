@@ -2294,22 +2294,38 @@ async def cmd_debugzyte(message: Message, command: CommandObject):
 
 
 # ---------------------------------------------------------------------------
-# /zyteusage — per-site Zyte API usage summary (request count, data volume,
-# browser-rendered vs plain-HTTP split, and an ESTIMATED cost range). This is
-# an ESTIMATE, not real billing: Zyte's own /v1/extract response has no
-# per-request cost/billing field (confirmed via documentation research and
-# /debugzyte's "raw" mode — see database.py's zyte_usage_log schema comment
-# for the full reasoning and ZYTE_COST_PER_REQUEST_HTTP/BROWSER for the
-# published price bands this estimate is derived from). Only counts requests
+# /creditusage — per-store Zyte API usage breakdown: request count, total
+# data fetched, browser-rendered/actions-used split, sorted by highest
+# usage first — a proxy for cost even without exact per-request Zyte
+# pricing, since request count + browser-rendering directly correlates
+# with what Zyte actually bills (browser-rendered requests cost roughly
+# 5-15x more than plain HTTP ones per Zyte's own published pricing — see
+# database.py's ZYTE_COST_PER_REQUEST_HTTP/BROWSER). The estimated $ range
+# shown alongside is exactly that — an ESTIMATE, not real billing: Zyte's
+# own /v1/extract response has no per-request cost/billing field
+# (confirmed via documentation research and /debugzyte's "raw" mode — see
+# database.py's zyte_usage_log schema comment for the full reasoning).
+#
+# Defaults to the CURRENT MONTH (IST) — a running counter that resets
+# automatically at each month boundary without ever deleting the
+# underlying log (get_zyte_usage_summary's since="__month__" default).
+# /creditusage all shows the all-time total instead. Only counts requests
 # actually served by Zyte (SCRAPING_PROVIDER="zyte") — Scrape.do usage has
 # its own separate dashboard the admin already monitors directly.
 # ---------------------------------------------------------------------------
 
-@router.message(Command("zyteusage"))
-async def cmd_zyteusage(message: Message):
-    summary = get_zyte_usage_summary()
+@router.message(Command("creditusage"))
+async def cmd_creditusage(message: Message, command: CommandObject):
+    all_time = bool(command.args and command.args.strip().lower() == "all")
+    summary = get_zyte_usage_summary(since=None if all_time else "__month__")
+    period_label = "all-time" if all_time else "this month"
+
     if not summary:
-        await message.answer("📭 No Zyte API usage logged yet.")
+        await message.answer(
+            f"📭 No Zyte API usage logged yet ({period_label}). "
+            f"Try <code>/creditusage all</code> for the all-time total.",
+            parse_mode="HTML",
+        )
         return
 
     total_requests = sum(r["request_count"] for r in summary)
@@ -2317,19 +2333,23 @@ async def cmd_zyteusage(message: Message):
     total_high = sum(r["estimated_cost_high"] for r in summary)
 
     lines = [
-        f"📊 <b>Zyte API usage — {total_requests} request(s) total</b>\n"
+        f"📊 <b>Zyte API credit usage — {period_label} — {total_requests} request(s) total</b>\n"
         f"💰 Estimated cost: ${total_low:,.4f} – ${total_high:,.4f} "
         f"(ESTIMATE from request count/bytes/browser-rendering — see "
         f"/debugzyte &lt;url&gt; raw for why no exact figure is available)\n",
     ]
     for r in summary:
         mb = r["total_bytes"] / (1024 * 1024)
+        label = r["site"] if r["site"] == "(debug/other)" else get_site_label(r["site"])
         lines.append(
-            f"🏪 <b>{get_site_label(r['site']) if r['site'] != '(debug/other)' else r['site']}</b>\n"
+            f"🏪 <b>{label}</b>\n"
             f"   {r['request_count']} request(s) · {mb:.2f} MB total\n"
-            f"   {r['browser_count']} browser-rendered · {r['http_count']} plain HTTP\n"
+            f"   {r['browser_count']} browser-rendered · {r['http_count']} plain HTTP"
+            + (f" · {r['actions_count']} used actions" if r["actions_count"] else "") + "\n"
             f"   Est. cost: ${r['estimated_cost_low']:,.4f} – ${r['estimated_cost_high']:,.4f}"
         )
+    if not all_time:
+        lines.append("\nUse <code>/creditusage all</code> for the all-time total.")
     text = "\n".join(lines)
     for i in range(0, len(text), 3800):
         await message.answer(text[i:i + 3800], parse_mode="HTML")
