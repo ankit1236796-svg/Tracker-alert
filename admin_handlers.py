@@ -1510,30 +1510,14 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
         for i in range(0, len(occ_text), _CHUNK_SIZE):
             await _debug_send(message, occ_text[i:i + _CHUNK_SIZE])
 
+    found_in_stock_phrase = inventstore._IN_STOCK_PHRASE in visible_text.lower()
+    verdict = inventstore.check(BeautifulSoup(html, "html.parser"), html)
     await _debug_send(
         message,
-        f"🧩 checkers/inventstore.py's actual detection patterns:\n"
-        f"Total-variations pattern: {inventstore._VARIATION_ID_PATTERN.pattern}\n"
-        f"Out-of-stock pattern: {inventstore._STOCK_OOS_PATTERN.pattern}\n"
-        f"(both re.IGNORECASE — compare these against the raw-HTML matches "
-        f"below to confirm they actually match what's in the real page)",
-    )
-
-    total_variations = inventstore._count_total_variations(html)
-    out_of_stock_count = inventstore._count_out_of_stock_variations(html)
-    if total_variations > 0:
-        verdict_line = (
-            f"Verdict: {'✅ IN STOCK' if out_of_stock_count < total_variations else '❌ OUT OF STOCK'} "
-            f"({out_of_stock_count}/{total_variations} variations out of stock)"
-        )
-    else:
-        verdict_line = "Verdict: ⚠️ could not determine via variation counting — 0 'variation_id' occurrences found"
-    await _debug_send(
-        message,
-        f"🧮 Variation-based stock count:\n"
-        f"Total variations found: {total_variations}\n"
-        f"Out-of-stock variations: {out_of_stock_count}\n"
-        f"{verdict_line}",
+        f"🧩 checkers/inventstore.py's sole detection signal: literal phrase "
+        f"{inventstore._IN_STOCK_PHRASE!r} in visible text (case-insensitive)\n"
+        f"Found: {'yes' if found_in_stock_phrase else 'no'}\n"
+        f"Verdict: {'✅ IN STOCK' if verdict else '❌ OUT OF STOCK'}",
     )
 
     for phrase in _INVENTSTORE_RAW_PHRASES:
