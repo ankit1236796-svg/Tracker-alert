@@ -1156,16 +1156,29 @@ async def cmd_debugsonyofficial(message: Message, command: CommandObject):
 # by this. Mirrors the EXACT fetch escalation stock_checker.py actually
 # uses for "unicornstore" today (render=true first via _JS_SITES, then
 # render=true+super=true if the first attempt looks blocked/incomplete via
-# _SUPER_PROXY_FALLBACK_SITES) — the heuristic below is a deliberate local
-# copy of stock_checker._looks_blocked_or_incomplete's logic (same
-# constants), not an import, matching this file's existing convention of
-# keeping every /debug* command self-contained. Safe to delete once no
-# longer needed.
+# _SUPER_PROXY_FALLBACK_SITES), INCLUDING the waitUntil="networkidle0" +
+# customWait=6000ms JS-settle fix (stock_checker._SITE_WAIT_UNTIL /
+# _SITE_CUSTOM_WAIT_MS) — confirmed necessary via an earlier run of this
+# exact command, which showed render=true alone capturing the page before
+# its SPA finished loading (visible text was just boilerplate/footer plus
+# the literal "Please enable JavaScript to continue using this
+# application" fallback text, no real product content at all — the same
+# symptom OnePlus hit, fixed the same way). The blocked/incomplete
+# heuristic below is a deliberate local copy of stock_checker._looks_
+# blocked_or_incomplete's logic (same constants), not an import, matching
+# this file's existing convention of keeping every /debug* command
+# self-contained. Safe to delete once no longer needed.
 # ---------------------------------------------------------------------------
 _DEBUG_UNICORN_ADMIN_ID = 5004721766  # same hardcoded restriction as every
 # other /debug* command above, on top of the router's own ADMIN_USER_ID
 # filter — this fetches an arbitrary caller-supplied URL via Scrape.do
 # (spends credits).
+
+# Mirrors stock_checker._SITE_WAIT_UNTIL["unicornstore"] /
+# _SITE_CUSTOM_WAIT_MS["unicornstore"] exactly, so this command's fetches
+# match production for real.
+_UNICORN_WAIT_UNTIL = "networkidle0"
+_UNICORN_CUSTOM_WAIT_MS = 6000
 
 # Mirrors stock_checker._BLOCKED_PAGE_PHRASES / _MIN_PLAUSIBLE_HTML_LENGTH /
 # _looks_blocked_or_incomplete exactly, so this command's escalation
@@ -1199,11 +1212,14 @@ async def cmd_debugunicorn(message: Message, command: CommandObject):
     url = command.args.strip()
     start = time.monotonic()
 
-    # Tier 1: render=true — the current production default for
-    # "unicornstore" (stock_checker._JS_SITES membership).
-    method_used = "render=true"
+    # Tier 1: render=true + waitUntil=networkidle0 + customWait=6000ms —
+    # the current production default for "unicornstore" (_JS_SITES plus
+    # the JS-settle fix in _SITE_WAIT_UNTIL/_SITE_CUSTOM_WAIT_MS).
+    method_used = f"render=true, waitUntil={_UNICORN_WAIT_UNTIL!r}, customWait={_UNICORN_CUSTOM_WAIT_MS}ms"
     try:
-        scraper_url = build_scraper_url(url, render_js=True)
+        scraper_url = build_scraper_url(
+            url, render_js=True, wait_until=_UNICORN_WAIT_UNTIL, custom_wait_ms=_UNICORN_CUSTOM_WAIT_MS
+        )
         stage_start = time.monotonic()
         async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
             resp = await client.get(scraper_url)
@@ -1216,17 +1232,25 @@ async def cmd_debugunicorn(message: Message, command: CommandObject):
 
     await _debug_send(
         message,
-        f"— Tier 1: render=true —\nStatus: HTTP {status_code}\n"
+        f"— Tier 1: render=true, waitUntil={_UNICORN_WAIT_UNTIL!r}, "
+        f"customWait={_UNICORN_CUSTOM_WAIT_MS}ms —\nStatus: HTTP {status_code}\n"
         f"Visible text length so far: {len(html)} raw chars\n⏱ Time: {elapsed_stage1:.2f}s",
     )
 
-    # Tier 2: render=true + super=true — only if tier 1 looks
-    # blocked/incomplete, exactly matching stock_checker.py's
+    # Tier 2: render=true + super=true (same wait params) — only if tier 1
+    # still looks blocked/incomplete, exactly matching stock_checker.py's
     # _SUPER_PROXY_FALLBACK_SITES escalation for this site.
     if _unicorn_looks_blocked_or_incomplete(html):
-        method_used = "render=true + super=true (premium proxy, escalated — tier 1 looked blocked/incomplete)"
+        method_used = (
+            f"render=true + super=true, waitUntil={_UNICORN_WAIT_UNTIL!r}, "
+            f"customWait={_UNICORN_CUSTOM_WAIT_MS}ms (premium proxy, escalated — "
+            f"tier 1 looked blocked/incomplete)"
+        )
         try:
-            fallback_scraper_url = build_scraper_url(url, render_js=True, super_proxy=True)
+            fallback_scraper_url = build_scraper_url(
+                url, render_js=True, super_proxy=True,
+                wait_until=_UNICORN_WAIT_UNTIL, custom_wait_ms=_UNICORN_CUSTOM_WAIT_MS,
+            )
             stage_start = time.monotonic()
             async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
                 resp2 = await client.get(fallback_scraper_url)
@@ -1255,7 +1279,8 @@ async def cmd_debugunicorn(message: Message, command: CommandObject):
         message,
         f"🔍 Fetch method used: {method_used}\n"
         f"Final HTTP status: {status_code}\n"
-        f"Visible text length: {len(visible_text)} chars",
+        f"Visible text length: {len(visible_text)} chars\n"
+        f"Visible text preview (first 500 chars): {visible_text[:500]!r}",
     )
 
     await _report_embedded_json_signals(message, "unicornstore", html, url)

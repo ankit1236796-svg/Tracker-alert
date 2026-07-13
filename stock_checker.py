@@ -178,8 +178,20 @@ _JS_SITES = {
 # customWait buffer fixes this; scoped to oneplus only via these per-site
 # maps (build_scraper_url's wait_until/custom_wait_ms are no-ops for every
 # other site, which don't appear here and so get None → unchanged requests).
-_SITE_WAIT_UNTIL = {"oneplus": "networkidle0"}
-_SITE_CUSTOM_WAIT_MS = {"oneplus": 4000}
+#
+# Unicorn Store hits the same symptom, confirmed via /debugunicorn: even
+# with render=true, Scrape.do was capturing the page before its SPA
+# finished loading — visible text was just boilerplate/footer plus the
+# literal "Please enable JavaScript to continue using this application"
+# fallback text, with the actual product content (price, stock status)
+# never appearing. Same fix, same reasoning as OnePlus: waitUntil=
+# "networkidle0" plus a customWait buffer. Given 6000ms (the middle of
+# the 5000-8000ms range that fixed this class of issue) rather than
+# OnePlus's 4000ms, since this page was captured showing essentially
+# NO real content (not just one missing signal), suggesting it needs
+# more settle time than OnePlus did.
+_SITE_WAIT_UNTIL = {"oneplus": "networkidle0", "unicornstore": "networkidle0"}
+_SITE_CUSTOM_WAIT_MS = {"oneplus": 4000, "unicornstore": 6000}
 
 # Sites that get a second fetch attempt with Scrape.do's super=true premium
 # proxy pool when the render=true fetch looks blocked/incomplete — the same
