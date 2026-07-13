@@ -9,21 +9,22 @@ from .common import build_scraper_url, HEADERS
 logger = logging.getLogger(__name__)
 
 # This site does NOT participate in stock_checker._JS_SITES — it owns its
-# own two-stage render escalation (render=false first, render=true only if
-# needed; see check_via_html below), special-cased in
-# stock_checker.check_stock() for "shopatsc", the opposite order from
-# every render=true-by-default site in _JS_SITES.
+# own fetch logic, special-cased in stock_checker.check_stock() for
+# "shopatsc".
 
-# Scrape.do fetch timeout for either render mode.
+# Scrape.do fetch timeout for the render=false/render=true tiers.
 _RENDER_TIMEOUT = 30.0
+# super=true (premium/residential proxy) requests can take noticeably
+# longer than the default proxy tier — matches the longer timeout used
+# for RelianceDigital's own super=true debug trials.
+_SUPER_PROXY_TIMEOUT = 60.0
 
 _ADD_PATTERNS = ["add to cart", "buy now"]
 _NOTIFY_ONLY_PATTERN = "notify me"
 
 # Minimum visible-text length considered "plausibly a real, fully-loaded
-# product page". A render=false fetch that comes back shorter than this
-# (or failed outright) is treated as incomplete and retried with
-# render=true.
+# product page". A fetch that comes back shorter than this (or failed
+# outright) is treated as incomplete and escalated to the next tier.
 _MIN_PLAUSIBLE_TEXT_LENGTH = 200
 
 
@@ -66,39 +67,36 @@ def check(soup: BeautifulSoup, html: str) -> bool:
     return False
 
 
-async def _fetch_page(url: str, render_js: bool) -> httpx.Response:
-    scraper_url = build_scraper_url(url, render_js=render_js)
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=_RENDER_TIMEOUT) as client:
+async def _fetch_page(
+    url: str, render_js: bool, super_proxy: bool = False, timeout: float = _RENDER_TIMEOUT
+) -> httpx.Response:
+    scraper_url = build_scraper_url(url, render_js=render_js, super_proxy=super_proxy)
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
         return await client.get(scraper_url)
 
 
 async def check_via_html(url: str) -> bool:
     """
-    Fetches the product page via Scrape.do and returns the stock status
-    via check(). Tries render=false FIRST — Shopify product pages are
-    largely server-rendered, so the "Add to cart"/"Notify Me" text this
-    checker needs is usually present without executing JS, and render=false
-    is both faster and cheaper in Scrape.do credits than render=true. If
-    that fetch fails (non-200) or its visible-text extraction looks
-    incomplete/empty, retries once with render=true.
+    Sole production fetch path for ShopAtSC. Goes straight to Scrape.do's
+    super=true (premium/residential proxy), skipping render=false and
+    render=true entirely — both were confirmed failing for this site
+    (render=false: HTTP 502; render=true: timeout), the same symptom
+    RelianceDigital hit before its own fix, and super=true is the same
+    fix that resolved it there too. Since the underlying problem is
+    proxy-IP reputation/blocking rather than missing JS-rendered content
+    (ShopAtSC's product pages are largely server-rendered), render_js is
+    NOT combined with super_proxy here — matching the RelianceDigital
+    precedent of super=true alone as the working default.
 
-    Called directly by stock_checker.check_stock() (special-cased for
-    "shopatsc", same pattern used for Apple's pincode refinement) rather
-    than going through the generic per-site _JS_SITES flag, since the
-    render=false-first-then-escalate order is the opposite of every other
-    JS-rendered site in this codebase.
+    Deliberately does not retry render=false/render=true if super=true
+    also fails — those two tiers are already known to fail for this
+    site, so retrying them would only waste time before an inevitable
+    failure. See debug_check() below for a diagnostic that still
+    exercises all three tiers, in case Scrape.do's behavior for this
+    site changes again in the future.
     """
-    resp = await _fetch_page(url, render_js=False)
-    text = _visible_text(resp.text) if resp.status_code == 200 else ""
-
-    if resp.status_code != 200 or _text_looks_incomplete(text):
-        logger.info(
-            f"[shopatsc] render=false insufficient (status={resp.status_code}, "
-            f"text_len={len(text)}) — retrying render=true"
-        )
-        resp = await _fetch_page(url, render_js=True)
-        resp.raise_for_status()
-
+    resp = await _fetch_page(url, render_js=False, super_proxy=True, timeout=_SUPER_PROXY_TIMEOUT)
+    resp.raise_for_status()
     html = resp.text
     soup = BeautifulSoup(html, "html.parser")
     return check(soup, html)
@@ -106,16 +104,17 @@ async def check_via_html(url: str) -> bool:
 
 async def debug_check(url: str) -> dict:
     """
-    Diagnostic version of check_via_html()'s two-stage render escalation
-    (render=false first, render=true only if needed) for the
-    /debugsonyofficial admin command (admin_handlers.py) — NOT used by the
-    live check_stock() path (which calls check_via_html() directly and
-    only cares about the final bool). Runs through the exact same logic
-    but captures which render mode was used, the HTTP status/visible-text
-    length/timing for EACH stage, the final signal, and total elapsed
-    time — instead of collapsing straight to a bool — so slowness or an
-    unexpected render mode can be diagnosed from a single command without
-    touching production code.
+    Diagnostic version of the full three-tier Scrape.do escalation
+    (render=false, then render=true, then super=true) for the
+    /debugsonyofficial admin command (admin_handlers.py) — NOT used by
+    the live check_stock() path (which calls check_via_html() directly
+    and skips straight to super=true, per the reasoning there). Runs each
+    tier in order, stopping as soon as one produces a plausibly-complete
+    page, and reports per-tier HTTP status/error/visible-text length/
+    timing for every tier actually attempted, plus the final signal,
+    verdict, and total elapsed time — so slowness or a tier recovering/
+    regressing can be diagnosed from a single command without touching
+    production code.
     """
     start = time.monotonic()
     result: dict = {
@@ -125,20 +124,27 @@ async def debug_check(url: str) -> dict:
         "render_false_visible_text_length": None,
         "render_false_looked_incomplete": None,
         "render_false_elapsed_seconds": None,
-        "used_render_true_fallback": False,
+        "used_render_true": False,
         "render_true_status_code": None,
         "render_true_error": None,
         "render_true_visible_text_length": None,
+        "render_true_looked_incomplete": None,
         "render_true_elapsed_seconds": None,
+        "used_super_proxy": False,
+        "super_proxy_status_code": None,
+        "super_proxy_error": None,
+        "super_proxy_visible_text_length": None,
+        "super_proxy_elapsed_seconds": None,
         "signal": None,
         "in_stock": None,
         "total_elapsed_seconds": None,
     }
 
-    stage1_start = time.monotonic()
+    # ── Tier 1: render=false ────────────────────────────────────────────
+    stage_start = time.monotonic()
     html1 = None
     try:
-        resp1 = await _fetch_page(url, render_js=False)
+        resp1 = await _fetch_page(url, render_js=False, timeout=_RENDER_TIMEOUT)
         result["render_false_status_code"] = resp1.status_code
         if resp1.status_code == 200:
             html1 = resp1.text
@@ -146,20 +152,22 @@ async def debug_check(url: str) -> dict:
             result["render_false_error"] = f"HTTP {resp1.status_code}"
     except Exception as exc:
         result["render_false_error"] = f"{type(exc).__name__}: {exc}"
-    result["render_false_elapsed_seconds"] = time.monotonic() - stage1_start
+    result["render_false_elapsed_seconds"] = time.monotonic() - stage_start
 
     text1 = _visible_text(html1) if html1 is not None else ""
     result["render_false_visible_text_length"] = len(text1)
-    incomplete = html1 is None or _text_looks_incomplete(text1)
-    result["render_false_looked_incomplete"] = incomplete
+    tier1_incomplete = html1 is None or _text_looks_incomplete(text1)
+    result["render_false_looked_incomplete"] = tier1_incomplete
 
-    final_html = html1
-    if incomplete:
-        result["used_render_true_fallback"] = True
-        stage2_start = time.monotonic()
+    final_html = html1 if not tier1_incomplete else None
+
+    # ── Tier 2: render=true (only if tier 1 was insufficient) ──────────
+    if tier1_incomplete:
+        result["used_render_true"] = True
+        stage_start = time.monotonic()
         html2 = None
         try:
-            resp2 = await _fetch_page(url, render_js=True)
+            resp2 = await _fetch_page(url, render_js=True, timeout=_RENDER_TIMEOUT)
             result["render_true_status_code"] = resp2.status_code
             if resp2.status_code == 200:
                 html2 = resp2.text
@@ -167,13 +175,39 @@ async def debug_check(url: str) -> dict:
                 result["render_true_error"] = f"HTTP {resp2.status_code}"
         except Exception as exc:
             result["render_true_error"] = f"{type(exc).__name__}: {exc}"
-        result["render_true_elapsed_seconds"] = time.monotonic() - stage2_start
+        result["render_true_elapsed_seconds"] = time.monotonic() - stage_start
+
+        text2 = _visible_text(html2) if html2 is not None else ""
         if html2 is not None:
-            result["render_true_visible_text_length"] = len(_visible_text(html2))
-        final_html = html2
+            result["render_true_visible_text_length"] = len(text2)
+        tier2_incomplete = html2 is None or _text_looks_incomplete(text2)
+        result["render_true_looked_incomplete"] = tier2_incomplete
+
+        final_html = html2 if not tier2_incomplete else None
+
+        # ── Tier 3: super=true (only if tiers 1 AND 2 were insufficient) ──
+        if tier2_incomplete:
+            result["used_super_proxy"] = True
+            stage_start = time.monotonic()
+            html3 = None
+            try:
+                resp3 = await _fetch_page(
+                    url, render_js=False, super_proxy=True, timeout=_SUPER_PROXY_TIMEOUT
+                )
+                result["super_proxy_status_code"] = resp3.status_code
+                if resp3.status_code == 200:
+                    html3 = resp3.text
+                else:
+                    result["super_proxy_error"] = f"HTTP {resp3.status_code}"
+            except Exception as exc:
+                result["super_proxy_error"] = f"{type(exc).__name__}: {exc}"
+            result["super_proxy_elapsed_seconds"] = time.monotonic() - stage_start
+            if html3 is not None:
+                result["super_proxy_visible_text_length"] = len(_visible_text(html3))
+            final_html = html3
 
     if final_html is None:
-        result["signal"] = "no usable HTML from either render=false or render=true"
+        result["signal"] = "all attempted tiers failed or looked incomplete"
         result["total_elapsed_seconds"] = time.monotonic() - start
         return result
 

@@ -1044,18 +1044,20 @@ async def cmd_debugreliance(message: Message, command: CommandObject):
 
 
 # ---------------------------------------------------------------------------
-# TEMPORARY debug command for tuning checkers/shopatsc.py's two-stage
-# render escalation (render=false first, render=true only if that looks
-# incomplete — the .js Shopify JSON endpoint's "available" field was
-# confirmed unreliable for this store and is no longer used at all) —
-# same admin restriction as /debugoneplus and /debugreliance above. NOT
-# wired into CHECKER_MAP or the regular check cycle — shopatsc's live
-# check_stock fetch (stock_checker.py) is completely untouched by this;
-# it calls checkers.shopatsc.check_via_html() directly. This command
-# instead calls checkers.shopatsc.debug_check(), a diagnostics-only
-# sibling that runs the exact same two-stage logic but returns rich
-# detail (render mode used, status codes, errors, visible-text length,
-# per-stage timing, raw signal) instead of collapsing to a bool. Safe to
+# TEMPORARY debug command for tuning checkers/shopatsc.py's three-tier
+# Scrape.do escalation (render=false, then render=true, then super=true —
+# the .js Shopify JSON endpoint's "available" field was confirmed
+# unreliable for this store and is no longer used at all) — same admin
+# restriction as /debugoneplus and /debugreliance above. NOT wired into
+# CHECKER_MAP or the regular check cycle — shopatsc's live check_stock
+# fetch (stock_checker.py) skips straight to super=true (render=false and
+# render=true were both confirmed failing for this site — HTTP 502 and
+# timeout respectively) and is completely untouched by this command. This
+# command instead calls checkers.shopatsc.debug_check(), a
+# diagnostics-only sibling that still exercises all three tiers in order
+# and returns rich per-tier detail (status codes, errors, visible-text
+# length, timing) instead of collapsing to a bool, so it stays useful for
+# monitoring whether render=false/render=true ever recover. Safe to
 # delete once no longer needed.
 # ---------------------------------------------------------------------------
 _DEBUG_SONYOFFICIAL_ADMIN_ID = 5004721766  # same hardcoded restriction as
@@ -1075,7 +1077,7 @@ async def cmd_debugsonyofficial(message: Message, command: CommandObject):
         return
 
     url = command.args.strip()
-    await _debug_send(message, f"🔍 Running shopatsc two-stage check: {url}")
+    await _debug_send(message, f"🔍 Running shopatsc three-tier check: {url}")
 
     try:
         result = await shopatsc.debug_check(url)
@@ -1083,7 +1085,7 @@ async def cmd_debugsonyofficial(message: Message, command: CommandObject):
         await _debug_send(message, f"⚠️ debug_check crashed: {exc}")
         return
 
-    lines = ["— render=false attempt —"]
+    lines = ["— Tier 1: render=false —"]
     lines.append(
         f"Status: HTTP {result['render_false_status_code']}"
         if result["render_false_status_code"] is not None else "Status: (no response)"
@@ -1095,8 +1097,8 @@ async def cmd_debugsonyofficial(message: Message, command: CommandObject):
     lines.append(f"⏱ Time: {result['render_false_elapsed_seconds']:.2f}s")
 
     lines.append("")
-    if result["used_render_true_fallback"]:
-        lines.append("— render=false looked incomplete/failed, retried with render=true —")
+    if result["used_render_true"]:
+        lines.append("— Tier 2: render=true (tier 1 looked incomplete/failed) —")
         lines.append(
             f"Status: HTTP {result['render_true_status_code']}"
             if result["render_true_status_code"] is not None else "Status: (no response)"
@@ -1105,18 +1107,41 @@ async def cmd_debugsonyofficial(message: Message, command: CommandObject):
             lines.append(f"❌ Error: {result['render_true_error']}")
         if result["render_true_visible_text_length"] is not None:
             lines.append(f"Visible text length: {result['render_true_visible_text_length']} chars")
+        if result["render_true_looked_incomplete"] is not None:
+            lines.append(f"Looked incomplete: {'yes' if result['render_true_looked_incomplete'] else 'no'}")
         lines.append(f"⏱ Time: {result['render_true_elapsed_seconds']:.2f}s")
     else:
-        lines.append("— render=false was sufficient, render=true NOT used —")
+        lines.append("— Tier 2: render=true — NOT used (tier 1 was sufficient) —")
+
+    lines.append("")
+    if result["used_super_proxy"]:
+        lines.append("— Tier 3: super=true premium proxy (tiers 1 & 2 both looked incomplete/failed) —")
+        lines.append(
+            f"Status: HTTP {result['super_proxy_status_code']}"
+            if result["super_proxy_status_code"] is not None else "Status: (no response)"
+        )
+        if result["super_proxy_error"]:
+            lines.append(f"❌ Error: {result['super_proxy_error']}")
+        if result["super_proxy_visible_text_length"] is not None:
+            lines.append(f"Visible text length: {result['super_proxy_visible_text_length']} chars")
+        lines.append(f"⏱ Time: {result['super_proxy_elapsed_seconds']:.2f}s")
+    else:
+        lines.append("— Tier 3: super=true — NOT used —")
 
     lines.append("")
     lines.append(f"Signal used: {result['signal']}")
     if result["in_stock"] is None:
-        lines.append("Verdict: ⚠️ INCONCLUSIVE (both render=false and render=true fetches failed)")
+        lines.append("Verdict: ⚠️ INCONCLUSIVE (all attempted tiers failed)")
     else:
         lines.append(f"Verdict: {'✅ IN STOCK' if result['in_stock'] else '❌ OUT OF STOCK'}")
 
     lines.append("")
     lines.append(f"⏱ Total time: {result['total_elapsed_seconds']:.2f}s")
+    lines.append("")
+    lines.append(
+        "Note: live check_stock() skips straight to Tier 3 (super=true) for this "
+        "site — tiers 1 & 2 are known-failing there and are only run here for "
+        "monitoring purposes."
+    )
 
     await _debug_send(message, "\n".join(lines))
