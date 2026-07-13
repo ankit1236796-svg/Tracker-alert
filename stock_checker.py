@@ -106,6 +106,20 @@ async def _fetch_html(scraper_url: str, site: str) -> str:
         _fetch_cache[scraper_url] = (time.monotonic(), html)
         return html
 
+
+async def _fetch_direct(scraper_url: str) -> str:
+    """
+    Fetch scraper_url WITHOUT the cache/lock machinery in _fetch_html —
+    for deliberate retries against the exact same scraper_url (e.g.
+    _EXTRA_RETRY_ON_INCOMPLETE_SITES below), where reusing _fetch_html
+    would just replay the same cached blocked/incomplete response instead
+    of actually hitting the network again.
+    """
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
+        response = await client.get(scraper_url)
+        response.raise_for_status()
+    return response.text
+
 # Sites that need JS rendering
 #
 # Flipkart deliberately excluded: empirically verified via
@@ -218,6 +232,19 @@ _SUPER_PROXY_FALLBACK_SITES = frozenset({
 # policy (3 attempts total, ~4s between retries).
 _RETRY_502_SITES = frozenset({"unicornstore"})
 
+# Sites that get 1-2 EXTRA fetch retries (fresh, non-cached — see
+# _fetch_direct) when the render=true+super=true fallback still looks
+# blocked/incomplete, rather than proceeding to run stock-detection text
+# matching on HTML that probably isn't the real page. If every retry is
+# still incomplete, check_stock() returns (None, None) — an explicit
+# "check was inconclusive, skip this update" result distinct from a
+# confirmed False (out of stock) verdict — rather than letting
+# checkers.inventstore.check() guess at a false OOS read from a
+# blocked/challenge page's near-empty text. Scoped to inventstore only;
+# every other site keeps proceeding with whatever HTML it has, unchanged.
+_EXTRA_RETRY_ON_INCOMPLETE_SITES = frozenset({"inventstore"})
+_EXTRA_RETRY_ATTEMPTS = 2
+
 # Heuristics for "the fetched page probably isn't the real one" — an
 # unusually short response, or a phrase commonly shown by bot-block/
 # challenge pages. Not confirmed against any of these four sites'
@@ -282,11 +309,19 @@ _QUICK_COMMERCE_SITES = _PINCODE_COOKIE_SITES | _PINCODE_COMPLEX_SITES
 
 async def check_stock(
     url: str, site: str, pincode: str | None = None, caller: str = "unknown"
-) -> tuple[bool, float | None]:
+) -> tuple[bool | None, float | None]:
     """
     Returns (in_stock, current_price).
     current_price is only populated for sites in PRICE_EXTRACTOR_MAP (currently Amazon);
     it is None for all other sites and when extraction fails.
+
+    in_stock is normally a definite bool. It is None ONLY for sites in
+    _EXTRA_RETRY_ON_INCOMPLETE_SITES (currently just inventstore) when the
+    fetched page still looks blocked/incomplete after every retry tier —
+    an explicit "check was inconclusive" result, distinct from a
+    confirmed False (out of stock) verdict. Every caller of check_stock()
+    must treat in_stock is None as "skip this update" (no database write,
+    no stock-transition alert), not as a falsy OOS result.
 
     `caller` is a label ("background" | "manual" | ...) identifying which code
     path invoked this check — logged up front so the rest of this request's
@@ -436,8 +471,47 @@ async def check_stock(
             if _looks_blocked_or_incomplete(html):
                 logger.warning(
                     f"[{site}] super=true retry STILL looks blocked/incomplete "
-                    f"(len={len(html)}) — proceeding with whatever HTML was returned"
+                    f"(len={len(html)})"
                 )
+
+                if site in _EXTRA_RETRY_ON_INCOMPLETE_SITES:
+                    retry_scraper_url = build_scraper_url(
+                        url,
+                        render_js=True,
+                        set_cookies=set_cookies,
+                        wait_until=_SITE_WAIT_UNTIL.get(site),
+                        custom_wait_ms=_SITE_CUSTOM_WAIT_MS.get(site),
+                        super_proxy=True,
+                    )
+                    for extra_attempt in range(1, _EXTRA_RETRY_ATTEMPTS + 1):
+                        logger.warning(
+                            f"[{site}] still incomplete — extra retry "
+                            f"{extra_attempt}/{_EXTRA_RETRY_ATTEMPTS} (fresh, non-cached fetch)"
+                        )
+                        try:
+                            html = await _fetch_direct(retry_scraper_url)
+                        except Exception as exc:
+                            logger.warning(f"[{site}] extra retry {extra_attempt} failed: {exc}")
+                            continue
+                        if not _looks_blocked_or_incomplete(html):
+                            break
+
+                    if _looks_blocked_or_incomplete(html):
+                        # Do NOT run stock-detection text matching against HTML
+                        # that still looks like a block/challenge page after
+                        # every retry tier — that would be guessing a False
+                        # (out of stock) verdict from a page that probably
+                        # isn't the real one. Return an explicit "inconclusive,
+                        # skip this update" result instead.
+                        logger.warning(
+                            f"[{site}] still blocked/incomplete after "
+                            f"{_EXTRA_RETRY_ATTEMPTS} extra retries (len={len(html)}) — "
+                            f"returning an inconclusive (None) result rather than a "
+                            f"guessed OOS verdict"
+                        )
+                        return None, None
+                else:
+                    logger.warning(f"[{site}] proceeding with whatever HTML was returned")
 
         soup = BeautifulSoup(html, "html.parser")
         result = checker(soup, html)
@@ -467,7 +541,7 @@ async def check_stock(
 async def batch_check(
     products: list[dict],
     pincode: str | None = None,
-) -> list[tuple[dict, bool]]:
+) -> list[tuple[dict, bool | None]]:
     results = []
     for product in products:
         in_stock, _price = await check_stock(

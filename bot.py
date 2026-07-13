@@ -52,7 +52,7 @@ def _log_startup_checks():
 # ---------------------------------------------------------------------------
 
 async def _apply_result_to_row(
-    bot: Bot, product: dict, now_in_stock: bool, current_price: float | None
+    bot: Bot, product: dict, now_in_stock: bool | None, current_price: float | None
 ) -> None:
     """
     Apply one group's stock result to a single tracked-product row: persist the
@@ -61,7 +61,14 @@ async def _apply_result_to_row(
     fan-out applies the EXACT same per-row logic the non-deduped loop used to,
     once per user tracking the product — no user's alert/price-gate behaviour
     changes.
+
+    now_in_stock is None for an inconclusive check (see
+    stock_checker.check_stock's docstring) — skip the DB write/transition
+    entirely rather than overwriting a real status with a guess.
     """
+    if now_in_stock is None:
+        logger.info(f"[bot] #{product['id']} check inconclusive — skipping status update")
+        return
     was_in_stock = bool(product["in_stock"])
     update_stock_status(product["id"], now_in_stock)
     if now_in_stock and not was_in_stock:

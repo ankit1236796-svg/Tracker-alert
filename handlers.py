@@ -208,7 +208,7 @@ async def _parallel_check(
     bot,
     pincode: str | None = None,
     concurrency: int = 10,
-) -> list[tuple[dict, bool]]:
+) -> list[tuple[dict, bool | None]]:
     """Check multiple products concurrently, limited to `concurrency` at a time.
 
     Mirrors the background loop's (bot.py) was-in-stock vs now-in-stock
@@ -222,12 +222,18 @@ async def _parallel_check(
     """
     sem = asyncio.Semaphore(concurrency)
 
-    async def _one(p: dict) -> tuple[dict, bool]:
+    async def _one(p: dict) -> tuple[dict, bool | None]:
         async with sem:
             was_in_stock = bool(p["in_stock"])
             result, current_price = await check_stock(
                 p["url"], p["site"], pincode=pincode, caller="manual"
             )
+            if result is None:
+                # Inconclusive check (see stock_checker.check_stock's
+                # docstring) — skip the DB write/transition entirely
+                # rather than overwriting a real status with a guess.
+                logger.info(f"[handlers] #{p['id']} check inconclusive — skipping status update")
+                return p, None
             update_stock_status(p["id"], result)
             if result and not was_in_stock:
                 if should_alert_for_price(p, current_price):
@@ -247,11 +253,12 @@ def _unreliable_note(site: str) -> str:
     return " ⚠️ <i>unreliable — under investigation, don't trust this status</i>" if site in UNRELIABLE_SITES else ""
 
 
-def _format_check_results(results: list[tuple[dict, bool]]) -> str:
+def _format_check_results(results: list[tuple[dict, bool | None]]) -> str:
     """Format parallel-check results into a readable summary."""
     total = len(results)
-    in_stock = [(p, s) for p, s in results if s]
-    oos = [(p, s) for p, s in results if not s]
+    in_stock = [(p, s) for p, s in results if s is True]
+    oos = [(p, s) for p, s in results if s is False]
+    inconclusive = [(p, s) for p, s in results if s is None]
     lines = [f"📊 <b>Check results ({total} item{'s' if total != 1 else ''}):</b>\n"]
     if in_stock:
         lines.append("✅ <b>In Stock:</b>")
@@ -264,6 +271,12 @@ def _format_check_results(results: list[tuple[dict, bool]]) -> str:
         lines.append("❌ <b>Out of Stock:</b>")
         for p, _ in oos:
             lines.append(f"  • <b>{p['name']}</b> [{get_site_label(p['site'])}]{_unreliable_note(p['site'])}")
+    if inconclusive:
+        if in_stock or oos:
+            lines.append("")
+        lines.append("⚠️ <b>Check inconclusive (try again later):</b>")
+        for p, _ in inconclusive:
+            lines.append(f"  • <b>{p['name']}</b> [{get_site_label(p['site'])}]")
     return "\n".join(lines)
 
 
@@ -1027,6 +1040,23 @@ async def callback_check(call: CallbackQuery):
     in_stock, current_price = await check_stock(
         product["url"], product["site"], pincode=pincode, caller="manual"
     )
+
+    if in_stock is None:
+        # Inconclusive check (see stock_checker.check_stock's docstring) —
+        # skip the DB write/transition entirely rather than overwriting a
+        # real status with a guess, and tell the user plainly instead of
+        # showing a confident (and possibly wrong) OUT OF STOCK verdict.
+        await call.message.edit_text(
+            f"⚠️ <b>{product['name']}</b>\n\n"
+            f"Check inconclusive — the page couldn't be loaded reliably. "
+            f"Try again in a bit.\n"
+            f"🔗 <a href=\"{product['url']}\">View product</a>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=_check_result_keyboard(),
+        )
+        return
+
     update_stock_status(product_id, in_stock)
 
     # Mirror the background loop's transition check (bot.py): a manual check
