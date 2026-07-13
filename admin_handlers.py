@@ -27,7 +27,7 @@ from bs4 import BeautifulSoup
 
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
 from checkers import (
-    build_scraper_url, HEADERS, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital,
+    build_scraper_url, HEADERS, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital, apple,
 )
 from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label
 from database import (
@@ -1769,3 +1769,115 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
             "further before picking a replacement signal."
         )
     await _debug_send(message, "\n".join(summary_lines))
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY debug command for the new Apple Store pickup-availability
+# tracker feature. This is step 1 of that feature ONLY — verifying the SKU
+# extraction and the fulfillment-messages API call/response before anything
+# else is built. Explicitly NOT included in this round: /trackpickup, a new
+# tracked-item-type DB schema, polling-cycle wiring, or notification-on-
+# transition logic — all deferred until this command's real-world output is
+# reviewed.
+#
+# Reuses checkers/apple.py's existing, already-in-production functions
+# (_extract_sku, _build_fulfillment_target, _fetch_pickup_availability,
+# _evaluate_pickup_availability — all used today by refine_with_pincode())
+# rather than reimplementing SKU extraction or the API call. The one thing
+# this command does that production code doesn't: report every store's raw
+# pickupDisplay value and the full JSON response, not just the collapsed
+# True/None verdict production only needs.
+#
+# NOT wired into CHECKER_MAP or the regular check cycle. Safe to delete once
+# no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_PICKUP_ADMIN_ID = 5004721766  # same hardcoded restriction as every
+# other /debug* command above, on top of the router's own ADMIN_USER_ID
+# filter — this fetches an arbitrary caller-supplied Apple URL plus calls
+# Apple's fulfillment-messages API via Scrape.do (spends credits).
+
+
+@router.message(Command("debugpickup"))
+async def cmd_debugpickup(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_PICKUP_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugpickup &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: <code>/debugpickup &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML"
+        )
+        return
+    url, pincode = parts[0], parts[1]
+
+    await _debug_send(message, f"🔍 Fetching product page (render={apple.NEEDS_JS}): {url}")
+    try:
+        scraper_url = build_scraper_url(url, render_js=apple.NEEDS_JS)
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(scraper_url)
+            resp.raise_for_status()
+        html = resp.text
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Product page fetch failed: {exc}")
+        return
+
+    soup = BeautifulSoup(html, "html.parser")
+    sku = apple._extract_sku(soup, html)
+    if not sku:
+        await _debug_send(
+            message,
+            "⚠️ Could not extract a SKU/part number from this page (checked JSON-LD "
+            "sku/offers.sku, inline partNumber, inline sku) — cannot call the "
+            "fulfillment-messages API without one.",
+        )
+        return
+    await _debug_send(message, f"✅ Extracted SKU: {sku!r}")
+
+    target = apple._build_fulfillment_target(sku, pincode)
+    await _debug_send(message, f"🔍 Calling fulfillment-messages API for pincode {pincode}:\n{target}")
+
+    data = await apple._fetch_pickup_availability(sku, pincode)
+    if data is None:
+        await _debug_send(
+            message,
+            "⚠️ fulfillment-messages API call failed, returned a non-200 status, or "
+            "returned a non-JSON response (likely a block/challenge page) — see "
+            "Railway logs for the exact status/body.",
+        )
+        return
+
+    raw_json = json.dumps(data, indent=2)
+    await _debug_send(message, f"Raw JSON response ({len(raw_json)} chars, sending in full):")
+    _CHUNK_SIZE = 4000
+    for i in range(0, len(raw_json), _CHUNK_SIZE):
+        await _debug_send(message, raw_json[i:i + _CHUNK_SIZE])
+
+    stores = (data.get("body") or {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
+    if not stores:
+        await _debug_send(
+            message,
+            f"No stores returned for pincode {pincode} — common for most Indian "
+            f"pincodes given Apple's sparse retail network (see checkers/apple.py's "
+            f"design note); not necessarily a bug.",
+        )
+        return
+
+    lines = [f"— {len(stores)} store(s) found for pincode {pincode} —"]
+    for store in stores:
+        part_info = (store.get("partsAvailability") or {}).get(sku, {})
+        pickup_display = part_info.get("pickupDisplay", "(missing)")
+        store_name = store.get("storeName", "(unknown store)")
+        lines.append(f"{store_name}: pickupDisplay={pickup_display!r}")
+    await _debug_send(message, "\n".join(lines))
+
+    verdict = apple._evaluate_pickup_availability(data, sku)
+    await _debug_send(
+        message,
+        f"Verdict via the existing _evaluate_pickup_availability (True = confirmed "
+        f"pickup-available somewhere, None = inconclusive/unavailable): {verdict!r}",
+    )
