@@ -26,7 +26,7 @@ from aiogram.types import Message
 from bs4 import BeautifulSoup
 
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
-from checkers import build_scraper_url, HEADERS, fetch_with_502_retry, shopatsc, unicornstore
+from checkers import build_scraper_url, HEADERS, fetch_with_502_retry, shopatsc, unicornstore, inventstore
 from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label
 from database import (
     IST,
@@ -1323,6 +1323,153 @@ async def cmd_debugunicorn(message: Message, command: CommandObject):
         f"Verdict: {'✅ IN STOCK' if verdict else '❌ OUT OF STOCK'}\n"
         f"⏱ Total time: {total_elapsed:.2f}s",
     )
+
+    await _debug_send(message, f"📄 Full visible text ({len(visible_text)} chars, sending in full):")
+    _CHUNK_SIZE = 4000
+    for i in range(0, len(visible_text), _CHUNK_SIZE):
+        await _debug_send(message, visible_text[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY debug command for tuning checkers/inventstore.py against real
+# product pages — same admin restriction as the other /debug* commands
+# above. NOT wired into CHECKER_MAP or the regular check cycle —
+# InventStore's live check_stock fetch (stock_checker.py) is completely
+# untouched by this. Mirrors the EXACT fetch escalation stock_checker.py
+# actually uses for "inventstore" today (render=true first via _JS_SITES,
+# then render=true+super=true if that looks blocked/incomplete via
+# _SUPER_PROXY_FALLBACK_SITES — inventstore has neither the JS-settle wait
+# params nor the 502-retry logic added for unicornstore, so this command
+# deliberately doesn't add them either). The blocked/incomplete heuristic
+# below is a deliberate local copy of stock_checker._looks_blocked_or_
+# incomplete's logic (same constants), not an import, matching this file's
+# existing convention of keeping every /debug* command self-contained.
+# Safe to delete once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_INVENTSTORE_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter — this fetches an arbitrary caller-supplied URL via
+# Scrape.do (spends credits).
+
+_INVENTSTORE_BLOCKED_PAGE_PHRASES = (
+    "access denied", "attention required", "are you a human",
+    "captcha", "just a moment", "checking your browser",
+    "please enable javascript and cookies", "bot detection",
+    "request unsuccessful",
+)
+_INVENTSTORE_MIN_PLAUSIBLE_HTML_LENGTH = 2000
+
+# ~50 chars of context on either side of each match — enough to tell
+# whether a hit is describing the main product or an unrelated section
+# (a "related products" list, a filter label, a policy blurb, etc.).
+_INVENTSTORE_STOCK_PHRASES = ("out of stock", "in stock")
+_INVENTSTORE_CONTEXT_CHARS = 50
+
+
+def _inventstore_looks_blocked_or_incomplete(html: str) -> bool:
+    if len(html) < _INVENTSTORE_MIN_PLAUSIBLE_HTML_LENGTH:
+        return True
+    html_lower = html.lower()
+    return any(phrase in html_lower for phrase in _INVENTSTORE_BLOCKED_PAGE_PHRASES)
+
+
+def _find_stock_phrase_occurrences(visible_text: str) -> list[tuple[str, str, int]]:
+    """Find every case-insensitive occurrence of "out of stock" or "in
+    stock" in visible_text. Returns (phrase, context, index) triples,
+    sorted by position in the text, where context is up to
+    _INVENTSTORE_CONTEXT_CHARS characters before and after the match
+    (clipped at the text's edges). "in stock" is never a substring of
+    "out of stock" (the word before "stock" there is "of", not "in"), so
+    the two phrases can't double-count the same occurrence."""
+    results: list[tuple[str, str, int]] = []
+    lower_text = visible_text.lower()
+    for phrase in _INVENTSTORE_STOCK_PHRASES:
+        start = 0
+        while True:
+            idx = lower_text.find(phrase, start)
+            if idx == -1:
+                break
+            ctx_start = max(0, idx - _INVENTSTORE_CONTEXT_CHARS)
+            ctx_end = min(len(visible_text), idx + len(phrase) + _INVENTSTORE_CONTEXT_CHARS)
+            context = visible_text[ctx_start:ctx_end]
+            results.append((phrase, context, idx))
+            start = idx + len(phrase)
+    results.sort(key=lambda r: r[2])
+    return results
+
+
+@router.message(Command("debuginventstore"))
+async def cmd_debuginventstore(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_INVENTSTORE_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debuginventstore &lt;url&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    url = command.args.strip()
+
+    # Tier 1: render=true — the current production default for
+    # "inventstore" (stock_checker._JS_SITES membership).
+    method_used = "render=true"
+    try:
+        scraper_url = build_scraper_url(url, render_js=True)
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
+            resp = await client.get(scraper_url)
+        status_code = resp.status_code
+        html = resp.text
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ render=true fetch failed: {exc}")
+        return
+
+    await _debug_send(message, f"— Tier 1: render=true —\nStatus: HTTP {status_code}\nRaw length: {len(html)} chars")
+
+    # Tier 2: render=true + super=true — only if tier 1 looks
+    # blocked/incomplete, exactly matching stock_checker.py's
+    # _SUPER_PROXY_FALLBACK_SITES escalation for this site.
+    if _inventstore_looks_blocked_or_incomplete(html):
+        method_used = "render=true + super=true (premium proxy, escalated — tier 1 looked blocked/incomplete)"
+        try:
+            fallback_scraper_url = build_scraper_url(url, render_js=True, super_proxy=True)
+            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
+                resp2 = await client.get(fallback_scraper_url)
+            status_code = resp2.status_code
+            html = resp2.text
+            await _debug_send(
+                message,
+                f"— Tier 2: render=true + super=true (tier 1 looked blocked/incomplete) —\n"
+                f"Status: HTTP {status_code}\nRaw length: {len(html)} chars",
+            )
+        except Exception as exc:
+            await _debug_send(message, f"⚠️ super=true fallback fetch failed: {exc}")
+            return
+    else:
+        await _debug_send(message, "— Tier 2: render=true + super=true — NOT used (tier 1 was sufficient) —")
+
+    text_soup = BeautifulSoup(html, "html.parser")
+    for tag in text_soup(["script", "style"]):
+        tag.decompose()
+    visible_text = text_soup.get_text(" ", strip=True)
+
+    await _debug_send(
+        message,
+        f"🔍 Fetch method used: {method_used}\n"
+        f"Final HTTP status: {status_code}\n"
+        f"Visible text length: {len(visible_text)} chars",
+    )
+
+    occurrences = _find_stock_phrase_occurrences(visible_text)
+    if not occurrences:
+        await _debug_send(message, "No occurrences of 'out of stock' or 'in stock' found in the visible text.")
+    else:
+        occ_lines = [f"Found {len(occurrences)} occurrence(s) of 'out of stock'/'in stock':"]
+        for i, (phrase, context, idx) in enumerate(occurrences, 1):
+            occ_lines.append(f"{i}. {phrase!r} @ char {idx}: …{context}…")
+        occ_text = "\n".join(occ_lines)
+        _CHUNK_SIZE = 4000
+        for i in range(0, len(occ_text), _CHUNK_SIZE):
+            await _debug_send(message, occ_text[i:i + _CHUNK_SIZE])
 
     await _debug_send(message, f"📄 Full visible text ({len(visible_text)} chars, sending in full):")
     _CHUNK_SIZE = 4000
