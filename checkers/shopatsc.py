@@ -70,7 +70,7 @@ def check(soup: BeautifulSoup, html: str) -> bool:
 async def _fetch_page(
     url: str, render_js: bool, super_proxy: bool = False, timeout: float = _RENDER_TIMEOUT
 ) -> httpx.Response:
-    return await fetch_page(url, render_js=render_js, super_proxy=super_proxy, timeout=timeout)
+    return await fetch_page(url, render_js=render_js, super_proxy=super_proxy, timeout=timeout, site="shopatsc")
 
 
 async def check_via_html(url: str) -> bool:

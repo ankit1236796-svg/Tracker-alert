@@ -185,7 +185,7 @@ async def _fetch_pickup_availability(sku: str, pincode: str) -> dict | None:
     logger.info(f"[apple][resolve] fulfillment-messages target={target!r}")
 
     try:
-        resp = await fetch_page(target, render_js=False, timeout=_FULFILLMENT_TIMEOUT)
+        resp = await fetch_page(target, render_js=False, timeout=_FULFILLMENT_TIMEOUT, site="apple")
     except Exception as exc:
         logger.warning(f"[apple][resolve] fulfillment-messages request failed: {exc}")
         return None

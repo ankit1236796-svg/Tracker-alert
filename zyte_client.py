@@ -256,3 +256,90 @@ async def fetch_page(
 
     logger.info(f"[zyte] target statusCode={target_status} html_length={len(html)}")
     return httpx.Response(status_code=target_status, content=html, request=request)
+
+
+# ---------------------------------------------------------------------------
+# DEBUG-ONLY raw-response dump — /debugzyte's "raw" mode (admin_handlers.py).
+#
+# Documentation research (see this module's docstring) found no cost/billing
+# field in Zyte API's own documented /v1/extract response schema (url,
+# statusCode, httpResponseBody/browserHtml, httpResponseHeaders, actions,
+# networkCapture, experimental.responseCookies — no "cost" anywhere); that
+# data appears to live only in a SEPARATE Stats API requiring its own
+# authenticated call, not embedded in the scrape response itself. This
+# sandbox has no live network access to actually call Zyte and confirm
+# first-hand, so fetch_raw() exists to let a human verify against a REAL
+# response before database.py's proxy-metric estimate (see
+# record_zyte_usage/get_zyte_usage_summary) is trusted as the final word.
+# _COST_FIELD_HINTS below is what /debugzyte's raw mode scans the response
+# for; if a real response ever contains one of these, usage tracking should
+# switch to summing that real figure instead of estimating from bytes/
+# render_js.
+# ---------------------------------------------------------------------------
+
+_COST_FIELD_HINTS = ("cost", "billing", "price", "credit", "charge", "usage")
+
+
+def _find_cost_like_keys(obj, path: str = "") -> list[str]:
+    """Recursively scan a parsed JSON value for any dict key whose name
+    contains one of _COST_FIELD_HINTS (case-insensitive), returning the
+    dotted paths where found. Used by /debugzyte's raw mode to highlight
+    anything that might be real per-request cost/billing data."""
+    found = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_path = f"{path}.{key}" if path else key
+            if any(hint in key.lower() for hint in _COST_FIELD_HINTS):
+                found.append(f"{key_path} = {value!r}")
+            found.extend(_find_cost_like_keys(value, key_path))
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj[:5]):  # cap: avoid pathological scans of huge arrays
+            found.extend(_find_cost_like_keys(item, f"{path}[{i}]"))
+    return found
+
+
+async def fetch_raw(
+    url: str, render_js: bool = False, super_proxy: bool = False, timeout: float = 60.0,
+) -> dict:
+    """
+    Performs the same Zyte API POST as fetch_page(), but returns the RAW,
+    unprocessed reply instead of synthesizing an httpx.Response: every HTTP
+    response header Zyte sent back, the full parsed JSON body (with the
+    giant httpResponseBody/browserHtml payload replaced by a
+    "<omitted, N chars>" placeholder — dumping literally megabytes of
+    encoded HTML via Telegram messages isn't useful for this investigation
+    and would blow well past Telegram's message-count practicality), and a
+    cost_like_fields list from _find_cost_like_keys — so a human can
+    confirm, from a REAL response, whether Zyte actually includes
+    per-request billing data anywhere in it.
+    """
+    use_browser = render_js or super_proxy
+    body: dict = {"url": url, "geolocation": "IN"}
+    if use_browser:
+        body["browserHtml"] = True
+    else:
+        body["httpResponseBody"] = True
+
+    api_key = _api_key()
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(ZYTE_API_URL, json=body, auth=(api_key, ""))
+
+    try:
+        parsed_body = resp.json()
+    except Exception:
+        parsed_body = {"_unparseable_raw_text": resp.text[:2000]}
+
+    cost_like_fields = _find_cost_like_keys(parsed_body) if isinstance(parsed_body, dict) else []
+
+    display_body = dict(parsed_body) if isinstance(parsed_body, dict) else parsed_body
+    if isinstance(display_body, dict):
+        for huge_field in ("httpResponseBody", "browserHtml"):
+            if huge_field in display_body and isinstance(display_body[huge_field], str):
+                display_body[huge_field] = f"<omitted, {len(display_body[huge_field])} chars>"
+
+    return {
+        "status_code": resp.status_code,
+        "headers": dict(resp.headers),
+        "body": display_body,
+        "cost_like_fields": cost_like_fields,
+    }

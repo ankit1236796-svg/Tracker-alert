@@ -8,6 +8,7 @@ from urllib.parse import urlparse, urlencode
 
 import httpx
 
+import database
 import zyte_client
 from config import SUPPORTED_SITES, SCRAPING_PROVIDER
 
@@ -105,6 +106,7 @@ async def fetch_page(
     super_proxy: bool = False,
     play_with_browser: list[dict] | None = None,
     timeout: float = 60.0,
+    site: str | None = None,
 ) -> httpx.Response:
     """
     THE central fetch function every checker and /debug* command routes
@@ -125,9 +127,17 @@ async def fetch_page(
     request/response field mapping) — so every caller's existing
     resp.text / resp.status_code / resp.json() / resp.raise_for_status()
     usage keeps working unchanged.
+
+    `site` is purely for usage-cost tracking (database.record_zyte_usage) —
+    optional, defaults to None (logged under "(debug/other)" — see
+    get_zyte_usage_summary) for callers with no tracked-product "site"
+    concept, e.g. /debugzyte on an arbitrary URL or Apple's fulfillment-
+    messages API call. Only recorded on the zyte path; Scrape.do usage has
+    its own separate dashboard the admin already monitors directly, so
+    there's no matching tracking on that path.
     """
     if SCRAPING_PROVIDER == "zyte":
-        return await zyte_client.fetch_page(
+        resp = await zyte_client.fetch_page(
             url,
             render_js=render_js,
             super_proxy=super_proxy,
@@ -138,6 +148,13 @@ async def fetch_page(
             play_with_browser=play_with_browser,
             timeout=timeout,
         )
+        try:
+            database.record_zyte_usage(site, render_js or super_proxy, len(resp.content))
+        except Exception as exc:
+            # Usage tracking must never take down a real fetch that already
+            # succeeded — log and move on.
+            logger.warning(f"[fetch_page] record_zyte_usage failed (fetch itself still succeeded): {exc}")
+        return resp
 
     # scrapedo — Scrape.do's original code path, untouched, only reached
     # when SCRAPING_PROVIDER is explicitly set back to "scrapedo".
@@ -181,6 +198,7 @@ async def fetch_with_502_retry(
     max_attempts: int = _DEFAULT_502_RETRY_ATTEMPTS,
     retry_wait_seconds: float = _DEFAULT_502_RETRY_WAIT_SECONDS,
     timeout: float = 60.0,
+    site: str | None = None,
 ) -> tuple[httpx.Response | None, list[dict]]:
     """
     Fetch url via Scrape.do, automatically retrying up to max_attempts
@@ -231,7 +249,7 @@ async def fetch_with_502_retry(
         try:
             response = await fetch_page(
                 url, render_js=render_js, super_proxy=super_proxy, set_cookies=set_cookies,
-                wait_until=wait_until, custom_wait_ms=custom_wait_ms, timeout=timeout,
+                wait_until=wait_until, custom_wait_ms=custom_wait_ms, timeout=timeout, site=site,
             )
         except Exception as exc:
             attempts.append({"attempt": attempt_num, "status_code": None, "error": f"{type(exc).__name__}: {exc}"})

@@ -123,6 +123,7 @@ async def fetch_with_pincode_interaction(url: str, pincode: str = "110001") -> s
     ]
     resp = await fetch_page(
         url, render_js=True, super_proxy=True, play_with_browser=actions, timeout=90.0,
+        site="reliancedigital",
     )
     resp.raise_for_status()
     return resp.text

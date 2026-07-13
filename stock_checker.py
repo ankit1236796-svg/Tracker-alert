@@ -122,7 +122,7 @@ async def _fetch_html(
         response = await fetch_page(
             url, render_js=render_js, set_cookies=set_cookies,
             wait_until=wait_until, custom_wait_ms=custom_wait_ms,
-            super_proxy=super_proxy, timeout=60.0,
+            super_proxy=super_proxy, timeout=60.0, site=site,
         )
         response.raise_for_status()
 
@@ -133,6 +133,7 @@ async def _fetch_html(
 
 async def _fetch_direct(
     url: str,
+    site: str,
     render_js: bool = False,
     set_cookies: str | None = None,
     wait_until: str | None = None,
@@ -149,7 +150,7 @@ async def _fetch_direct(
     response = await fetch_page(
         url, render_js=render_js, set_cookies=set_cookies,
         wait_until=wait_until, custom_wait_ms=custom_wait_ms,
-        super_proxy=super_proxy, timeout=60.0,
+        super_proxy=super_proxy, timeout=60.0, site=site,
     )
     response.raise_for_status()
     return response.text
@@ -497,6 +498,7 @@ async def check_stock(
                     wait_until=_SITE_WAIT_UNTIL.get(site),
                     custom_wait_ms=_SITE_CUSTOM_WAIT_MS.get(site),
                     super_proxy=True,
+                    site=site,
                 )
                 logger.info(f"[{site}] super=true fetch attempts: {attempts}")
                 if resp is not None:
@@ -541,6 +543,7 @@ async def check_stock(
                         try:
                             html = await _fetch_direct(
                                 url,
+                                site,
                                 render_js=True,
                                 set_cookies=set_cookies,
                                 wait_until=_SITE_WAIT_UNTIL.get(site),

@@ -219,6 +219,35 @@ def init_db():
             ON site_locks(user_id, site) WHERE user_id IS NOT NULL
         """)
 
+        # ── Zyte API usage log (proxy-metric cost tracking) ───────────────────
+        # One row per fetch actually served by Zyte API (see checkers/common.py's
+        # fetch_page, zyte_client.py). Zyte's own /v1/extract response does NOT
+        # include a per-request dollar-cost field — confirmed via documentation
+        # research (docs.zyte.com/zyte-api/usage/reference.html's response
+        # field list has no "cost"/"billing" field; that data only exists in a
+        # SEPARATE Stats API requiring its own authenticated call) and via
+        # /debugzyte's "raw" mode, which dumps a real response for a human to
+        # double-check. So cost here is an ESTIMATE derived from response_bytes
+        # + render_js (Zyte's own published pricing splits HTTP vs
+        # browser-rendered requests into very different price bands — browser
+        # rendering costs roughly 5-15x more per request) — see
+        # get_zyte_usage_summary's cost-range calculation. site is nullable:
+        # ad-hoc/debug fetches (e.g. /debugzyte on an arbitrary URL) that have
+        # no tracked-product "site" concept are logged under NULL, grouped
+        # separately from real per-store production traffic.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS zyte_usage_log (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                site           TEXT,
+                render_js      INTEGER NOT NULL DEFAULT 0,
+                response_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_zyte_usage_log_site ON zyte_usage_log(site)
+        """)
+
         # ── WhatsApp channel forwarding (per-user, admin-approved) ────────────
         # Each user may register their OWN WhatsApp Channel/Community invite
         # link; once the admin manually joins it and approves the registration
@@ -639,6 +668,84 @@ def list_user_site_locks(user_id: int) -> set[str]:
             "SELECT site FROM site_locks WHERE user_id = ?", (user_id,)
         ).fetchall()
     return {r["site"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Zyte API usage log (proxy-metric cost tracking — see zyte_usage_log's
+# schema comment in init_db for why this is an estimate, not exact billing)
+# ---------------------------------------------------------------------------
+
+# Zyte's own published pricing splits requests into an HTTP-only band and a
+# much pricier browser-rendered band (see https://www.zyte.com/pricing/ —
+# roughly $0.13-$1.27 per 1000 HTTP requests vs $1.00-$16.08 per 1000
+# browser-rendered requests, the wide range coming from Zyte's own per-target-
+# site "difficulty tier" classification, which isn't exposed to callers). Low/
+# high ends of each band, in dollars per single request — used only to show a
+# plausible ESTIMATED range, never a precise figure, since the actual
+# difficulty tier per site is unknown to this codebase.
+ZYTE_COST_PER_REQUEST_HTTP = (0.13 / 1000, 1.27 / 1000)
+ZYTE_COST_PER_REQUEST_BROWSER = (1.00 / 1000, 16.08 / 1000)
+
+
+def record_zyte_usage(site: str | None, render_js: bool, response_bytes: int) -> None:
+    """
+    Log one Zyte API fetch for later cost-estimation (see
+    get_zyte_usage_summary). Called from checkers/common.py's fetch_page()
+    after every successful Zyte-served fetch — never from the Scrape.do
+    code path, which has its own separate dashboard/billing the admin
+    already monitors directly. site is whatever the caller knows (a
+    tracked-product site key like "amazon", or None for an ad-hoc/debug
+    fetch with no such concept, e.g. /debugzyte on an arbitrary URL).
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO zyte_usage_log (site, render_js, response_bytes, created_at) VALUES (?, ?, ?, ?)",
+            (site, 1 if render_js else 0, response_bytes, now_ist_str()),
+        )
+        conn.commit()
+
+
+def get_zyte_usage_summary() -> list[dict]:
+    """
+    Per-site (site=None grouped as "(debug/other)") usage totals: request
+    count, total response bytes, how many of those requests were browser-
+    rendered vs plain HTTP, and an ESTIMATED cost range in dollars derived
+    from ZYTE_COST_PER_REQUEST_HTTP/BROWSER — NOT Zyte's actual billed
+    amount (no per-request cost field exists in Zyte API's own response;
+    see this module's zyte_usage_log schema comment). Ordered by total
+    request count, busiest site first.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                site,
+                COUNT(*) AS request_count,
+                SUM(response_bytes) AS total_bytes,
+                SUM(CASE WHEN render_js = 1 THEN 1 ELSE 0 END) AS browser_count,
+                SUM(CASE WHEN render_js = 0 THEN 1 ELSE 0 END) AS http_count
+            FROM zyte_usage_log
+            GROUP BY site
+            ORDER BY request_count DESC
+            """
+        ).fetchall()
+
+    summary = []
+    for row in rows:
+        http_count = row["http_count"] or 0
+        browser_count = row["browser_count"] or 0
+        low = http_count * ZYTE_COST_PER_REQUEST_HTTP[0] + browser_count * ZYTE_COST_PER_REQUEST_BROWSER[0]
+        high = http_count * ZYTE_COST_PER_REQUEST_HTTP[1] + browser_count * ZYTE_COST_PER_REQUEST_BROWSER[1]
+        summary.append({
+            "site": row["site"] or "(debug/other)",
+            "request_count": row["request_count"],
+            "total_bytes": row["total_bytes"] or 0,
+            "browser_count": browser_count,
+            "http_count": http_count,
+            "estimated_cost_low": low,
+            "estimated_cost_high": high,
+        })
+    return summary
 
 
 # ---------------------------------------------------------------------------

@@ -59,8 +59,10 @@ from database import (
     bulk_stop_tracking,
     bulk_cancel_plan,
     list_tracked_links_by_store,
+    get_zyte_usage_summary,
 )
 import whatsapp_client
+import zyte_client
 from states import AdminBulkStates
 from notifications import (
     send_approval_notice,
@@ -2204,16 +2206,59 @@ async def cmd_debugzyte(message: Message, command: CommandObject):
         return
     if not command.args:
         await message.answer(
-            "Usage: <code>/debugzyte &lt;url&gt; [render]</code>\n"
-            "Add <code>render</code> as a second word to fetch with "
-            "render_js=True instead of the default False.",
+            "Usage: <code>/debugzyte &lt;url&gt; [render] [raw]</code>\n"
+            "Add <code>render</code> to fetch with render_js=True instead "
+            "of the default False.\n"
+            "Add <code>raw</code> to dump Zyte API's COMPLETE raw response "
+            "(all HTTP headers + the full parsed JSON body, minus the huge "
+            "HTML payload itself) instead of the usual visible-text report "
+            "— specifically to check whether Zyte includes a real "
+            "per-request cost/billing field (see database.py's "
+            "zyte_usage_log for why this matters). Always goes straight to "
+            "Zyte regardless of SCRAPING_PROVIDER, since the raw dump only "
+            "makes sense for Zyte's own response shape.",
             parse_mode="HTML",
         )
         return
 
     parts = command.args.strip().split()
-    render_js = len(parts) > 1 and parts[1].lower() == "render"
+    flags = {p.lower() for p in parts[1:]}
+    render_js = "render" in flags
+    raw_mode = "raw" in flags
     url = parts[0]
+
+    if raw_mode:
+        await _debug_send(message, f"🔍 Fetching RAW via Zyte API (render_js={render_js}): {url}")
+        try:
+            raw = await zyte_client.fetch_raw(url, render_js=render_js, timeout=60.0)
+        except Exception as exc:
+            await _debug_send(message, f"⚠️ Fetch failed: {exc}")
+            return
+
+        await _debug_send(message, f"Zyte HTTP status: {raw['status_code']}")
+
+        header_lines = "\n".join(f"  {k}: {v}" for k, v in sorted(raw["headers"].items()))
+        await _debug_send(message, f"— Response headers —\n{header_lines or '(none)'}")
+
+        if raw["cost_like_fields"]:
+            await _debug_send(
+                message,
+                "💰 POSSIBLE COST/BILLING FIELD(S) FOUND:\n" + "\n".join(raw["cost_like_fields"]),
+            )
+        else:
+            await _debug_send(
+                message,
+                "💸 No cost/billing/price/credit-like field found anywhere in the "
+                "response body — matches this codebase's documentation research "
+                "(no such field in Zyte's documented /v1/extract response schema).",
+            )
+
+        body_json = json.dumps(raw["body"], indent=2, default=str)
+        await _debug_send(message, f"— Full JSON body ({len(body_json)} chars, HTML payload omitted) —")
+        _CHUNK_SIZE = 3800
+        for i in range(0, len(body_json), _CHUNK_SIZE):
+            await _debug_send(message, body_json[i:i + _CHUNK_SIZE])
+        return
 
     await _debug_send(
         message,
@@ -2246,3 +2291,45 @@ async def cmd_debugzyte(message: Message, command: CommandObject):
     _CHUNK_SIZE = 4000
     for i in range(0, len(snippet), _CHUNK_SIZE):
         await _debug_send(message, snippet[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
+# /zyteusage — per-site Zyte API usage summary (request count, data volume,
+# browser-rendered vs plain-HTTP split, and an ESTIMATED cost range). This is
+# an ESTIMATE, not real billing: Zyte's own /v1/extract response has no
+# per-request cost/billing field (confirmed via documentation research and
+# /debugzyte's "raw" mode — see database.py's zyte_usage_log schema comment
+# for the full reasoning and ZYTE_COST_PER_REQUEST_HTTP/BROWSER for the
+# published price bands this estimate is derived from). Only counts requests
+# actually served by Zyte (SCRAPING_PROVIDER="zyte") — Scrape.do usage has
+# its own separate dashboard the admin already monitors directly.
+# ---------------------------------------------------------------------------
+
+@router.message(Command("zyteusage"))
+async def cmd_zyteusage(message: Message):
+    summary = get_zyte_usage_summary()
+    if not summary:
+        await message.answer("📭 No Zyte API usage logged yet.")
+        return
+
+    total_requests = sum(r["request_count"] for r in summary)
+    total_low = sum(r["estimated_cost_low"] for r in summary)
+    total_high = sum(r["estimated_cost_high"] for r in summary)
+
+    lines = [
+        f"📊 <b>Zyte API usage — {total_requests} request(s) total</b>\n"
+        f"💰 Estimated cost: ${total_low:,.4f} – ${total_high:,.4f} "
+        f"(ESTIMATE from request count/bytes/browser-rendering — see "
+        f"/debugzyte &lt;url&gt; raw for why no exact figure is available)\n",
+    ]
+    for r in summary:
+        mb = r["total_bytes"] / (1024 * 1024)
+        lines.append(
+            f"🏪 <b>{get_site_label(r['site']) if r['site'] != '(debug/other)' else r['site']}</b>\n"
+            f"   {r['request_count']} request(s) · {mb:.2f} MB total\n"
+            f"   {r['browser_count']} browser-rendered · {r['http_count']} plain HTTP\n"
+            f"   Est. cost: ${r['estimated_cost_low']:,.4f} – ${r['estimated_cost_high']:,.4f}"
+        )
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3800):
+        await message.answer(text[i:i + 3800], parse_mode="HTML")
