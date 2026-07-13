@@ -12,30 +12,42 @@ logger = logging.getLogger(__name__)
 # verdict from a still-blocked page" retry/skip logic).
 NEEDS_JS = True
 
-# WooCommerce's standard availability_html markup for a product/variation
-# is a <p class="stock in-stock">In stock</p> or
-# <p class="stock out-of-stock">Out of stock</p> element. This site
-# renders variations into a JSON blob (e.g. a variation-form data
-# attribute or an embedded <script> state object) where that HTML is
-# embedded as a JSON STRING value, so its quotes come out backslash-
-# escaped in the raw response (class=\"stock out-of-stock\"). The
-# backslash is optional in this pattern so it matches both that escaped
-# form and a plain, directly-rendered one.
-_STOCK_CLASS_PATTERN = re.compile(r'class=\\?"stock (in-stock|out-of-stock)\\?"', re.IGNORECASE)
+# Confirmed via real /debuginventstore results: WooCommerce never emits a
+# literal "stock in-stock" marker. Only an OUT-OF-STOCK variation gets an
+# explicit availability_html override (a <p class="stock out-of-stock">
+# element, JS-swapped in when that combination is selected); an in-stock
+# variation's availability_html is simply empty/absent, so "in stock" can
+# only be inferred by the ABSENCE of this marker on some variation, never
+# by a positive marker of its own. The backslash before each quote is
+# optional so this matches both the JSON-escaped form (as it appears when
+# availability_html is embedded as a JSON string value inside the page's
+# variations data blob) and a plain, directly-rendered one.
+_STOCK_OOS_PATTERN = re.compile(r'class=\\?"stock out-of-stock\\?"', re.IGNORECASE)
+
+# Every entry in WooCommerce's variations data blob (one per color/storage
+# combination) carries its own "variation_id" — a standard field WooCommerce's
+# own core JS (wc-add-to-cart-variation.js) uses to match a selected
+# combination to its variation, present regardless of theme/markup
+# differences. Counting its occurrences gives the TOTAL possible variation
+# count (e.g. 3 colors x 2 storages = 6) without needing to parse the
+# color/storage <select> dropdowns and compute their cartesian product
+# directly — the variations blob already has exactly one entry per
+# combination. Backslash-optional for the same JSON-escaping reason as above.
+_VARIATION_ID_PATTERN = re.compile(r'\\?"variation_id\\?"\s*:', re.IGNORECASE)
 
 
-def _count_woocommerce_stock_classes(html: str) -> tuple[int, int]:
-    """Count every occurrence of WooCommerce's stock-status class pattern
-    in the raw HTML — one occurrence per product variation on a
-    variable-product page. Returns (in_stock_count, out_of_stock_count)."""
-    in_stock_count = 0
-    out_of_stock_count = 0
-    for match in _STOCK_CLASS_PATTERN.finditer(html):
-        if match.group(1).lower() == "in-stock":
-            in_stock_count += 1
-        else:
-            out_of_stock_count += 1
-    return in_stock_count, out_of_stock_count
+def _count_total_variations(html: str) -> int:
+    """Total possible product variations (e.g. 3 colors x 2 storages = 6
+    combinations), counted via "variation_id" occurrences in the raw
+    HTML's embedded variations data blob — see _VARIATION_ID_PATTERN."""
+    return len(_VARIATION_ID_PATTERN.findall(html))
+
+
+def _count_out_of_stock_variations(html: str) -> int:
+    """Count of variations carrying WooCommerce's out-of-stock
+    availability_html marker (class="stock out-of-stock", plain or
+    JSON-escaped) in the raw HTML — see _STOCK_OOS_PATTERN."""
+    return len(_STOCK_OOS_PATTERN.findall(html))
 
 
 def _offer_availability(offers) -> str:
@@ -62,32 +74,33 @@ def _offer_availability(offers) -> str:
 
 def check(soup: BeautifulSoup, html: str) -> bool:
     """
-    inventstore.in's stock-detection logic, now based on the confirmed
-    WooCommerce variation stock-class pattern rather than page text.
+    inventstore.in's stock-detection logic — WooCommerce variation
+    counting, NOT a "does an in-stock marker appear" text/class search.
 
-    The previous "Buy Now"/"Add to Cart" text-based primary signal has
-    been removed entirely — confirmed unreliable, since that button text
-    is static on this site's product pages regardless of actual stock
-    status. The generic embedded-JSON substring key check (a prior
-    fallback here) is also removed: on a page with multiple product
-    variations, a plain "first occurrence wins" substring match can't
-    tell "this ONE variation is unavailable" apart from "the WHOLE
-    product is unavailable" — exactly the ambiguity this WooCommerce-
-    specific, occurrence-counting approach is built to resolve correctly
-    instead.
+    Real /debuginventstore results confirmed WooCommerce never emits a
+    literal "stock in-stock" marker for a purchasable variation (see
+    _STOCK_OOS_PATTERN's docstring) — the previous version of this
+    checker looked for that marker as a positive "any in-stock" signal,
+    which could never actually fire. The correct read is comparative:
+    count how many of the product's TOTAL possible variations carry the
+    out-of-stock marker, and compare against the total variation count
+    itself (both via raw-HTML occurrence counting, not JSON parsing, to
+    stay robust against exact-structure differences — see
+    _count_total_variations / _count_out_of_stock_variations).
 
     Detection order:
     1. JSON-LD product-level availability (kept — a structured,
        whole-product signal, not per-variation free text, and not
-       implicated in the issues that led to this change).
-    2. WooCommerce variation stock classes (see
-       _count_woocommerce_stock_classes): if ANY occurrence is
-       class="stock in-stock", the product is in stock — at least one
-       purchasable variation exists. Only if EVERY matched occurrence is
-       class="stock out-of-stock" (and at least one was found) is the
-       product reported out of stock.
-    3. No signal at all -> defaults to out of stock, per this codebase's
-       standing principle that a missed alert is safer than a false one.
+       implicated in the issue that led to this change).
+    2. WooCommerce variation counting: if the out-of-stock count is LESS
+       than the total variation count, at least one combination is still
+       purchasable -> in stock. If the out-of-stock count EQUALS the
+       total (every combination unavailable) -> out of stock. Only
+       applied when at least one variation was actually found (total > 0)
+       — otherwise this comparison is meaningless.
+    3. No signal at all (no variations found, no conclusive JSON-LD)
+       -> defaults to out of stock, per this codebase's standing
+       principle that a missed alert is safer than a false one.
     """
     # ── JSON-LD ──────────────────────────────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
@@ -106,21 +119,24 @@ def check(soup: BeautifulSoup, html: str) -> bool:
                 logger.info("[inventstore] JSON-LD: OutOfStock/Discontinued → False")
                 return False
 
-    # ── WooCommerce variation stock classes ─────────────────────────────
-    in_stock_count, out_of_stock_count = _count_woocommerce_stock_classes(html)
-    if in_stock_count > 0:
+    # ── WooCommerce variation counting ──────────────────────────────────
+    total_variations = _count_total_variations(html)
+    out_of_stock_count = _count_out_of_stock_variations(html)
+    if total_variations > 0:
+        if out_of_stock_count < total_variations:
+            logger.info(
+                f"[inventstore] {out_of_stock_count}/{total_variations} variations "
+                f"out of stock → True (at least one combination still purchasable)"
+            )
+            return True
         logger.info(
-            f"[inventstore] WooCommerce variation classes: {in_stock_count} "
-            f"in-stock, {out_of_stock_count} out-of-stock → True (at least "
-            f"one purchasable variation)"
-        )
-        return True
-    if out_of_stock_count > 0:
-        logger.info(
-            f"[inventstore] WooCommerce variation classes: {out_of_stock_count} "
-            f"out-of-stock, 0 in-stock → False"
+            f"[inventstore] {out_of_stock_count}/{total_variations} variations "
+            f"out of stock (all) → False"
         )
         return False
 
-    logger.info("[inventstore] no conclusive signal → defaulting OUT OF STOCK (False)")
+    logger.info(
+        "[inventstore] no variations found (0 'variation_id' occurrences) and "
+        "no conclusive JSON-LD signal → defaulting OUT OF STOCK (False)"
+    )
     return False

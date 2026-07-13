@@ -1403,12 +1403,11 @@ def _find_stock_phrase_occurrences(visible_text: str) -> list[tuple[str, str, in
 # attribute name/value pair) needs more surrounding characters to be
 # legible than plain rendered sentences do.
 _INVENTSTORE_RAW_CONTEXT_CHARS = 100
-# "stock in-stock" (not just "in-stock" alone) deliberately mirrors the
-# exact WooCommerce class-attribute fragment checkers.inventstore's own
-# detection regex looks for (class="stock in-stock") — searching for the
-# bare word "in-stock" would also match unrelated substrings, so this
-# stays scoped to the same fragment the checker actually keys off.
-_INVENTSTORE_RAW_PHRASES = ("out of stock", "stock in-stock")
+# "stock in-stock" is deliberately NOT searched here — confirmed via real
+# /debuginventstore results that WooCommerce never emits that marker at
+# all (see checkers/inventstore.py's _STOCK_OOS_PATTERN docstring); only
+# "out of stock" is a real signal to search for.
+_INVENTSTORE_RAW_PHRASES = ("out of stock",)
 
 
 def _find_raw_html_occurrences(html: str, phrase: str) -> list[tuple[str, int]]:
@@ -1513,10 +1512,28 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
 
     await _debug_send(
         message,
-        f"🧩 checkers/inventstore.py's actual in-stock detection pattern:\n"
-        f"{inventstore._STOCK_CLASS_PATTERN.pattern}\n"
-        f"(re.IGNORECASE — compare this against the raw-HTML matches below "
-        f"to confirm it actually matches what's in the real page)",
+        f"🧩 checkers/inventstore.py's actual detection patterns:\n"
+        f"Total-variations pattern: {inventstore._VARIATION_ID_PATTERN.pattern}\n"
+        f"Out-of-stock pattern: {inventstore._STOCK_OOS_PATTERN.pattern}\n"
+        f"(both re.IGNORECASE — compare these against the raw-HTML matches "
+        f"below to confirm they actually match what's in the real page)",
+    )
+
+    total_variations = inventstore._count_total_variations(html)
+    out_of_stock_count = inventstore._count_out_of_stock_variations(html)
+    if total_variations > 0:
+        verdict_line = (
+            f"Verdict: {'✅ IN STOCK' if out_of_stock_count < total_variations else '❌ OUT OF STOCK'} "
+            f"({out_of_stock_count}/{total_variations} variations out of stock)"
+        )
+    else:
+        verdict_line = "Verdict: ⚠️ could not determine via variation counting — 0 'variation_id' occurrences found"
+    await _debug_send(
+        message,
+        f"🧮 Variation-based stock count:\n"
+        f"Total variations found: {total_variations}\n"
+        f"Out-of-stock variations: {out_of_stock_count}\n"
+        f"{verdict_line}",
     )
 
     for phrase in _INVENTSTORE_RAW_PHRASES:
