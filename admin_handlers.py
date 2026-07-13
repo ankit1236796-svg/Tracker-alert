@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from calendar import monthrange
 from collections import Counter
 from datetime import datetime
@@ -25,7 +26,7 @@ from aiogram.types import Message
 from bs4 import BeautifulSoup
 
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
-from checkers import build_scraper_url, HEADERS, shopatsc
+from checkers import build_scraper_url, HEADERS, shopatsc, unicornstore
 from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label
 from database import (
     IST,
@@ -1145,3 +1146,134 @@ async def cmd_debugsonyofficial(message: Message, command: CommandObject):
     )
 
     await _debug_send(message, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY debug command for tuning checkers/unicornstore.py against real
+# product pages — same admin restriction as the other /debug* commands
+# above. NOT wired into CHECKER_MAP or the regular check cycle — Unicorn
+# Store's live check_stock fetch (stock_checker.py) is completely untouched
+# by this. Mirrors the EXACT fetch escalation stock_checker.py actually
+# uses for "unicornstore" today (render=true first via _JS_SITES, then
+# render=true+super=true if the first attempt looks blocked/incomplete via
+# _SUPER_PROXY_FALLBACK_SITES) — the heuristic below is a deliberate local
+# copy of stock_checker._looks_blocked_or_incomplete's logic (same
+# constants), not an import, matching this file's existing convention of
+# keeping every /debug* command self-contained. Safe to delete once no
+# longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_UNICORN_ADMIN_ID = 5004721766  # same hardcoded restriction as every
+# other /debug* command above, on top of the router's own ADMIN_USER_ID
+# filter — this fetches an arbitrary caller-supplied URL via Scrape.do
+# (spends credits).
+
+# Mirrors stock_checker._BLOCKED_PAGE_PHRASES / _MIN_PLAUSIBLE_HTML_LENGTH /
+# _looks_blocked_or_incomplete exactly, so this command's escalation
+# decision matches production's for real.
+_UNICORN_BLOCKED_PAGE_PHRASES = (
+    "access denied", "attention required", "are you a human",
+    "captcha", "just a moment", "checking your browser",
+    "please enable javascript and cookies", "bot detection",
+    "request unsuccessful",
+)
+_UNICORN_MIN_PLAUSIBLE_HTML_LENGTH = 2000
+
+
+def _unicorn_looks_blocked_or_incomplete(html: str) -> bool:
+    if len(html) < _UNICORN_MIN_PLAUSIBLE_HTML_LENGTH:
+        return True
+    html_lower = html.lower()
+    return any(phrase in html_lower for phrase in _UNICORN_BLOCKED_PAGE_PHRASES)
+
+
+@router.message(Command("debugunicorn"))
+async def cmd_debugunicorn(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_UNICORN_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugunicorn &lt;url&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    url = command.args.strip()
+    start = time.monotonic()
+
+    # Tier 1: render=true — the current production default for
+    # "unicornstore" (stock_checker._JS_SITES membership).
+    method_used = "render=true"
+    try:
+        scraper_url = build_scraper_url(url, render_js=True)
+        stage_start = time.monotonic()
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
+            resp = await client.get(scraper_url)
+        status_code = resp.status_code
+        html = resp.text
+        elapsed_stage1 = time.monotonic() - stage_start
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ render=true fetch failed: {exc}")
+        return
+
+    await _debug_send(
+        message,
+        f"— Tier 1: render=true —\nStatus: HTTP {status_code}\n"
+        f"Visible text length so far: {len(html)} raw chars\n⏱ Time: {elapsed_stage1:.2f}s",
+    )
+
+    # Tier 2: render=true + super=true — only if tier 1 looks
+    # blocked/incomplete, exactly matching stock_checker.py's
+    # _SUPER_PROXY_FALLBACK_SITES escalation for this site.
+    if _unicorn_looks_blocked_or_incomplete(html):
+        method_used = "render=true + super=true (premium proxy, escalated — tier 1 looked blocked/incomplete)"
+        try:
+            fallback_scraper_url = build_scraper_url(url, render_js=True, super_proxy=True)
+            stage_start = time.monotonic()
+            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
+                resp2 = await client.get(fallback_scraper_url)
+            status_code = resp2.status_code
+            html = resp2.text
+            elapsed_stage2 = time.monotonic() - stage_start
+            await _debug_send(
+                message,
+                f"— Tier 2: render=true + super=true (tier 1 looked blocked/incomplete) —\n"
+                f"Status: HTTP {status_code}\nVisible text length so far: {len(html)} raw chars\n"
+                f"⏱ Time: {elapsed_stage2:.2f}s",
+            )
+        except Exception as exc:
+            await _debug_send(message, f"⚠️ super=true fallback fetch failed: {exc}")
+            return
+    else:
+        await _debug_send(message, "— Tier 2: render=true + super=true — NOT used (tier 1 was sufficient) —")
+
+    soup = BeautifulSoup(html, "html.parser")
+    text_soup = BeautifulSoup(html, "html.parser")
+    for tag in text_soup(["script", "style"]):
+        tag.decompose()
+    visible_text = text_soup.get_text(" ", strip=True)
+
+    await _debug_send(
+        message,
+        f"🔍 Fetch method used: {method_used}\n"
+        f"Final HTTP status: {status_code}\n"
+        f"Visible text length: {len(visible_text)} chars",
+    )
+
+    await _report_embedded_json_signals(message, "unicornstore", html, url)
+
+    verdict = unicornstore.check(soup, html)
+    total_elapsed = time.monotonic() - start
+    await _debug_send(
+        message,
+        f"Signal/logic used: checkers.common.generic_marketplace_check() with "
+        f"unicornstore's own ADD patterns {unicornstore._ADD_PATTERNS!r} and "
+        f"OOS patterns {unicornstore._OOS_PATTERNS!r} (JSON-LD availability -> "
+        f"embedded-JSON stock key -> OOS text -> active add-to-cart button/attr "
+        f"-> default False; see checkers/common.py for the full waterfall).\n"
+        f"Verdict: {'✅ IN STOCK' if verdict else '❌ OUT OF STOCK'}\n"
+        f"⏱ Total time: {total_elapsed:.2f}s",
+    )
+
+    await _debug_send(message, f"📄 Full visible text ({len(visible_text)} chars, sending in full):")
+    _CHUNK_SIZE = 4000
+    for i in range(0, len(visible_text), _CHUNK_SIZE):
+        await _debug_send(message, visible_text[i:i + _CHUNK_SIZE])
