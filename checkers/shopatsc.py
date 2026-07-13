@@ -13,7 +13,11 @@ logger = logging.getLogger(__name__)
 # for the actual render=true/false switch on the fallback page fetch).
 NEEDS_JS = True
 
-_JS_ENDPOINT_TIMEOUT = 20.0
+# Shopify's .js/.json product endpoints are public with no bot-protection,
+# so the direct request is expected to respond quickly — a short timeout
+# means a slow/hanging request is itself treated as a failure signal
+# (fall back to Scrape.do) rather than waited out.
+_JS_ENDPOINT_TIMEOUT = 8.0
 
 _ADD_PATTERNS = ["add to cart", "buy now"]
 _NOTIFY_ONLY_PATTERN = "notify me"
@@ -29,40 +33,60 @@ def _js_endpoint_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
+def _extract_available(data) -> bool | None:
+    """Extract the stock-availability boolean from a Shopify '.js' product
+    JSON response — either top-level ("available") or nested under the
+    first variant ("variants[0].available"), whichever is present.
+    Returns None if neither is found."""
+    if not isinstance(data, dict):
+        return None
+    if "available" in data:
+        return bool(data["available"])
+    variants = data.get("variants")
+    if isinstance(variants, list) and variants:
+        first = variants[0]
+        if isinstance(first, dict) and "available" in first:
+            return bool(first["available"])
+    return None
+
+
 async def check_via_js_endpoint(url: str) -> bool | None:
     """
     Primary signal: Shopify's '<product>.js' JSON endpoint, which carries an
-    "available" boolean with no HTML parsing needed — the most reliable
-    signal when it works. Returns True/False when the endpoint is reachable
-    and returns valid JSON with an "available" key, or None if it fails,
-    isn't reachable, or doesn't look like Shopify's JSON — signaling the
-    caller (stock_checker.check_stock) to fall back to a normally-rendered
-    page fetch + check() instead. Routed through Scrape.do (render_js=False
-    — this is a JSON API response, not a page needing browser rendering)
-    rather than a direct fetch, consistent with every other checker in this
-    codebase.
+    "available" boolean (top-level or within variants[0]) with no HTML
+    parsing needed — the most reliable signal when it works. Shopify's .js/
+    .json endpoints are publicly accessible with no bot-protection, so this
+    is fetched DIRECTLY — no Scrape.do proxy/render — which is both faster
+    (typically sub-second) and avoids spending Scrape.do credits on a
+    request that doesn't need them. Scrape.do is used ONLY as the fallback
+    below, and only when this direct request genuinely fails.
+
+    Returns True/False when the endpoint is reachable and returns valid
+    JSON with a usable "available" field, or None if it fails for any
+    reason (non-200, timeout, malformed JSON, missing field) — signaling
+    the caller (stock_checker.check_stock) to fall back to a
+    normally-rendered Scrape.do page fetch + check() instead.
     """
     js_url = _js_endpoint_url(url)
     try:
-        scraper_url = build_scraper_url(js_url, render_js=False)
         async with httpx.AsyncClient(
             headers=HEADERS, follow_redirects=True, timeout=_JS_ENDPOINT_TIMEOUT
         ) as client:
-            resp = await client.get(scraper_url)
+            resp = await client.get(js_url)
         if resp.status_code != 200:
-            logger.info(f"[shopatsc] .js endpoint HTTP {resp.status_code} — falling back to page fetch")
+            logger.info(f"[shopatsc] direct .js request HTTP {resp.status_code} — falling back to Scrape.do page fetch")
             return None
         data = resp.json()
     except Exception as exc:
-        logger.info(f"[shopatsc] .js endpoint failed ({exc!r}) — falling back to page fetch")
+        logger.info(f"[shopatsc] direct .js request failed ({exc!r}) — falling back to Scrape.do page fetch")
         return None
 
-    if not isinstance(data, dict) or "available" not in data:
-        logger.info("[shopatsc] .js endpoint returned no usable 'available' key — falling back to page fetch")
+    available = _extract_available(data)
+    if available is None:
+        logger.info("[shopatsc] direct .js response had no usable 'available' field — falling back to Scrape.do page fetch")
         return None
 
-    available = bool(data["available"])
-    logger.info(f"[shopatsc] .js endpoint available={available!r} → {available} (primary signal)")
+    logger.info(f"[shopatsc] direct .js endpoint available={available!r} → {available} (primary signal)")
     return available
 
 
@@ -128,11 +152,11 @@ async def debug_check(url: str) -> dict:
     result["js_endpoint_url"] = js_url
 
     try:
-        scraper_url = build_scraper_url(js_url, render_js=False)
+        # Direct request — no Scrape.do — same as check_via_js_endpoint().
         async with httpx.AsyncClient(
             headers=HEADERS, follow_redirects=True, timeout=_JS_ENDPOINT_TIMEOUT
         ) as client:
-            resp = await client.get(scraper_url)
+            resp = await client.get(js_url)
         result["js_status_code"] = resp.status_code
         if resp.status_code != 200:
             result["js_error"] = f"HTTP {resp.status_code}"
@@ -143,11 +167,12 @@ async def debug_check(url: str) -> dict:
                 result["js_error"] = f"response was not valid JSON: {exc}"
                 data = None
             if data is not None:
-                if not isinstance(data, dict) or "available" not in data:
-                    result["js_error"] = "JSON parsed but no 'available' key present"
+                available = _extract_available(data)
+                if available is None:
+                    result["js_error"] = "JSON parsed but no usable 'available' field (checked top-level and variants[0])"
                 else:
                     result["js_success"] = True
-                    result["js_raw_available"] = data["available"]
+                    result["js_raw_available"] = available
     except httpx.TimeoutException as exc:
         result["js_error"] = f"timeout: {exc}"
     except Exception as exc:
