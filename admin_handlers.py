@@ -1405,8 +1405,9 @@ def _find_stock_phrase_occurrences(visible_text: str) -> list[tuple[str, str, in
 _INVENTSTORE_RAW_CONTEXT_CHARS = 100
 # "stock in-stock" is deliberately NOT searched here — confirmed via real
 # /debuginventstore results that WooCommerce never emits that marker at
-# all (see checkers/inventstore.py's _STOCK_OOS_PATTERN docstring); only
-# "out of stock" is a real signal to search for.
+# all; checkers/inventstore.py's own detection now only ever looks for
+# the plain visible-text phrase "In Stock" (see checkers/inventstore.py),
+# so only "out of stock" remains a real signal to search for here.
 _INVENTSTORE_RAW_PHRASES = ("out of stock",)
 
 
@@ -1435,6 +1436,88 @@ def _find_raw_html_occurrences(html: str, phrase: str) -> list[tuple[str, int]]:
         results.append((context, idx))
         start = idx + len(lower_phrase)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Race-condition investigation (not a fix — see cmd_debuginventstore's
+# final section below): real /debuginventstore runs showed the SAME URL
+# sometimes has "In Stock" in its visible text and sometimes doesn't,
+# despite an identical HTTP 200 + full page length each time. The leading
+# hypothesis is that WooCommerce loads the selected variation's stock
+# status via a delayed AJAX call (wc-ajax=get_variation, WooCommerce's
+# standard endpoint for this) rather than baking it into the initial HTML
+# — meaning a fixed customWait may or may not be long enough, and a
+# request-timing race, not a detection-logic bug, could be the real cause.
+# ---------------------------------------------------------------------------
+_INVENTSTORE_DIAGNOSTIC_WAIT_UNTIL = "networkidle0"
+_INVENTSTORE_DIAGNOSTIC_CUSTOM_WAIT_MS = 10000  # 10s, vs. no explicit wait today
+
+_INVENTSTORE_BAKED_IN_ATTR = "data-product_variations"
+
+
+def _detect_ajax_variation_endpoint(html: str) -> list[str]:
+    """Search the raw HTML for any reference to WooCommerce's AJAX
+    variation-lookup endpoint convention (?wc-ajax=get_variation, or a
+    generic wc-ajax= call) — evidence that stock status for a selected
+    variation is fetched via a delayed AJAX request rather than being
+    present in the initial page load at all. Returns the matched hint(s)
+    found (at most one, the most specific one available)."""
+    lower = html.lower()
+    if "wc-ajax=get_variation" in lower:
+        return ["wc-ajax=get_variation (WooCommerce's standard variation-lookup AJAX action)"]
+    if "wc-ajax" in lower:
+        return ["wc-ajax (a WooCommerce AJAX call is present, but not specifically get_variation)"]
+    return []
+
+
+def _detect_baked_in_variations_attr(html: str) -> tuple[bool, int]:
+    """Check for WooCommerce's standard data-product_variations HTML
+    attribute — if present, its JSON value carries per-variation data
+    (including each variation's availability_html) directly in the
+    initial page load, with no AJAX round-trip needed to learn stock
+    status. Returns (attribute_present, "availability_html"
+    occurrence_count) — the count is a rough proxy for how many
+    variations have some availability_html content baked in (blank for
+    in-stock, non-blank for out-of-stock, per the WooCommerce convention
+    confirmed in earlier rounds), regardless of whether it's inside this
+    specific attribute or elsewhere in the page."""
+    present = _INVENTSTORE_BAKED_IN_ATTR in html.lower()
+    availability_count = html.lower().count("availability_html")
+    return present, availability_count
+
+
+async def _inventstore_diagnostic_fetch(url: str) -> dict:
+    """One controlled render=true + customWait=10000ms fetch — no tier
+    escalation, deliberately kept simple/isolated so any difference
+    between repeated calls is attributable only to genuine fetch-to-fetch
+    nondeterminism (e.g. AJAX-timing luck), not to different fetch
+    configurations being used. Returns the signals observed: whether the
+    visible-text "In Stock" phrase was found (the checker's current
+    signal), and whether a baked-in variations JSON attribute / an AJAX
+    variation-lookup call was detected in the raw HTML (candidate
+    alternative signals)."""
+    scraper_url = build_scraper_url(
+        url, render_js=True,
+        wait_until=_INVENTSTORE_DIAGNOSTIC_WAIT_UNTIL,
+        custom_wait_ms=_INVENTSTORE_DIAGNOSTIC_CUSTOM_WAIT_MS,
+    )
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
+        resp = await client.get(scraper_url)
+    html = resp.text
+    text_soup = BeautifulSoup(html, "html.parser")
+    for tag in text_soup(["script", "style"]):
+        tag.decompose()
+    visible_text = text_soup.get_text(" ", strip=True)
+    baked_in_present, availability_count = _detect_baked_in_variations_attr(html)
+    return {
+        "status_code": resp.status_code,
+        "html_length": len(html),
+        "visible_text_length": len(visible_text),
+        "in_stock_found": inventstore._IN_STOCK_PHRASE in visible_text.lower(),
+        "ajax_hints": _detect_ajax_variation_endpoint(html),
+        "baked_in_present": baked_in_present,
+        "availability_html_count": availability_count,
+    }
 
 
 @router.message(Command("debuginventstore"))
@@ -1544,3 +1627,72 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
     _CHUNK_SIZE = 4000
     for i in range(0, len(visible_text), _CHUNK_SIZE):
         await _debug_send(message, visible_text[i:i + _CHUNK_SIZE])
+
+    # ── Race-condition investigation: 2 back-to-back controlled fetches ──
+    # (customWait=10000ms, no tier escalation) — see _inventstore_
+    # diagnostic_fetch's docstring. NOT a fix, purely diagnostic; nothing
+    # here feeds back into checkers/inventstore.py's actual detection.
+    await _debug_send(
+        message,
+        f"🔬 Race-condition investigation: 2 back-to-back fetches with "
+        f"customWait={_INVENTSTORE_DIAGNOSTIC_CUSTOM_WAIT_MS}ms "
+        f"(waitUntil={_INVENTSTORE_DIAGNOSTIC_WAIT_UNTIL!r}), no tier escalation:",
+    )
+    try:
+        run1 = await _inventstore_diagnostic_fetch(url)
+        run2 = await _inventstore_diagnostic_fetch(url)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Diagnostic fetch failed: {exc}")
+        return
+
+    for label, run in (("Run 1", run1), ("Run 2", run2)):
+        ajax_line = (
+            "; ".join(run["ajax_hints"]) if run["ajax_hints"]
+            else "no wc-ajax reference found in raw HTML"
+        )
+        await _debug_send(
+            message,
+            f"— {label} —\n"
+            f"HTTP {run['status_code']} | raw HTML {run['html_length']} chars | "
+            f"visible text {run['visible_text_length']} chars\n"
+            f"'In Stock' in visible text (waited-text signal): "
+            f"{'✅ found' if run['in_stock_found'] else '❌ not found'}\n"
+            f"AJAX variation endpoint reference: {ajax_line}\n"
+            f"{_INVENTSTORE_BAKED_IN_ATTR!r} attribute present (baked-in JSON signal): "
+            f"{'✅ yes' if run['baked_in_present'] else '❌ no'}\n"
+            f"'availability_html' occurrences in raw HTML: {run['availability_html_count']}",
+        )
+
+    waited_text_consistent = run1["in_stock_found"] == run2["in_stock_found"]
+    baked_in_consistent = (
+        run1["baked_in_present"] == run2["baked_in_present"]
+        and run1["availability_html_count"] == run2["availability_html_count"]
+    )
+    summary_lines = [
+        "— Consistency summary —",
+        "Waited visible-text signal ('In Stock' present): "
+        + ("✅ consistent across both runs" if waited_text_consistent
+           else f"❌ INCONSISTENT — differed between runs (run1={run1['in_stock_found']} vs run2={run2['in_stock_found']})"),
+        f"Baked-in JSON signal ({_INVENTSTORE_BAKED_IN_ATTR!r} + availability_html count): "
+        + ("✅ consistent across both runs" if baked_in_consistent else "❌ INCONSISTENT — differed between runs"),
+    ]
+    if waited_text_consistent and not baked_in_consistent:
+        summary_lines.append("→ The waited-text signal was MORE consistent this run.")
+    elif baked_in_consistent and not waited_text_consistent:
+        summary_lines.append(
+            "→ The baked-in JSON signal was MORE consistent this run — a stronger "
+            "candidate to switch detection to if this holds up across more runs."
+        )
+    elif waited_text_consistent and baked_in_consistent:
+        summary_lines.append(
+            "→ Both signals were consistent this run — inconclusive on which is "
+            "more reliable; try more back-to-back runs, ideally against a URL "
+            "known to flip between states."
+        )
+    else:
+        summary_lines.append(
+            "→ BOTH signals were inconsistent this run — the race condition may "
+            "affect more than just the visible-text timing; worth investigating "
+            "further before picking a replacement signal."
+        )
+    await _debug_send(message, "\n".join(summary_lines))
