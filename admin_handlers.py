@@ -25,7 +25,7 @@ from aiogram.types import Message
 from bs4 import BeautifulSoup
 
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
-from checkers import build_scraper_url, HEADERS
+from checkers import build_scraper_url, HEADERS, shopatsc
 from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label
 from database import (
     IST,
@@ -1041,3 +1041,73 @@ async def cmd_debugreliance(message: Message, command: CommandObject):
             message, "super=true (premium proxy, default)", url,
             super_proxy=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY debug command for tuning checkers/shopatsc.py's two-stage flow
+# (.js Shopify endpoint first, HTML-scrape fallback second) — same admin
+# restriction as /debugoneplus and /debugreliance above. NOT wired into
+# CHECKER_MAP or the regular check cycle — shopatsc's live check_stock
+# fetch (stock_checker.py) is completely untouched by this; it calls
+# checkers.shopatsc.check_via_js_endpoint()/check() directly. This command
+# instead calls checkers.shopatsc.debug_check(), a diagnostics-only sibling
+# that runs the exact same two-stage logic but returns rich detail (status
+# codes, errors, raw signal, elapsed time) instead of collapsing to a bool.
+# Safe to delete once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_SONYOFFICIAL_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# /debugoneplus and /debugreliance, on top of the router's own
+# ADMIN_USER_ID filter — this fetches an arbitrary caller-supplied URL via
+# Scrape.do (spends credits).
+
+
+@router.message(Command("debugsonyofficial"))
+async def cmd_debugsonyofficial(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_SONYOFFICIAL_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugsonyofficial &lt;url&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    url = command.args.strip()
+    await _debug_send(message, f"🔍 Running shopatsc two-stage check: {url}")
+
+    try:
+        result = await shopatsc.debug_check(url)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ debug_check crashed: {exc}")
+        return
+
+    lines = ["— .js endpoint attempt —"]
+    lines.append(f"URL tried: {result['js_endpoint_url']}")
+    if result["js_success"]:
+        lines.append(f"✅ Succeeded (HTTP {result['js_status_code']})")
+        lines.append(f"Raw 'available' field: {result['js_raw_available']!r}")
+    else:
+        lines.append(f"❌ Failed (HTTP {result['js_status_code']})" if result["js_status_code"] is not None
+                      else "❌ Failed (no response)")
+        lines.append(f"Reason: {result['js_error']}")
+
+    lines.append("")
+    if result["used_fallback"]:
+        lines.append("— Fell back to HTML scraping via Scrape.do (render=true) —")
+        if result["fallback_error"]:
+            lines.append(f"❌ Fallback fetch failed: {result['fallback_error']}")
+        else:
+            lines.append(f"Fallback fetch HTTP {result['fallback_status_code']}")
+    else:
+        lines.append("— .js endpoint succeeded, HTML fallback NOT used —")
+
+    lines.append("")
+    lines.append(f"Signal used: {result['signal']}")
+    if result["in_stock"] is None:
+        lines.append("Verdict: ⚠️ INCONCLUSIVE (check failed before a signal was found)")
+    else:
+        lines.append(f"Verdict: {'✅ IN STOCK' if result['in_stock'] else '❌ OUT OF STOCK'}")
+
+    lines.append("")
+    lines.append(f"⏱ Total time: {result['elapsed_seconds']:.2f}s")
+
+    await _debug_send(message, "\n".join(lines))
