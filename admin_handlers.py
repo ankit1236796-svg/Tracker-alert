@@ -1398,6 +1398,40 @@ def _find_stock_phrase_occurrences(visible_text: str) -> list[tuple[str, str, in
     return results
 
 
+# ~100 chars of context for the raw-HTML search below — wider than the
+# visible-text search's 50, since raw markup (a JSON blob's keys, an
+# attribute name/value pair) needs more surrounding characters to be
+# legible than plain rendered sentences do.
+_INVENTSTORE_RAW_CONTEXT_CHARS = 100
+_INVENTSTORE_RAW_PHRASE = "out of stock"
+
+
+def _find_raw_html_oos_occurrences(html: str) -> list[tuple[str, int]]:
+    """Find every case-insensitive occurrence of "out of stock" in the
+    RAW HTML — <script> tag contents, HTML attributes (e.g.
+    data-stock-status="Out of Stock"), and any other raw markup included,
+    unlike _find_stock_phrase_occurrences above which only searches the
+    visible/rendered text. Returns (context, index) pairs sorted by
+    position, where context is up to _INVENTSTORE_RAW_CONTEXT_CHARS
+    characters before and after the match (clipped at the string's
+    edges) — this surfaces a match sitting inside an embedded JSON state
+    blob or a data attribute that never becomes visible text, which the
+    visible-text-only search would miss entirely."""
+    results: list[tuple[str, int]] = []
+    lower_html = html.lower()
+    start = 0
+    while True:
+        idx = lower_html.find(_INVENTSTORE_RAW_PHRASE, start)
+        if idx == -1:
+            break
+        ctx_start = max(0, idx - _INVENTSTORE_RAW_CONTEXT_CHARS)
+        ctx_end = min(len(html), idx + len(_INVENTSTORE_RAW_PHRASE) + _INVENTSTORE_RAW_CONTEXT_CHARS)
+        context = html[ctx_start:ctx_end]
+        results.append((context, idx))
+        start = idx + len(_INVENTSTORE_RAW_PHRASE)
+    return results
+
+
 @router.message(Command("debuginventstore"))
 async def cmd_debuginventstore(message: Message, command: CommandObject):
     if message.from_user.id != _DEBUG_INVENTSTORE_ADMIN_ID:
@@ -1470,6 +1504,25 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
         _CHUNK_SIZE = 4000
         for i in range(0, len(occ_text), _CHUNK_SIZE):
             await _debug_send(message, occ_text[i:i + _CHUNK_SIZE])
+
+    raw_occurrences = _find_raw_html_oos_occurrences(html)
+    if not raw_occurrences:
+        await _debug_send(
+            message,
+            "No occurrences of 'out of stock' found in the RAW HTML "
+            "(script tags and attributes included).",
+        )
+    else:
+        raw_lines = [
+            f"Found {len(raw_occurrences)} occurrence(s) of 'out of stock' in the "
+            f"RAW HTML (script tags/attributes included, {len(html)} raw chars total):"
+        ]
+        for i, (context, idx) in enumerate(raw_occurrences, 1):
+            raw_lines.append(f"{i}. @ char {idx}: …{context}…")
+        raw_text = "\n".join(raw_lines)
+        _CHUNK_SIZE = 4000
+        for i in range(0, len(raw_text), _CHUNK_SIZE):
+            await _debug_send(message, raw_text[i:i + _CHUNK_SIZE])
 
     await _debug_send(message, f"📄 Full visible text ({len(visible_text)} chars, sending in full):")
     _CHUNK_SIZE = 4000
