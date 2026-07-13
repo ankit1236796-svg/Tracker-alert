@@ -1,10 +1,9 @@
 import json
 import logging
 
-import httpx
 from bs4 import BeautifulSoup
 
-from .common import build_scraper_url, HEADERS
+from .common import fetch_page
 
 logger = logging.getLogger(__name__)
 
@@ -98,16 +97,19 @@ def _offer_availability(offers) -> str:
 async def fetch_with_pincode_interaction(url: str, pincode: str = "110001") -> str:
     """
     DEBUG-ONLY — not called by check() or wired into stock_checker.py's
-    live check_stock() path. Fetches url via Scrape.do (render=true +
-    super=true), simulating a real user entering a pincode into the
+    live check_stock() path. Fetches url via the active scraping provider
+    (render=true + super=true — see checkers.fetch_page/config.
+    SCRAPING_PROVIDER), simulating a real user entering a pincode into the
     page's pincode-check widget before the final HTML is captured:
     click the pincode input -> fill it with `pincode` -> click the
     submit/check button -> wait _PINCODE_INTERACTION_WAIT_MS for the
     page's own JS to process the change.
 
-    Uses Scrape.do's "playWithBrowser" browser-interaction actions (see
-    checkers/common.py's build_scraper_url for how this is confirmed to
-    exist). The exact CSS selectors for RelianceDigital's pincode input/
+    Uses the browser-interaction action chain (Click/Fill/Wait — see
+    checkers/common.py's build_scraper_url for Scrape.do's own
+    "playWithBrowser", or zyte_client.py's _translate_actions for how the
+    same chain maps onto Zyte's "actions" field when that's the active
+    provider). The exact CSS selectors for RelianceDigital's pincode input/
     submit button are BEST-GUESS, not verified against the real site —
     this function exists specifically so admin_handlers.py's
     /debugreliance2 can reveal whether they actually work, before
@@ -119,12 +121,10 @@ async def fetch_with_pincode_interaction(url: str, pincode: str = "110001") -> s
         {"Action": "Click", "Selector": _PINCODE_SUBMIT_SELECTOR},
         {"Action": "Wait", "Timeout": _PINCODE_INTERACTION_WAIT_MS},
     ]
-    scraper_url = build_scraper_url(
-        url, render_js=True, super_proxy=True, play_with_browser=actions,
+    resp = await fetch_page(
+        url, render_js=True, super_proxy=True, play_with_browser=actions, timeout=90.0,
     )
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=90.0) as client:
-        resp = await client.get(scraper_url)
-        resp.raise_for_status()
+    resp.raise_for_status()
     return resp.text
 
 

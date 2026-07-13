@@ -4,7 +4,7 @@ import time
 import httpx
 from bs4 import BeautifulSoup
 
-from .common import build_scraper_url, HEADERS
+from .common import fetch_page
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +70,7 @@ def check(soup: BeautifulSoup, html: str) -> bool:
 async def _fetch_page(
     url: str, render_js: bool, super_proxy: bool = False, timeout: float = _RENDER_TIMEOUT
 ) -> httpx.Response:
-    scraper_url = build_scraper_url(url, render_js=render_js, super_proxy=super_proxy)
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
-        return await client.get(scraper_url)
+    return await fetch_page(url, render_js=render_js, super_proxy=super_proxy, timeout=timeout)
 
 
 async def check_via_html(url: str) -> bool:

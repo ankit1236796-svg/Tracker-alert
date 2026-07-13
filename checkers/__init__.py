@@ -1,4 +1,4 @@
-from .common import detect_site, build_scraper_url, HEADERS, fetch_with_502_retry
+from .common import detect_site, build_scraper_url, fetch_page, HEADERS, fetch_with_502_retry
 from . import amazon, flipkart, zepto, bigbasket, blinkit, croma, instamart, myntra
 from . import jiomart, reliancedigital, apple, oneplus, tataneu, vivo, iqoo
 from . import unicornstore, vijaysales, inventstore, sangeethamobiles, shopatsc
@@ -33,6 +33,6 @@ PRICE_EXTRACTOR_MAP = {
 }
 
 __all__ = [
-    "detect_site", "build_scraper_url", "HEADERS", "fetch_with_502_retry",
+    "detect_site", "build_scraper_url", "fetch_page", "HEADERS", "fetch_with_502_retry",
     "CHECKER_MAP", "PRICE_EXTRACTOR_MAP",
 ]

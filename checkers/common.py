@@ -8,7 +8,8 @@ from urllib.parse import urlparse, urlencode
 
 import httpx
 
-from config import SUPPORTED_SITES
+import zyte_client
+from config import SUPPORTED_SITES, SCRAPING_PROVIDER
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,66 @@ def build_scraper_url(
     return f"{SCRAPEDO_API_URL}?{urlencode(params)}"
 
 
+async def fetch_page(
+    url: str,
+    render_js: bool = False,
+    set_cookies: str | None = None,
+    custom_headers: bool = False,
+    wait_until: str | None = None,
+    custom_wait_ms: int | None = None,
+    super_proxy: bool = False,
+    play_with_browser: list[dict] | None = None,
+    timeout: float = 60.0,
+) -> httpx.Response:
+    """
+    THE central fetch function every checker and /debug* command routes
+    through — provider-aware (config.SCRAPING_PROVIDER: "zyte" [default,
+    PRIMARY since Scrape.do's credits ran out] or "scrapedo" [Scrape.do's
+    original code path via build_scraper_url above, kept fully intact and
+    simply unused while the flag is "zyte" — flip it back the moment
+    Scrape.do credits are recharged, no code changes needed]).
+
+    Same parameter meanings regardless of provider (render_js -> JS-rendered
+    fetch, super_proxy -> the provider's "try harder against a block" tier,
+    etc.), so every existing call site's render-tier logic (OnePlus's
+    wait_until/custom_wait_ms, RelianceDigital's super_proxy, ShopAtSC's
+    three-tier escalation, ...) is preserved unchanged no matter which
+    provider is actually running underneath. Always returns a genuine
+    httpx.Response — for zyte, synthesized from Zyte's JSON reply by
+    zyte_client.fetch_page (see that module's docstring for the exact
+    request/response field mapping) — so every caller's existing
+    resp.text / resp.status_code / resp.json() / resp.raise_for_status()
+    usage keeps working unchanged.
+    """
+    if SCRAPING_PROVIDER == "zyte":
+        return await zyte_client.fetch_page(
+            url,
+            render_js=render_js,
+            super_proxy=super_proxy,
+            wait_until=wait_until,
+            custom_wait_ms=custom_wait_ms,
+            set_cookies=set_cookies,
+            custom_headers=custom_headers,
+            play_with_browser=play_with_browser,
+            timeout=timeout,
+        )
+
+    # scrapedo — Scrape.do's original code path, untouched, only reached
+    # when SCRAPING_PROVIDER is explicitly set back to "scrapedo".
+    scraper_url = build_scraper_url(
+        url,
+        render_js=render_js,
+        set_cookies=set_cookies,
+        custom_headers=custom_headers,
+        wait_until=wait_until,
+        custom_wait_ms=custom_wait_ms,
+        super_proxy=super_proxy,
+        play_with_browser=play_with_browser,
+    )
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
+        return await client.get(scraper_url)
+
+
 # ---------------------------------------------------------------------------
 # 502 retry helper — Scrape.do's premium/residential proxy pool
 # occasionally returns HTTP 502 (seen with an ErrorType: "ROTATION_FAILED"
@@ -139,6 +200,16 @@ async def fetch_with_502_retry(
     a persistent network failure can't spin for max_attempts * wait_seconds
     before surfacing.
 
+    The fetch itself now goes through fetch_page() (provider-aware — see
+    that function), so this works under Zyte too, but the RETRY CONDITION
+    (status_code == 502) is still exactly Scrape.do's proxy-rotation
+    symptom specifically and hasn't been re-tuned for Zyte's own ban signal
+    (HTTP 520 from Zyte's endpoint — see zyte_client.py). Under
+    SCRAPING_PROVIDER="zyte" this degrades gracefully to "no retry, return
+    whatever fetch_page() gave back" rather than looping on the wrong
+    status code — safe, just not yet doing anything extra for a Zyte-side
+    ban. Re-tune if that's confirmed to need retrying too.
+
     Returns (response, attempts):
       - response: the LAST httpx.Response obtained (a genuine non-502
         response, or the final still-502 response if every attempt was a
@@ -153,17 +224,15 @@ async def fetch_with_502_retry(
     exhausted-retries (still-502) or errored response by inspecting it
     and `attempts`, rather than this helper raising or looping forever.
     """
-    scraper_url = build_scraper_url(
-        url, render_js=render_js, super_proxy=super_proxy, set_cookies=set_cookies,
-        wait_until=wait_until, custom_wait_ms=custom_wait_ms,
-    )
     attempts: list[dict] = []
     response: httpx.Response | None = None
 
     for attempt_num in range(1, max_attempts + 1):
         try:
-            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
-                response = await client.get(scraper_url)
+            response = await fetch_page(
+                url, render_js=render_js, super_proxy=super_proxy, set_cookies=set_cookies,
+                wait_until=wait_until, custom_wait_ms=custom_wait_ms, timeout=timeout,
+            )
         except Exception as exc:
             attempts.append({"attempt": attempt_num, "status_code": None, "error": f"{type(exc).__name__}: {exc}"})
             logger.warning(f"fetch_with_502_retry: attempt {attempt_num}/{max_attempts} failed (non-502): {exc}")

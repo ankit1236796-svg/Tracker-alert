@@ -46,6 +46,24 @@ UNRELIABLE_SITES = {"croma"}
 PLAYWRIGHT_HEADLESS = True
 PLAYWRIGHT_TIMEOUT = 30000  # ms
 
+# ---------------------------------------------------------------------------
+# Scraping provider (Scrape.do vs Zyte API)
+# ---------------------------------------------------------------------------
+# Scrape.do's credits ran out — Zyte API (https://api.zyte.com/v1/extract) is
+# now the PRIMARY provider every checker fetch routes through (see
+# checkers/common.py's fetch_page(), the central function all checkers and
+# /debug* commands call, and zyte_client.py for the actual Zyte request/
+# response handling). Scrape.do's own code path (build_scraper_url + a plain
+# GET) is left FULLY INTACT and simply unused while this is "zyte" — flip it
+# back to "scrapedo" here (or via the SCRAPING_PROVIDER env var) the moment
+# Scrape.do credits are recharged; no code changes needed either way.
+SCRAPING_PROVIDER = os.getenv("SCRAPING_PROVIDER", "zyte").strip().lower()
+# ZYTE_API_KEY itself is read directly via os.environ in zyte_client.py at
+# call time, not through this module — mirroring how SCRAPEDO_KEY is read
+# directly via os.environ in checkers/common.py rather than through
+# config.py, so a Railway env var change takes effect without an
+# import-order dependency.
+
 # Supported sites
 #
 # Vijay Sales (vijaysales.com) deliberately NOT added — investigated and

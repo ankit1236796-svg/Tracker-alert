@@ -12,7 +12,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from checkers import (
-    detect_site, build_scraper_url, HEADERS, fetch_with_502_retry, CHECKER_MAP, PRICE_EXTRACTOR_MAP,
+    detect_site, fetch_page, fetch_with_502_retry, CHECKER_MAP, PRICE_EXTRACTOR_MAP,
 )
 from checkers import apple as apple_checker
 from checkers import shopatsc as shopatsc_checker
@@ -27,15 +27,18 @@ __all__ = ["detect_site", "check_stock", "batch_check"]
 # ---------------------------------------------------------------------------
 # Different users tracking the SAME product URL each get their own row in
 # `products` (UNIQUE(user_id, url), not UNIQUE(url)), so the background loop
-# previously fired one independent Scrape.do request per tracker even though
-# the underlying page/request is identical. Today `build_scraper_url()` is
-# fully deterministic per (site, url) — set_cookies is never actually set
-# for any site (see _PINCODE_COOKIE_SITES below, an empty frozenset) — so the
-# exact scraper_url is a safe cache key with no risk of serving one user's
-# pincode-specific result to another. If a future site starts varying
-# set_cookies per-pincode, this remains correct: it just becomes part of the
-# cache key (via the full scraper_url), so pincode-specific requests won't
-# collide with each other, they just won't share a cache entry either.
+# previously fired one independent scraping-provider request per tracker even
+# though the underlying page/request is identical. The cache key is built
+# from the exact fetch parameters (url + render_js + set_cookies + wait_until
+# + custom_wait_ms + super_proxy — see _cache_key below), which is
+# deterministic per (site, url): set_cookies is never actually set for any
+# site today (see _PINCODE_COOKIE_SITES below, an empty frozenset), so this
+# is a safe cache key with no risk of serving one user's pincode-specific
+# result to another. If a future site starts varying set_cookies per-pincode,
+# this remains correct: it just becomes part of the cache key, so
+# pincode-specific requests won't collide with each other, they just won't
+# share a cache entry either. Provider-agnostic (see checkers.fetch_page) —
+# unrelated to which of Scrape.do/Zyte is actually doing the fetching.
 #
 # This caches the raw HTML fetch only, not the final in_stock/price result —
 # Apple's per-user pincode refinement (refine_with_pincode) and Amazon's
@@ -50,6 +53,17 @@ _FETCH_CACHE_TTL_SECONDS = 240  # 4 min — inside the 3-5 min window requested;
 _fetch_cache: dict[str, tuple[float, str]] = {}
 _fetch_locks: dict[str, asyncio.Lock] = {}
 _locks_guard = asyncio.Lock()
+
+
+def _cache_key(
+    url: str,
+    render_js: bool,
+    set_cookies: str | None,
+    wait_until: str | None,
+    custom_wait_ms: int | None,
+    super_proxy: bool,
+) -> str:
+    return f"{url}|render={render_js}|cookies={set_cookies}|wait_until={wait_until}|custom_wait_ms={custom_wait_ms}|super={super_proxy}"
 
 
 async def _get_fetch_lock(key: str) -> asyncio.Lock:
@@ -68,56 +82,76 @@ def _prune_fetch_cache(now: float) -> None:
         _fetch_locks.pop(k, None)
 
 
-async def _fetch_html(scraper_url: str, site: str) -> str:
+async def _fetch_html(
+    url: str,
+    site: str,
+    render_js: bool = False,
+    set_cookies: str | None = None,
+    wait_until: str | None = None,
+    custom_wait_ms: int | None = None,
+    super_proxy: bool = False,
+) -> str:
     """
-    Fetch scraper_url, reusing a recent identical fetch when one exists.
-    A per-key lock prevents a thundering herd where several concurrent
-    check_stock() calls for the same not-yet-cached URL (e.g. the background
-    loop's asyncio.gather firing many products at once) each launch their own
-    Scrape.do request before the first one has a chance to populate the cache.
+    Fetch url via checkers.fetch_page (provider-aware — Zyte or Scrape.do,
+    see config.SCRAPING_PROVIDER), reusing a recent identical fetch when one
+    exists. A per-key lock prevents a thundering herd where several
+    concurrent check_stock() calls for the same not-yet-cached URL (e.g. the
+    background loop's asyncio.gather firing many products at once) each
+    launch their own provider request before the first one has a chance to
+    populate the cache.
     """
+    key = _cache_key(url, render_js, set_cookies, wait_until, custom_wait_ms, super_proxy)
     now = time.monotonic()
     _prune_fetch_cache(now)
 
-    cached = _fetch_cache.get(scraper_url)
+    cached = _fetch_cache.get(key)
     if cached is not None and now - cached[0] < _FETCH_CACHE_TTL_SECONDS:
-        logger.info(f"[{site}] fetch cache hit (age={now - cached[0]:.0f}s) — Scrape.do request skipped")
+        logger.info(f"[{site}] fetch cache hit (age={now - cached[0]:.0f}s) — provider request skipped")
         return cached[1]
 
-    lock = await _get_fetch_lock(scraper_url)
+    lock = await _get_fetch_lock(key)
     async with lock:
         # Re-check after acquiring the lock: a concurrent call for the same
-        # scraper_url may have already populated the cache while we waited.
+        # key may have already populated the cache while we waited.
         now = time.monotonic()
-        cached = _fetch_cache.get(scraper_url)
+        cached = _fetch_cache.get(key)
         if cached is not None and now - cached[0] < _FETCH_CACHE_TTL_SECONDS:
-            logger.info(f"[{site}] fetch cache hit post-lock (age={now - cached[0]:.0f}s) — Scrape.do request skipped")
+            logger.info(f"[{site}] fetch cache hit post-lock (age={now - cached[0]:.0f}s) — provider request skipped")
             return cached[1]
 
-        async with httpx.AsyncClient(
-            headers=HEADERS,
-            follow_redirects=True,
-            timeout=60.0,
-        ) as client:
-            response = await client.get(scraper_url)
-            response.raise_for_status()
+        response = await fetch_page(
+            url, render_js=render_js, set_cookies=set_cookies,
+            wait_until=wait_until, custom_wait_ms=custom_wait_ms,
+            super_proxy=super_proxy, timeout=60.0,
+        )
+        response.raise_for_status()
 
         html = response.text
-        _fetch_cache[scraper_url] = (time.monotonic(), html)
+        _fetch_cache[key] = (time.monotonic(), html)
         return html
 
 
-async def _fetch_direct(scraper_url: str) -> str:
+async def _fetch_direct(
+    url: str,
+    render_js: bool = False,
+    set_cookies: str | None = None,
+    wait_until: str | None = None,
+    custom_wait_ms: int | None = None,
+    super_proxy: bool = False,
+) -> str:
     """
-    Fetch scraper_url WITHOUT the cache/lock machinery in _fetch_html —
-    for deliberate retries against the exact same scraper_url (e.g.
+    Fetch url WITHOUT the cache/lock machinery in _fetch_html — for
+    deliberate retries against the exact same parameters (e.g.
     _EXTRA_RETRY_ON_INCOMPLETE_SITES below), where reusing _fetch_html
     would just replay the same cached blocked/incomplete response instead
     of actually hitting the network again.
     """
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
-        response = await client.get(scraper_url)
-        response.raise_for_status()
+    response = await fetch_page(
+        url, render_js=render_js, set_cookies=set_cookies,
+        wait_until=wait_until, custom_wait_ms=custom_wait_ms,
+        super_proxy=super_proxy, timeout=60.0,
+    )
+    response.raise_for_status()
     return response.text
 
 # Sites that need JS rendering
@@ -436,17 +470,15 @@ async def check_stock(
             )
 
     try:
-        scraper_url = build_scraper_url(
-            url,
+        logger.info(f"[{site}] setCookies={set_cookies!r} render_js={site in _JS_SITES}")
+
+        html = await _fetch_html(
+            url, site,
             render_js=site in _JS_SITES,
             set_cookies=set_cookies,
             wait_until=_SITE_WAIT_UNTIL.get(site),
             custom_wait_ms=_SITE_CUSTOM_WAIT_MS.get(site),
         )
-        logger.info(f"[{site}] setCookies={set_cookies!r} render_js={site in _JS_SITES}")
-        logger.info(f"[{site}] scraper_url (truncated)={scraper_url[:120]!r}")
-
-        html = await _fetch_html(scraper_url, site)
 
         if site in _SUPER_PROXY_FALLBACK_SITES and _looks_blocked_or_incomplete(html):
             logger.warning(
@@ -485,15 +517,14 @@ async def check_stock(
                         f"render=true-only HTML"
                     )
             else:
-                fallback_scraper_url = build_scraper_url(
-                    url,
+                html = await _fetch_html(
+                    url, site,
                     render_js=True,
                     set_cookies=set_cookies,
                     wait_until=_SITE_WAIT_UNTIL.get(site),
                     custom_wait_ms=_SITE_CUSTOM_WAIT_MS.get(site),
                     super_proxy=True,
                 )
-                html = await _fetch_html(fallback_scraper_url, site)
 
             if _looks_blocked_or_incomplete(html):
                 logger.warning(
@@ -502,21 +533,20 @@ async def check_stock(
                 )
 
                 if site in _EXTRA_RETRY_ON_INCOMPLETE_SITES:
-                    retry_scraper_url = build_scraper_url(
-                        url,
-                        render_js=True,
-                        set_cookies=set_cookies,
-                        wait_until=_SITE_WAIT_UNTIL.get(site),
-                        custom_wait_ms=_SITE_CUSTOM_WAIT_MS.get(site),
-                        super_proxy=True,
-                    )
                     for extra_attempt in range(1, _EXTRA_RETRY_ATTEMPTS + 1):
                         logger.warning(
                             f"[{site}] still incomplete — extra retry "
                             f"{extra_attempt}/{_EXTRA_RETRY_ATTEMPTS} (fresh, non-cached fetch)"
                         )
                         try:
-                            html = await _fetch_direct(retry_scraper_url)
+                            html = await _fetch_direct(
+                                url,
+                                render_js=True,
+                                set_cookies=set_cookies,
+                                wait_until=_SITE_WAIT_UNTIL.get(site),
+                                custom_wait_ms=_SITE_CUSTOM_WAIT_MS.get(site),
+                                super_proxy=True,
+                            )
                         except Exception as exc:
                             logger.warning(f"[{site}] extra retry {extra_attempt} failed: {exc}")
                             continue

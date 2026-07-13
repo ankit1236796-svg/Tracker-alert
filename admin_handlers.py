@@ -19,7 +19,6 @@ from collections import Counter
 from datetime import datetime
 from urllib.parse import urlparse
 
-import httpx
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -28,10 +27,10 @@ from bs4 import BeautifulSoup
 
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
 from checkers import (
-    build_scraper_url, HEADERS, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital, apple,
+    fetch_page, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital, apple,
     CHECKER_MAP,
 )
-from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label
+from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER
 from database import (
     IST,
     now_ist_str,
@@ -937,15 +936,14 @@ async def cmd_debugoneplus(message: Message, command: CommandObject):
     )
 
     try:
-        scraper_url = build_scraper_url(
+        resp = await fetch_page(
             url,
             render_js=True,
             wait_until=_DEBUG_ONEPLUS_WAIT_UNTIL,
             custom_wait_ms=_DEBUG_ONEPLUS_CUSTOM_WAIT_MS,
+            timeout=60.0,
         )
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
-            resp = await client.get(scraper_url)
-            resp.raise_for_status()
+        resp.raise_for_status()
         html = resp.text
     except Exception as exc:
         await _debug_send(message, f"⚠️ Fetch failed: {exc}")
@@ -1266,19 +1264,18 @@ async def _report_embedded_json_signals(message: Message, label: str, html: str,
 
 
 async def _run_debug_reliance_trial(message: Message, label: str, url: str, **scraper_kwargs) -> None:
-    """Fetch `url` via Scrape.do with the given build_scraper_url() kwargs
-    and send a labeled diagnostic report: HTTP status, raw HTML length,
-    where _RELIANCE_ANTIBOT_PHRASE was (or wasn't) found, then the FULL
-    visible text chunked under Telegram's 4096-char limit (not truncated —
-    unlike /debugoneplus, which still only sends the first 3000 chars).
-    Any failure here is reported under this trial's own label and does not
-    raise — safe to call multiple times/labels from the same command."""
+    """Fetch `url` via the active scraping provider (checkers.fetch_page)
+    with the given kwargs and send a labeled diagnostic report: HTTP
+    status, raw HTML length, where _RELIANCE_ANTIBOT_PHRASE was (or
+    wasn't) found, then the FULL visible text chunked under Telegram's
+    4096-char limit (not truncated — unlike /debugoneplus, which still
+    only sends the first 3000 chars). Any failure here is reported under
+    this trial's own label and does not raise — safe to call multiple
+    times/labels from the same command."""
     await _debug_send(message, f"— {label} —")
 
     try:
-        scraper_url = build_scraper_url(url, **scraper_kwargs)
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
-            resp = await client.get(scraper_url)
+        resp = await fetch_page(url, timeout=60.0, **scraper_kwargs)
         status_code = resp.status_code
         html = resp.text
     except Exception as exc:
@@ -1600,12 +1597,11 @@ async def cmd_debugunicorn(message: Message, command: CommandObject):
     # the JS-settle fix in _SITE_WAIT_UNTIL/_SITE_CUSTOM_WAIT_MS).
     method_used = f"render=true, waitUntil={_UNICORN_WAIT_UNTIL!r}, customWait={_UNICORN_CUSTOM_WAIT_MS}ms"
     try:
-        scraper_url = build_scraper_url(
-            url, render_js=True, wait_until=_UNICORN_WAIT_UNTIL, custom_wait_ms=_UNICORN_CUSTOM_WAIT_MS
-        )
         stage_start = time.monotonic()
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
-            resp = await client.get(scraper_url)
+        resp = await fetch_page(
+            url, render_js=True, wait_until=_UNICORN_WAIT_UNTIL,
+            custom_wait_ms=_UNICORN_CUSTOM_WAIT_MS, timeout=60.0,
+        )
         status_code = resp.status_code
         html = resp.text
         elapsed_stage1 = time.monotonic() - stage_start
@@ -1879,13 +1875,12 @@ async def _inventstore_diagnostic_fetch(url: str) -> dict:
     signal), and whether a baked-in variations JSON attribute / an AJAX
     variation-lookup call was detected in the raw HTML (candidate
     alternative signals)."""
-    scraper_url = build_scraper_url(
+    resp = await fetch_page(
         url, render_js=True,
         wait_until=_INVENTSTORE_DIAGNOSTIC_WAIT_UNTIL,
         custom_wait_ms=_INVENTSTORE_DIAGNOSTIC_CUSTOM_WAIT_MS,
+        timeout=60.0,
     )
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
-        resp = await client.get(scraper_url)
     html = resp.text
     text_soup = BeautifulSoup(html, "html.parser")
     for tag in text_soup(["script", "style"]):
@@ -1919,9 +1914,7 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
     # "inventstore" (stock_checker._JS_SITES membership).
     method_used = "render=true"
     try:
-        scraper_url = build_scraper_url(url, render_js=True)
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
-            resp = await client.get(scraper_url)
+        resp = await fetch_page(url, render_js=True, timeout=60.0)
         status_code = resp.status_code
         html = resp.text
     except Exception as exc:
@@ -1936,9 +1929,7 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
     if _inventstore_looks_blocked_or_incomplete(html):
         method_used = "render=true + super=true (premium proxy, escalated — tier 1 looked blocked/incomplete)"
         try:
-            fallback_scraper_url = build_scraper_url(url, render_js=True, super_proxy=True)
-            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60.0) as client:
-                resp2 = await client.get(fallback_scraper_url)
+            resp2 = await fetch_page(url, render_js=True, super_proxy=True, timeout=60.0)
             status_code = resp2.status_code
             html = resp2.text
             await _debug_send(
@@ -2127,10 +2118,8 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
 
     await _debug_send(message, f"🔍 Fetching product page (render={apple.NEEDS_JS}): {url}")
     try:
-        scraper_url = build_scraper_url(url, render_js=apple.NEEDS_JS)
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30.0) as client:
-            resp = await client.get(scraper_url)
-            resp.raise_for_status()
+        resp = await fetch_page(url, render_js=apple.NEEDS_JS, timeout=30.0)
+        resp.raise_for_status()
         html = resp.text
     except Exception as exc:
         await _debug_send(message, f"⚠️ Product page fetch failed: {exc}")
@@ -2191,3 +2180,69 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
         f"Verdict via the existing _evaluate_pickup_availability (True = confirmed "
         f"pickup-available somewhere, None = inconclusive/unavailable): {verdict!r}",
     )
+
+
+# ---------------------------------------------------------------------------
+# /debugzyte — verify a single fetch through the active scraping provider
+# (checkers.fetch_page / config.SCRAPING_PROVIDER) before trusting the Zyte
+# API switchover for the live check cycle. Built specifically for the
+# Scrape.do -> Zyte API cutover (Scrape.do's credits ran out): reports which
+# provider actually served the fetch, the HTTP status, raw HTML length, and
+# a chunk of visible text, so a human can eyeball a real Zyte response
+# before it's relied on for every checker. NOT wired into CHECKER_MAP or
+# the regular check cycle. Safe to delete once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_ZYTE_ADMIN_ID = 5004721766  # same hardcoded restriction as every
+# other /debug* command above, on top of the router's own ADMIN_USER_ID
+# filter — this fetches an arbitrary caller-supplied URL via whichever
+# scraping provider is currently active (spends Zyte/Scrape.do credits).
+
+
+@router.message(Command("debugzyte"))
+async def cmd_debugzyte(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_ZYTE_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugzyte &lt;url&gt; [render]</code>\n"
+            "Add <code>render</code> as a second word to fetch with "
+            "render_js=True instead of the default False.",
+            parse_mode="HTML",
+        )
+        return
+
+    parts = command.args.strip().split()
+    render_js = len(parts) > 1 and parts[1].lower() == "render"
+    url = parts[0]
+
+    await _debug_send(
+        message,
+        f"🔍 Fetching via SCRAPING_PROVIDER={SCRAPING_PROVIDER!r} "
+        f"(render_js={render_js}): {url}",
+    )
+
+    try:
+        resp = await fetch_page(url, render_js=render_js, timeout=60.0)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Fetch failed: {exc}")
+        return
+
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    visible_text = soup.get_text(" ", strip=True)
+
+    await _debug_send(
+        message,
+        f"Status: HTTP {resp.status_code}\n"
+        f"Raw HTML length: {len(html)} chars | visible text: {len(visible_text)} chars",
+    )
+
+    snippet = visible_text[:3000]
+    await _debug_send(
+        message, f"📄 Visible text (first {len(snippet)} of {len(visible_text)} chars):",
+    )
+    _CHUNK_SIZE = 4000
+    for i in range(0, len(snippet), _CHUNK_SIZE):
+        await _debug_send(message, snippet[i:i + _CHUNK_SIZE])

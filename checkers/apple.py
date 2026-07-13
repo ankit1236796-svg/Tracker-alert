@@ -3,10 +3,9 @@ import logging
 import re
 from urllib.parse import urlencode
 
-import httpx
 from bs4 import BeautifulSoup
 
-from .common import build_scraper_url
+from .common import fetch_page
 
 logger = logging.getLogger(__name__)
 
@@ -183,12 +182,10 @@ async def _fetch_pickup_availability(sku: str, pincode: str) -> dict | None:
     # headless-browser render (same reasoning as Blinkit's autoSuggest/info
     # calls) — and every working third-party implementation calls it cold,
     # with no special headers/cookies required.
-    scraper_url = build_scraper_url(target, render_js=False)
     logger.info(f"[apple][resolve] fulfillment-messages target={target!r}")
 
     try:
-        async with httpx.AsyncClient(timeout=_FULFILLMENT_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(scraper_url)
+        resp = await fetch_page(target, render_js=False, timeout=_FULFILLMENT_TIMEOUT)
     except Exception as exc:
         logger.warning(f"[apple][resolve] fulfillment-messages request failed: {exc}")
         return None
