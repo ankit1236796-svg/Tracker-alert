@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% set active = 'manage_service' %}
+{% block title %}Pause/Resume service{% endblock %}
+{% block body %}
+<p class="note" style="margin-top:0;"><a class="rowlink" href="{{ url_for('home') }}">← Dashboard</a></p>
+<h1>Pause/Resume checking ({{ rows|length }} user(s) with tracked items)</h1>
+<div class="card" style="margin-bottom:14px;">
+  {% if service.paused %}
+    <span class="pill bad">🔴 Service PAUSED globally</span> since {{ service.paused_at }}
+  {% else %}
+    <span class="pill ok">🟢 Service RUNNING</span>
+  {% endif %}
+  <p class="note" style="margin-top:8px;">
+    Pausing (globally or per-user) only stops background checking — tracked items stay saved,
+    and NO notification is ever sent to affected users.
+  </p>
+</div>
+{% if rows %}
+<form method="post" action="{{ url_for('service_pause_selected') }}">
+  <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+  <div class="actions" style="margin-bottom:10px;">
+    <button class="btn bad" type="submit">⏸ Pause Selected</button>
+    <button class="btn" type="submit" formaction="{{ url_for('service_resume_selected') }}">▶️ Resume Selected</button>
+    <span class="note">Tick users, then choose an action. No confirmation needed — both are instantly reversible.</span>
+  </div>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr><th><input type="checkbox" onclick="toggleAll(this,'uids')" title="Select all"></th>
+            <th>User ID</th><th>User</th><th>Tracked items</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td><input type="checkbox" name="uids" value="{{ r.user_id }}"></td>
+          <td>{{ r.user_id }}</td>
+          <td><a class="rowlink" href="{{ url_for('user_detail', uid=r.user_id) }}">{{ r.name }}</a></td>
+          <td>{{ r.product_count }}</td>
+          <td>
+            {% if r.checks_paused %}
+              <span class="pill bad">🔴 paused{{ ' since ' + r.checks_paused_at if r.checks_paused_at else '' }}</span>
+            {% else %}
+              <span class="pill ok">🟢 running</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</form>
+{% else %}
+<p class="empty">No users currently have any tracked products.</p>
+{% endif %}
+{% endblock %}

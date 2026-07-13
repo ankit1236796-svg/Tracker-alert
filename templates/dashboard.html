@@ -3,6 +3,36 @@
 {% block title %}Stats{% endblock %}
 {% block body %}
 <h1>Overview</h1>
+
+<div class="card" style="margin-bottom:18px;">
+  <div class="actions" style="justify-content:space-between;">
+    <div>
+      {% if service.paused %}
+        <span class="pill bad">🔴 Service PAUSED</span> globally since {{ service.paused_at }}
+      {% else %}
+        <span class="pill ok">🟢 Service RUNNING</span>
+      {% endif %}
+      {% if service.paused_user_count %}
+        <span class="note">· {{ service.paused_user_count }} user(s) individually paused</span>
+      {% endif %}
+    </div>
+    <div class="actions">
+      {% if service.paused %}
+        <form class="inline" method="post" action="{{ url_for('service_resume_all') }}">
+          <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+          <button class="btn primary" type="submit">▶️ Resume ALL (global)</button>
+        </form>
+      {% else %}
+        <form class="inline" method="post" action="{{ url_for('service_pause_all') }}">
+          <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+          <button class="btn bad" type="submit">⏸ Pause ALL (global)</button>
+        </form>
+      {% endif %}
+      <a class="btn" href="{{ url_for('manage_service') }}">☑️ Pause/Resume selected users…</a>
+    </div>
+  </div>
+</div>
+
 <div class="cards">
   <a class="card" href="{{ url_for('users') }}"><div class="n">{{ stats.total_users }}</div><div class="l">Total users →</div></a>
   <a class="card" href="{{ url_for('users', filter='active') }}"><div class="n">{{ stats.active }}</div><div class="l">Active (paid) →</div></a>

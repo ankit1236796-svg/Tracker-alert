@@ -21,3 +21,4 @@ class SelectStates(StatesGroup):
 
 class AdminBulkStates(StatesGroup):
     managing = State()
+    pausing = State()

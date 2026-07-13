@@ -20,6 +20,8 @@ from database import (
     list_all_users,
     mark_reminder_sent,
     purge_user_data,
+    is_service_paused,
+    list_paused_user_ids,
 )
 from handlers import router
 from notifications import (
@@ -105,8 +107,30 @@ async def run_stock_check_cycle(bot: Bot) -> dict:
 
     Extracted from stock_checker_loop so a single cycle is directly testable
     (mirrors run_access_maintenance_cycle). Returns a small stats dict.
+
+    Pause/Resume Service: if the GLOBAL switch is on (is_service_paused()),
+    returns immediately — no get_all_products() call, no grouping, no
+    provider (Scrape.do/Zyte) requests at all, the efficient "essentially a
+    global on/off switch" behavior the feature asks for, rather than
+    iterating every user and skipping each one individually. Otherwise,
+    products belonging to an INDIVIDUALLY-paused user (checks_paused=1)
+    are filtered out before grouping, so their items are simply never
+    checked this cycle — still saved in the DB, no notification sent
+    either way (silent, admin-only visibility for both pause modes).
     """
+    if is_service_paused():
+        logger.info("[bot] service globally paused — skipping this check cycle entirely")
+        return {"products": 0, "groups": 0, "saved": 0, "paused": True}
+
     products = get_all_products()
+    paused_user_ids = set(list_paused_user_ids())
+    if paused_user_ids:
+        before_count = len(products)
+        products = [p for p in products if p["user_id"] not in paused_user_ids]
+        logger.info(
+            f"[bot] excluding {before_count - len(products)} product(s) belonging to "
+            f"{len(paused_user_ids)} individually-paused user(s) this cycle"
+        )
 
     # One pincode lookup per user per cycle (cached), not per product.
     pincode_by_user: dict[int, str | None] = {}
@@ -306,6 +330,8 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="managetracking", description="[admin] Bulk stop tracking / stop plan"),
         BotCommand(command="linksbystore",   description="[admin] Tracked links grouped by store"),
         BotCommand(command="creditusage",    description="[admin] Zyte API credit usage per store (this month / all)"),
+        BotCommand(command="pauseservice",   description="[admin] Pause/resume background stock checking"),
+        BotCommand(command="resumeservice",  description="[admin] Resume background stock checking"),
     ]
     # Scoped ONLY to the admin's own chat — regular users never see these in
     # their Telegram "/" menu, on top of being functionally unreachable to

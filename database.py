@@ -174,6 +174,50 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # Migration: per-user "pause checking" flag for the admin Pause/Resume
+        # Service feature (/pauseservice, /resumeservice — see
+        # set_users_checks_paused/list_paused_user_ids below). A paused
+        # user's tracked items stay saved in the DB exactly as before — only
+        # the background check cycle skips them (no Scrape.do/Zyte API calls
+        # for their products), and NO notification is sent to them (silent,
+        # admin-only visibility, per the feature's design). Distinct from
+        # `blocked` (access.py's STATUS_LOCKED — that also blocks the user
+        # from using the bot at all); pausing only stops background checks,
+        # the user's own /check still works normally.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN checks_paused INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN checks_paused_at TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_users_checks_paused ON users(checks_paused)
+        """)
+
+        # ── Service status (GLOBAL pause/resume — a singleton row) ────────────
+        # A single on/off switch for the ENTIRE background check cycle,
+        # separate from the per-user checks_paused flag above (see
+        # bot.py's run_stock_check_cycle: when paused=1 here, the cycle
+        # returns immediately — no get_all_products() call, no grouping, no
+        # Scrape.do/Zyte requests at all — rather than iterating every user
+        # and skipping each one individually, which would still cost a DB
+        # read per cycle for no benefit). paused_at is the IST timestamp of
+        # the most recent pause; cleared back to NULL on resume.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS service_status (
+                id        INTEGER PRIMARY KEY CHECK (id = 1),
+                paused    INTEGER NOT NULL DEFAULT 0,
+                paused_at TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR IGNORE INTO service_status (id, paused, paused_at) VALUES (1, 0, NULL)"
+        )
+
         # ── Approvals (full approve/reject/extend/block/unblock audit trail) ──
         conn.execute("""
             CREATE TABLE IF NOT EXISTS approvals (
@@ -1239,7 +1283,7 @@ def list_users_with_products_summary() -> list[dict]:
             """
             SELECT p.user_id,
                    u.username, u.first_name, u.plan_id, u.is_trial,
-                   u.access_until, u.blocked,
+                   u.access_until, u.blocked, u.checks_paused, u.checks_paused_at,
                    COUNT(p.id) AS product_count
             FROM products p
             LEFT JOIN users u ON u.user_id = p.user_id
@@ -1335,6 +1379,80 @@ def list_tracked_links_by_store() -> dict[str, list[dict]]:
     for row in rows:
         grouped.setdefault(row["site"], []).append(dict(row))
     return grouped
+
+
+# ---------------------------------------------------------------------------
+# Pause/Resume Service — global on/off switch (service_status) + per-user
+# pause (users.checks_paused). See init_db's schema comments for the full
+# design rationale. Both are checked by bot.py's run_stock_check_cycle;
+# neither ever touches a user's saved tracked items or sends them anything.
+# ---------------------------------------------------------------------------
+
+def get_service_pause_info() -> dict:
+    """{'paused': bool, 'paused_at': str | None} — the GLOBAL switch's
+    current state. paused_at is the IST timestamp of the most recent pause
+    (None while running)."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT paused, paused_at FROM service_status WHERE id = 1").fetchone()
+    if row is None:
+        return {"paused": False, "paused_at": None}
+    return {"paused": bool(row["paused"]), "paused_at": row["paused_at"]}
+
+
+def is_service_paused() -> bool:
+    """Fast-path check for bot.py's run_stock_check_cycle — True means skip
+    the ENTIRE cycle (no get_all_products(), no grouping, no provider
+    calls at all)."""
+    return get_service_pause_info()["paused"]
+
+
+def set_service_paused(paused: bool) -> dict:
+    """Flip the GLOBAL switch. Sets paused_at to now on pause, clears it to
+    NULL on resume. Returns the updated {'paused', 'paused_at'} dict."""
+    paused_at = now_ist_str() if paused else None
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE service_status SET paused = ?, paused_at = ? WHERE id = 1",
+            (1 if paused else 0, paused_at),
+        )
+        conn.commit()
+    return {"paused": paused, "paused_at": paused_at}
+
+
+def is_user_checks_paused(user_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute("SELECT checks_paused FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row["checks_paused"])
+
+
+def list_paused_user_ids() -> list[int]:
+    """Every user_id currently individually paused — bot.py's
+    run_stock_check_cycle excludes their products from the check cycle
+    (as a set membership test, cheap even for a large user base)."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT user_id FROM users WHERE checks_paused = 1").fetchall()
+    return [r["user_id"] for r in rows]
+
+
+def set_users_checks_paused(user_ids: list[int], paused: bool) -> int:
+    """Bulk set/clear the per-user pause flag for the given user_ids (admin
+    'Pause SELECTED users' / 'Resume SELECTED users' action — see
+    /pauseservice, /resumeservice, and the dashboard's matching page).
+    Returns how many existing user rows were actually updated. Never
+    touches a paused user's tracked products or sends them anything — see
+    this section's module comment."""
+    if not user_ids:
+        return 0
+    paused_at = now_ist_str() if paused else None
+    with get_connection() as conn:
+        placeholders = ",".join("?" for _ in user_ids)
+        cursor = conn.execute(
+            f"UPDATE users SET checks_paused = ?, checks_paused_at = ? "
+            f"WHERE user_id IN ({placeholders})",
+            (1 if paused else 0, paused_at, *user_ids),
+        )
+        conn.commit()
+    return cursor.rowcount
 
 
 # ---------------------------------------------------------------------------

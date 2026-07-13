@@ -60,6 +60,10 @@ from database import (
     bulk_cancel_plan,
     list_tracked_links_by_store,
     get_zyte_usage_summary,
+    get_service_pause_info,
+    set_service_paused,
+    list_paused_user_ids,
+    set_users_checks_paused,
 )
 import whatsapp_client
 import zyte_client
@@ -831,6 +835,211 @@ async def callback_mt_back(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "mt_cancel", AdminBulkStates.managing)
 async def callback_mt_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("❌ Cancelled.")
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# /pauseservice + /resumeservice — Pause/Resume Service.
+#
+# Two independent pause mechanisms, both checked by bot.py's
+# run_stock_check_cycle:
+#   • GLOBAL (database.service_status, a singleton row) — an on/off switch
+#     for the ENTIRE background check cycle. When on, the cycle returns
+#     immediately: no get_all_products() call, no grouping, no Scrape.do/
+#     Zyte requests at all — an efficient global stop, not "iterate every
+#     user and skip each one", per the feature's explicit design.
+#   • PER-USER (users.checks_paused) — a secondary, separate mechanism:
+#     selected users' tracked products are excluded from the cycle before
+#     grouping, but every other user's items still get checked normally.
+#
+# Neither mode touches a paused user's saved tracked items, and NEITHER
+# sends any notification to affected users — silent, admin-only visibility,
+# exactly as specified. Per-user selection reuses the exact same checkbox
+# pattern as /managetracking (AdminBulkStates, ✅/⬜ toggle callbacks, an
+# FSM-tracked selected_ids set) — just a different FSM state
+# (AdminBulkStates.pausing) and a different pair of terminal actions
+# (Pause Selected / Resume Selected instead of Stop Tracking / Stop Plan).
+# No confirmation step for pause/resume specifically — unlike
+# stop-tracking/stop-plan, both are fully, instantly reversible, so the
+# extra step would only add friction without a corresponding safety benefit.
+# ---------------------------------------------------------------------------
+
+def _service_status_text() -> str:
+    info = get_service_pause_info()
+    paused_user_count = len(list_paused_user_ids())
+    if info["paused"]:
+        status_line = f"🔴 <b>Service: PAUSED</b> (globally, since {info['paused_at']})"
+    else:
+        status_line = "🟢 <b>Service: RUNNING</b>"
+    paused_users_line = (
+        f"👤 {paused_user_count} user(s) individually paused"
+        if paused_user_count else "👤 No users individually paused"
+    )
+    return f"{status_line}\n{paused_users_line}"
+
+
+def _service_menu_keyboard(global_paused: bool) -> InlineKeyboardMarkup:
+    toggle_button = (
+        InlineKeyboardButton(text="▶️ Resume ALL (global)", callback_data="ps_resume_all")
+        if global_paused else
+        InlineKeyboardButton(text="⏸ Pause ALL (global)", callback_data="ps_pause_all")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [toggle_button],
+        [InlineKeyboardButton(text="☑️ Pause/Resume Selected Users…", callback_data="ps_select_users")],
+    ])
+
+
+async def _send_service_menu(message: Message) -> None:
+    info = get_service_pause_info()
+    await message.answer(
+        _service_status_text(), parse_mode="HTML",
+        reply_markup=_service_menu_keyboard(info["paused"]),
+    )
+
+
+@router.message(Command("pauseservice"))
+async def cmd_pauseservice(message: Message):
+    await _send_service_menu(message)
+
+
+@router.message(Command("resumeservice"))
+async def cmd_resumeservice(message: Message):
+    # /resumeservice always resumes the GLOBAL switch immediately if it's
+    # currently on (a dedicated one-tap "get me back to running" command),
+    # then shows the same status+menu either way — including the
+    # Pause/Resume Selected Users option, for resuming specific
+    # individually-paused users too.
+    info = get_service_pause_info()
+    if info["paused"]:
+        set_service_paused(False)
+        await message.answer("✅ Service resumed globally.", parse_mode="HTML")
+    await _send_service_menu(message)
+
+
+@router.callback_query(F.data == "ps_pause_all")
+async def callback_ps_pause_all(call: CallbackQuery):
+    set_service_paused(True)
+    await call.message.edit_text(
+        _service_status_text(), parse_mode="HTML",
+        reply_markup=_service_menu_keyboard(True),
+    )
+    await call.answer("Service paused globally.")
+
+
+@router.callback_query(F.data == "ps_resume_all")
+async def callback_ps_resume_all(call: CallbackQuery):
+    set_service_paused(False)
+    await call.message.edit_text(
+        _service_status_text(), parse_mode="HTML",
+        reply_markup=_service_menu_keyboard(False),
+    )
+    await call.answer("Service resumed globally.")
+
+
+def _pauseselect_keyboard(rows: list[dict], selected: set[int]) -> InlineKeyboardMarkup:
+    buttons = []
+    for r in rows:
+        mark = "✅" if r["user_id"] in selected else "⬜"
+        pause_indicator = "🔴 PAUSED" if r.get("checks_paused") else "🟢 running"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{mark} {_display_name(r)} — {pause_indicator} ({r['product_count']} item(s))",
+                callback_data=f"ps_toggle:{r['user_id']}",
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="⏸ Pause Selected", callback_data="ps_pause_selected"),
+        InlineKeyboardButton(text="▶️ Resume Selected", callback_data="ps_resume_selected"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="↩️ Back", callback_data="ps_back_to_menu"),
+        InlineKeyboardButton(text="❌ Cancel", callback_data="ps_cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "ps_select_users")
+async def callback_ps_select_users(call: CallbackQuery, state: FSMContext):
+    rows = list_users_with_products_summary()
+    if not rows:
+        await call.answer("No users currently have any tracked products.", show_alert=True)
+        return
+    await state.set_state(AdminBulkStates.pausing)
+    await state.update_data(selected_ids=[])
+    await call.message.edit_text(
+        f"☑️ <b>Pause/Resume selected users ({len(rows)} user(s) with tracked items)</b>\n\n"
+        "Tap to toggle ✅/⬜, then Pause or Resume the selected users. "
+        "No notification is ever sent to affected users.",
+        parse_mode="HTML",
+        reply_markup=_pauseselect_keyboard(rows, set()),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ps_toggle:"), AdminBulkStates.pausing)
+async def callback_ps_toggle(call: CallbackQuery, state: FSMContext):
+    user_id = int(call.data.split(":", 1)[1])
+    data = await state.get_data()
+    selected = set(data.get("selected_ids", []))
+    if user_id in selected:
+        selected.discard(user_id)
+    else:
+        selected.add(user_id)
+    await state.update_data(selected_ids=list(selected))
+    rows = list_users_with_products_summary()
+    await call.message.edit_reply_markup(reply_markup=_pauseselect_keyboard(rows, selected))
+    await call.answer()
+
+
+@router.callback_query(F.data == "ps_pause_selected", AdminBulkStates.pausing)
+async def callback_ps_pause_selected(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = list(set(data.get("selected_ids", [])))
+    if not selected:
+        await call.answer("No users selected! Tap ⬜ to select users first.", show_alert=True)
+        return
+    count = set_users_checks_paused(selected, True)
+    await call.message.edit_text(
+        f"⏸ Paused checking for <b>{count}</b> user(s). Their tracked items stay saved — "
+        f"just not checked until resumed. No notification was sent.",
+        parse_mode="HTML",
+    )
+    await state.clear()
+    await call.answer()
+
+
+@router.callback_query(F.data == "ps_resume_selected", AdminBulkStates.pausing)
+async def callback_ps_resume_selected(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = list(set(data.get("selected_ids", [])))
+    if not selected:
+        await call.answer("No users selected! Tap ⬜ to select users first.", show_alert=True)
+        return
+    count = set_users_checks_paused(selected, False)
+    await call.message.edit_text(
+        f"▶️ Resumed checking for <b>{count}</b> user(s). No notification was sent.",
+        parse_mode="HTML",
+    )
+    await state.clear()
+    await call.answer()
+
+
+@router.callback_query(F.data == "ps_back_to_menu", AdminBulkStates.pausing)
+async def callback_ps_back_to_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    info = get_service_pause_info()
+    await call.message.edit_text(
+        _service_status_text(), parse_mode="HTML",
+        reply_markup=_service_menu_keyboard(info["paused"]),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ps_cancel", AdminBulkStates.pausing)
+async def callback_ps_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("❌ Cancelled.")
     await call.answer()

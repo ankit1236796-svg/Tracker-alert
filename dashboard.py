@@ -81,6 +81,10 @@ from database import (
     bulk_stop_tracking,
     bulk_cancel_plan,
     list_tracked_links_by_store,
+    get_service_pause_info,
+    set_service_paused,
+    list_paused_user_ids,
+    set_users_checks_paused,
 )
 import whatsapp_client
 from notifications import (
@@ -246,7 +250,9 @@ def create_app() -> Flask:
             "top_store": f"{top_store[0][0]} ({top_store[0][1]})" if top_store else "—",
             "active_plans": len(list_plans(active_only=True)),
         }
-        return render_template("dashboard.html", stats=stats)
+        service = get_service_pause_info()
+        service["paused_user_count"] = len(list_paused_user_ids())
+        return render_template("dashboard.html", stats=stats, service=service)
 
     # Maps a ?filter= value to a predicate over (AccessInfo, user_row). Powers
     # the clickable stats cards (point 3): each card links to /users?filter=X.
@@ -978,6 +984,65 @@ def create_app() -> Flask:
             for site in ordered_sites if grouped.get(site)
         ]
         return render_template("links_by_store.html", sections=sections)
+
+    # ── Pause/Resume Service ───────────────────────────────────────────────
+    # GLOBAL switch (service_status) stops the entire background check cycle
+    # efficiently (see bot.py's run_stock_check_cycle) — no per-user
+    # iteration. PER-USER pause (users.checks_paused) is a secondary,
+    # separate mechanism: selected users' tracked items are excluded from
+    # the cycle, everyone else keeps checking normally. Neither ever
+    # touches a paused user's saved items or notifies them — silent,
+    # admin-only, matching the Telegram /pauseservice /resumeservice flow.
+    @app.route("/service/pause-all", methods=["POST"])
+    @login_required
+    def service_pause_all():
+        set_service_paused(True)
+        flash("Service paused globally — background checking has stopped for everyone.", "ok")
+        return redirect(request.referrer or url_for("home"))
+
+    @app.route("/service/resume-all", methods=["POST"])
+    @login_required
+    def service_resume_all():
+        set_service_paused(False)
+        flash("Service resumed globally.", "ok")
+        return redirect(request.referrer or url_for("home"))
+
+    @app.route("/service/manage")
+    @login_required
+    def manage_service():
+        rows = []
+        for r in list_users_with_products_summary():
+            rows.append({
+                "user_id": r["user_id"],
+                "name": _display_name(r),
+                "product_count": r["product_count"],
+                "checks_paused": bool(r.get("checks_paused")),
+                "checks_paused_at": r.get("checks_paused_at"),
+            })
+        info = get_service_pause_info()
+        return render_template("manage_service.html", rows=rows, service=info)
+
+    @app.route("/service/pause-selected", methods=["POST"])
+    @login_required
+    def service_pause_selected():
+        uids = _valid_uids(request.form.getlist("uids"))
+        if not uids:
+            flash("No users selected.", "bad")
+            return redirect(url_for("manage_service"))
+        count = set_users_checks_paused(uids, True)
+        flash(f"Paused checking for {count} user(s). No notification was sent.", "ok")
+        return redirect(url_for("manage_service"))
+
+    @app.route("/service/resume-selected", methods=["POST"])
+    @login_required
+    def service_resume_selected():
+        uids = _valid_uids(request.form.getlist("uids"))
+        if not uids:
+            flash("No users selected.", "bad")
+            return redirect(url_for("manage_service"))
+        count = set_users_checks_paused(uids, False)
+        flash(f"Resumed checking for {count} user(s). No notification was sent.", "ok")
+        return redirect(url_for("manage_service"))
 
     return app
 
