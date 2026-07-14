@@ -25,9 +25,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from bs4 import BeautifulSoup
 
+import stock_checker
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
 from checkers import (
     fetch_page, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital, apple,
+    sangeethamobiles, vijaysales, tataneu, iqoo, vivo,
     CHECKER_MAP,
 )
 from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER
@@ -2562,3 +2564,218 @@ async def cmd_creditusage(message: Message, command: CommandObject):
     text = "\n".join(lines)
     for i in range(0, len(text), 3800):
         await message.answer(text[i:i + 3800], parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# /debugrenderfalse — tests whether render_js=False (plain HTTP, no
+# headless browser) still returns usable/complete product data for the six
+# checkers currently in stock_checker._JS_SITES on a "safe default, never
+# individually verified" basis: inventstore, sangeethamobiles, vijaysales,
+# tataneu, iqoo, vivo. OnePlus, RelianceDigital, and ShopAtSC are
+# deliberately NOT covered here — those were already confirmed (via
+# /debugoneplus and real diagnostics — see stock_checker.py's comments) to
+# actually need JS rendering / a premium proxy, so there's nothing to
+# re-test.
+#
+# Fetches the given URL with render_js=False, then runs that SITE'S OWN
+# real check() function against the result (so the boolean verdict is
+# exactly what production would compute), plus a per-site signal-presence
+# report built from each checker's own real constants/JSON-LD scan (not
+# hand-duplicated guesses) — so a page-structure difference between
+# render_js=True and False is directly visible, not inferred. Also reports
+# stock_checker._looks_blocked_or_incomplete's verdict — the same
+# blocked/challenge-page heuristic the live check cycle uses to decide
+# whether to escalate to super=true — since a render_js=False fetch that
+# LOOKS fine but is secretly a bot-block page would be a false "it works"
+# reading otherwise.
+#
+# Deliberately does NOT change any checker's NEEDS_JS/render default by
+# itself — this sandbox has no live network access to actually fetch real
+# product pages for these sites, so there is no real result to act on yet.
+# The intended workflow: admin runs this against real product URLs (ideally
+# one confirmed in-stock, one confirmed out-of-stock per site) and reports
+# the output back; only THEN does switching stock_checker._JS_SITES happen,
+# backed by real evidence, not a guess — matching this codebase's standing
+# "never guess target-site behavior, verify via a debug command and real
+# results first" principle.
+# ---------------------------------------------------------------------------
+
+_RENDER_FALSE_TEST_SITES = {
+    "inventstore": inventstore,
+    "sangeethamobiles": sangeethamobiles,
+    "vijaysales": vijaysales,
+    "tataneu": tataneu,
+    "iqoo": iqoo,
+    "vivo": vivo,
+}
+
+_DEBUG_RENDERFALSE_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter — this fetches an arbitrary caller-supplied URL via
+# whichever scraping provider is currently active (spends credits).
+
+
+def _jsonld_offers_report(soup: BeautifulSoup) -> list[str]:
+    """Shared JSON-LD offers.availability scan — the same pattern iqoo.py/
+    vivo.py's own _log_diagnostics already runs, reused here so the debug
+    report reflects the exact same extraction, not a re-typed guess."""
+    lines = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if not isinstance(item, dict):
+                continue
+            offers = item.get("offers")
+            if offers is None:
+                continue
+            avail = ""
+            if isinstance(offers, dict):
+                avail = offers.get("availability", "")
+                nested = offers.get("offers", [])
+                if not avail and isinstance(nested, list):
+                    for o in nested:
+                        if isinstance(o, dict) and o.get("availability"):
+                            avail = o["availability"]
+                            break
+            elif isinstance(offers, list):
+                for o in offers:
+                    if isinstance(o, dict) and o.get("availability"):
+                        avail = o["availability"]
+                        break
+            lines.append(f"JSON-LD offers.availability = {avail!r}")
+    if not lines:
+        lines.append("No JSON-LD block with an 'offers' field found.")
+    return lines
+
+
+def _render_false_signal_report(site: str, soup: BeautifulSoup, html: str) -> list[str]:
+    """Per-site signal-presence report, built from each checker module's
+    OWN real constants (_IN_STOCK_PHRASE, _OOS_PHRASE, _OOS_PATTERNS,
+    _ADD_PATTERNS) rather than hand-duplicated copies, so this can never
+    silently drift from what check() actually looks for."""
+    html_lower = html.lower()
+    lines = []
+
+    if site == "inventstore":
+        visible_lower = inventstore._visible_text(html).lower()
+        present = inventstore._IN_STOCK_PHRASE in visible_lower
+        lines.append(
+            f"'{inventstore._IN_STOCK_PHRASE}' phrase in visible text: "
+            f"{'✅ present' if present else '❌ absent'}"
+        )
+
+    elif site == "tataneu":
+        present = tataneu._OOS_PHRASE in html_lower
+        lines.append(
+            f"OOS phrase ({tataneu._OOS_PHRASE!r}) in raw HTML: "
+            + ("✅ present (→ this checker reads it as OUT OF STOCK)" if present
+               else "❌ absent (→ this checker reads it as IN STOCK — NEGATIVE "
+                    "signal: a broken/incomplete fetch would also read as "
+                    "IN STOCK, the riskier failure direction for this "
+                    "specific checker)")
+        )
+
+    elif site in ("iqoo", "vivo"):
+        module = iqoo if site == "iqoo" else vivo
+        lines.extend(_jsonld_offers_report(soup))
+        oos_hits = [p for p in module._OOS_PATTERNS if p in html_lower]
+        lines.append(f"OOS text patterns present: {oos_hits or 'none'}")
+
+    elif site in ("sangeethamobiles", "vijaysales"):
+        module = sangeethamobiles if site == "sangeethamobiles" else vijaysales
+        lines.extend(_jsonld_offers_report(soup))
+        oos_hits = [p for p in module._OOS_PATTERNS if p in html_lower]
+        add_hits = [p for p in module._ADD_PATTERNS if p in html_lower]
+        lines.append(f"OOS text patterns present: {oos_hits or 'none'}")
+        lines.append(f"Add-to-cart text patterns present: {add_hits or 'none'}")
+        if site == "vijaysales":
+            lines.append(
+                "Note: vijaysales.check() INVERTS the generic waterfall's "
+                "raw result (see checkers/vijaysales.py's bugfix comment) "
+                "— the 'checker(soup, html) result' line above already "
+                "reflects that inversion."
+            )
+
+    return lines
+
+
+@router.message(Command("debugrenderfalse"))
+async def cmd_debugrenderfalse(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_RENDERFALSE_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugrenderfalse &lt;site&gt; &lt;url&gt;</code>\n"
+            f"site must be one of: {', '.join(sorted(_RENDER_FALSE_TEST_SITES))}",
+            parse_mode="HTML",
+        )
+        return
+
+    parts = command.args.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer(
+            "Usage: <code>/debugrenderfalse &lt;site&gt; &lt;url&gt;</code>", parse_mode="HTML"
+        )
+        return
+    site, url = parts[0].lower(), parts[1].strip()
+    if site not in _RENDER_FALSE_TEST_SITES:
+        await message.answer(
+            f"⚠️ Unknown site {site!r}. Must be one of: "
+            f"{', '.join(sorted(_RENDER_FALSE_TEST_SITES))}"
+        )
+        return
+
+    await _debug_send(
+        message, f"🔍 Fetching with render_js=False (plain HTTP, no browser) for {site}: {url}",
+    )
+
+    try:
+        resp = await fetch_page(url, render_js=False, timeout=60.0)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Fetch failed: {exc}")
+        return
+
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    text_soup = BeautifulSoup(html, "html.parser")
+    for tag in text_soup(["script", "style"]):
+        tag.decompose()
+    visible_text = text_soup.get_text(" ", strip=True)
+
+    try:
+        checker_result = CHECKER_MAP[site](soup, html)
+        checker_error = None
+    except Exception as exc:
+        checker_result = None
+        checker_error = str(exc)
+
+    blocked = stock_checker._looks_blocked_or_incomplete(html)
+
+    lines = [
+        f"— render_js=False result for {site} —",
+        f"HTTP status: {resp.status_code}",
+        f"Raw HTML length: {len(html)} chars",
+        f"Visible text length: {len(visible_text)} chars",
+        f"Looks blocked/incomplete (same heuristic the live check cycle uses): "
+        f"{'⚠️ YES' if blocked else '✅ no'}",
+    ]
+    if checker_error:
+        lines.append(f"⚠️ check(soup, html) CRASHED on this HTML: {checker_error}")
+    else:
+        lines.append(
+            f"checker(soup, html) result: {'✅ IN STOCK' if checker_result else '❌ OUT OF STOCK'}"
+        )
+    lines.extend(_render_false_signal_report(site, soup, html))
+
+    await _debug_send(message, "\n".join(lines))
+
+    snippet = visible_text[:2000]
+    await _debug_send(
+        message, f"📄 Visible text (first {len(snippet)} of {len(visible_text)} chars):",
+    )
+    _CHUNK_SIZE = 3800
+    for i in range(0, len(snippet), _CHUNK_SIZE):
+        await _debug_send(message, snippet[i:i + _CHUNK_SIZE])
