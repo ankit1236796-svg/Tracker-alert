@@ -29,12 +29,10 @@ import stock_checker
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
 from checkers import (
     fetch_page, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital, apple,
-    sangeethamobiles, vijaysales, tataneu, iqoo, vivo, flipkart_api,
+    sangeethamobiles, vijaysales, tataneu, iqoo, vivo,
     CHECKER_MAP,
 )
-from config import (
-    ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER, FLIPKART_SOURCE,
-)
+from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER
 from database import (
     IST,
     now_ist_str,
@@ -2781,103 +2779,3 @@ async def cmd_debugrenderfalse(message: Message, command: CommandObject):
     _CHUNK_SIZE = 3800
     for i in range(0, len(snippet), _CHUNK_SIZE):
         await _debug_send(message, snippet[i:i + _CHUNK_SIZE])
-
-
-# ---------------------------------------------------------------------------
-# /debugflipkartapi — verify checkers/flipkart_api.py's Flipkart Affiliate
-# API integration (product-id extraction, the raw API call, response
-# parsing, and the automatic fall-back-to-scraping behavior) against a
-# real tracked Flipkart URL, before config.FLIPKART_SOURCE="api" is ever
-# wired into the live check cycle. Reports every step separately so a
-# failure at any one of them (no pid= in the URL, missing credentials,
-# auth error, product not in the affiliate feed, rate limit, unexpected
-# response shape) is immediately visible, plus the FULL raw API response
-# (so a real reply can be cross-checked against this module's documented,
-# web-search-verified field assumptions — see flipkart_api.py's docstring
-# for exactly what is and isn't independently confirmed). NOT wired into
-# CHECKER_MAP or the regular check cycle. Safe to delete once no longer
-# needed.
-# ---------------------------------------------------------------------------
-
-_DEBUG_FLIPKARTAPI_ADMIN_ID = 5004721766  # same hardcoded restriction as
-# every other /debug* command above, on top of the router's own
-# ADMIN_USER_ID filter — this calls Flipkart's Affiliate API (and, on
-# fallback, the active scraping provider) for an arbitrary caller-supplied
-# URL.
-
-
-@router.message(Command("debugflipkartapi"))
-async def cmd_debugflipkartapi(message: Message, command: CommandObject):
-    if message.from_user.id != _DEBUG_FLIPKARTAPI_ADMIN_ID:
-        return
-    if not command.args:
-        await message.answer(
-            "Usage: <code>/debugflipkartapi &lt;flipkart_url&gt;</code>", parse_mode="HTML"
-        )
-        return
-
-    url = command.args.strip()
-
-    product_id = flipkart_api.extract_product_id(url)
-    if not product_id:
-        await _debug_send(
-            message,
-            "⚠️ Could not extract a Flipkart product id (pid= query param) from this "
-            "URL — checkers/flipkart_api.py reuses url_normalize's own Flipkart pid "
-            "extractor, the same one used for cross-user dedup. Without a pid, the "
-            "Affiliate API can't be called at all (falls straight to scraping if "
-            "this URL is ever used with FLIPKART_SOURCE=api).",
-        )
-        return
-    await _debug_send(message, f"✅ Extracted product id (FSN): {product_id!r}")
-
-    aff_id, aff_token = flipkart_api._credentials()
-    await _debug_send(
-        message,
-        f"Credentials: FLIPKART_AFFILIATE_ID={'set' if aff_id else '⚠️ NOT SET'}, "
-        f"FLIPKART_AFFILIATE_TOKEN={'set' if aff_token else '⚠️ NOT SET'}",
-    )
-
-    await _debug_send(message, f"🔍 Calling the Affiliate API for id={product_id!r}…")
-    try:
-        raw = await flipkart_api.fetch_product(product_id)
-    except flipkart_api.FlipkartApiError as exc:
-        await _debug_send(message, f"⚠️ Affiliate API call failed: {exc}")
-    else:
-        raw_json = json.dumps(raw, indent=2)
-        await _debug_send(message, f"— Raw API response ({len(raw_json)} chars) —")
-        _CHUNK_SIZE = 3800
-        for i in range(0, len(raw_json), _CHUNK_SIZE):
-            await _debug_send(message, raw_json[i:i + _CHUNK_SIZE])
-
-        try:
-            in_stock, price, title = flipkart_api.parse_availability(raw)
-        except flipkart_api.FlipkartApiError as exc:
-            await _debug_send(message, f"⚠️ Could not parse the response: {exc}")
-        else:
-            await _debug_send(
-                message,
-                f"Parsed: title={title!r}, in_stock={in_stock}, "
-                f"price={f'₹{price:,.0f}' if price is not None else 'n/a'}",
-            )
-
-    await _debug_send(
-        message,
-        "🔍 Running the full fallback flow (check_stock_with_fallback, "
-        "source='api') — should use the API result above if it succeeded, "
-        "or fall back to the existing scraping checker otherwise…",
-    )
-    try:
-        in_stock2, price2, method = await flipkart_api.check_stock_with_fallback(url, source="api")
-    except Exception as exc:
-        await _debug_send(message, f"⚠️ check_stock_with_fallback crashed: {exc}")
-        return
-    await _debug_send(
-        message,
-        f"✅ Final result via {method!r}: in_stock={in_stock2}, "
-        f"price={f'₹{price2:,.0f}' if price2 is not None else 'n/a'}\n\n"
-        f"(This ran with source='api' forced regardless of config.FLIPKART_SOURCE, "
-        f"currently {FLIPKART_SOURCE!r}, so the fallback path above is always "
-        f"exercised by this debug command. Not yet read by the live check cycle "
-        f"either way — see checkers/flipkart_api.py's module docstring.)",
-    )

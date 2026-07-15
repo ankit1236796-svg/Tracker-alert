@@ -64,22 +64,6 @@ SCRAPING_PROVIDER = os.getenv("SCRAPING_PROVIDER", "zyte").strip().lower()
 # config.py, so a Railway env var change takes effect without an
 # import-order dependency.
 
-# ---------------------------------------------------------------------------
-# Flipkart Affiliate API (alternative to Zyte/Scrape.do scraping, Flipkart
-# only) — see checkers/flipkart_api.py. Defaults to "scraping" (today's
-# unchanged behavior, checkers/flipkart.py via checkers.common.fetch_page);
-# "api" makes checkers.flipkart_api.check_stock_with_fallback() try
-# Flipkart's own Affiliate API first, automatically falling back to
-# scraping on any failure (auth error, product not in the affiliate feed,
-# rate limit, network error, unexpected response shape). NOT wired into
-# the live check cycle yet — see admin_handlers.py's /debugflipkartapi,
-# the verification step this needs to go through first regardless of
-# which value this flag has.
-FLIPKART_SOURCE = os.getenv("FLIPKART_SOURCE", "scraping").strip().lower()
-# FLIPKART_AFFILIATE_ID / FLIPKART_AFFILIATE_TOKEN are read directly via
-# os.environ in checkers/flipkart_api.py at call time, not through this
-# module — mirroring SCRAPEDO_KEY/ZYTE_API_KEY's own pattern above.
-
 # Supported sites
 #
 # Vijay Sales (vijaysales.com) deliberately NOT added — investigated and
