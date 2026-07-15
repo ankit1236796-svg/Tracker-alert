@@ -2,6 +2,12 @@ from .common import detect_site, build_scraper_url, fetch_page, HEADERS, fetch_w
 from . import amazon, flipkart, zepto, bigbasket, blinkit, croma, instamart, myntra
 from . import jiomart, reliancedigital, apple, oneplus, tataneu, vivo, iqoo
 from . import unicornstore, vijaysales, inventstore, sangeethamobiles, shopatsc
+# flipkart_api: an ALTERNATIVE data source for Flipkart (Affiliate API
+# instead of scraping) — deliberately NOT added to CHECKER_MAP below, so
+# it stays completely unwired from the live check cycle (see
+# checkers/flipkart_api.py's module docstring and admin_handlers.py's
+# /debugflipkartapi, the verification step this needs first).
+from . import flipkart_api
 
 CHECKER_MAP = {
     "amazon":           amazon.check,
