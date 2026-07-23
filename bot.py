@@ -22,6 +22,8 @@ from database import (
     purge_user_data,
     is_service_paused,
     list_paused_user_ids,
+    get_all_pickup_tracking,
+    update_pickup_status,
 )
 from handlers import router
 from notifications import (
@@ -29,8 +31,10 @@ from notifications import (
     should_alert_for_price,
     send_expiry_reminder,
     send_data_purged_notice,
+    send_pickup_alert,
 )
 from stock_checker import check_stock
+from checkers import apple as apple_checker
 from url_normalize import product_group_key
 
 logging.basicConfig(
@@ -178,6 +182,111 @@ async def run_stock_check_cycle(bot: Bot) -> dict:
     return {"products": len(products), "groups": len(groups), "saved": saved}
 
 
+# ---------------------------------------------------------------------------
+# Apple Store pickup-availability tracking (separate feature/table from the
+# regular stock checker above — see database.pickup_tracking, /trackpickup
+# in handlers.py, and checkers/apple.py's pickup section). Runs on the same
+# CHECK_INTERVAL cadence as run_stock_check_cycle (called right after it in
+# stock_checker_loop below) rather than its own separate timer.
+# ---------------------------------------------------------------------------
+
+async def _check_pickup_row(bot: Bot, row: dict) -> None:
+    """
+    Checks every saved pincode for one tracked-pickup row, sequentially
+    (never concurrently within the SAME row) so the row's pincode_status
+    dict can be safely read-modified-written once at the end without a
+    lost-update race between two pincodes of the same row finishing at
+    different times. Different rows still run concurrently (see the
+    semaphore-gated gather in run_pickup_check_cycle) — this only serializes
+    within a row, matching the low pincode-per-row counts the feature
+    expects (a handful of pincodes at most).
+
+    A pincode whose API call fails (data is None — network error, non-200,
+    non-JSON/challenge page) is left completely untouched for this cycle:
+    mirrors bot._apply_result_to_row's "None = inconclusive, skip the write"
+    convention for the regular stock checker — a transient failure must
+    never flip a previously-available pincode back to unavailable, which
+    would otherwise manufacture a spurious future "transition" and a
+    duplicate/false alert once the API recovers.
+
+    A successful call with zero available stores (including zero stores
+    returned at all) IS a real, known "unavailable" answer for this
+    feature's specific question ("is pickup available near this pincode
+    right now") — unlike the generic OOS-inference use in
+    _evaluate_pickup_availability, there's no separate signal here that a
+    "no stores nearby" result could be confused with, so it's safe to
+    persist as False.
+    """
+    status = dict(row["pincode_status"])
+    changed = False
+    for pincode in row["pincodes"]:
+        try:
+            data = await apple_checker._fetch_pickup_availability(row["sku"], pincode)
+        except Exception as exc:
+            logger.error(
+                f"[pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
+            )
+            continue
+        if data is None:
+            continue  # inconclusive this cycle — leave prior status untouched
+
+        stores = apple_checker.available_stores_for_pickup(data, row["sku"])
+        now_available = bool(stores)
+        was_available = bool(status.get(pincode, False))
+
+        if now_available != was_available:
+            status[pincode] = now_available
+            changed = True
+
+        if now_available and not was_available:
+            try:
+                await send_pickup_alert(bot, row["user_id"], row["name"], pincode, stores)
+            except Exception as exc:
+                logger.error(
+                    f"[pickup] error sending alert for tracking #{row['id']} "
+                    f"pincode={pincode!r}: {exc}"
+                )
+
+    if changed:
+        update_pickup_status(row["id"], status)
+
+
+async def run_pickup_check_cycle(bot: Bot) -> dict:
+    """
+    One pickup-availability check pass across every /trackpickup row (all
+    users). Same pause semantics as run_stock_check_cycle: a global pause
+    skips the cycle entirely, individually-paused users' rows are excluded.
+    No cross-user/cross-row deduplication (unlike run_stock_check_cycle) —
+    pickup tracking is expected to be low-volume, and each row already
+    carries its own cached SKU, so there's no redundant page-fetch to save.
+    """
+    if is_service_paused():
+        logger.info("[pickup] service globally paused — skipping this check cycle entirely")
+        return {"tracked": 0, "paused": True}
+
+    rows = get_all_pickup_tracking()
+    paused_user_ids = set(list_paused_user_ids())
+    if paused_user_ids:
+        before_count = len(rows)
+        rows = [r for r in rows if r["user_id"] not in paused_user_ids]
+        logger.info(
+            f"[pickup] excluding {before_count - len(rows)} tracked pickup row(s) "
+            f"belonging to {len(paused_user_ids)} individually-paused user(s) this cycle"
+        )
+
+    if not rows:
+        return {"tracked": 0}
+
+    sem = asyncio.Semaphore(10)
+
+    async def _bounded(row):
+        async with sem:
+            await _check_pickup_row(bot, row)
+
+    await asyncio.gather(*[_bounded(row) for row in rows])
+    return {"tracked": len(rows)}
+
+
 async def stock_checker_loop(bot: Bot):
     """
     Runs on a fixed CHECK_INTERVAL period measured from the start of each cycle,
@@ -188,6 +297,12 @@ async def stock_checker_loop(bot: Bot):
     plan's concurrency limit).
     Sends an alert when a product transitions from out-of-stock → in-stock.
     For Amazon items with a target_price, only alerts when price ≤ target.
+
+    Also runs run_pickup_check_cycle (Apple Store pickup-availability
+    tracking — a separate feature/table, see database.pickup_tracking) on
+    this SAME interval right after the regular stock check, rather than on
+    its own timer — simplest way to satisfy "the existing check-cycle
+    interval" without adding a second background loop.
     """
     logger.info("Stock checker loop started.")
     while True:
@@ -196,6 +311,10 @@ async def stock_checker_loop(bot: Bot):
             await run_stock_check_cycle(bot)
         except Exception as exc:
             logger.error(f"Stock checker loop error: {exc}")
+        try:
+            await run_pickup_check_cycle(bot)
+        except Exception as exc:
+            logger.error(f"Pickup checker cycle error: {exc}")
 
         # Sleep only the remainder of CHECK_INTERVAL, measured from cycle start,
         # so total cycle time ≈ CHECK_INTERVAL instead of checking_time + CHECK_INTERVAL.
@@ -303,6 +422,7 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="freetrial", description="Get a bonus free trial by sharing on WhatsApp"),
         BotCommand(command="setwhatsapp", description="Link your WhatsApp Channel/Community for alerts"),
         BotCommand(command="whatsappstatus", description="Check your WhatsApp channel link status"),
+        BotCommand(command="trackpickup", description="Track Apple Store pickup availability by pincode"),
         BotCommand(command="cancel", description="Cancel the current operation"),
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())

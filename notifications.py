@@ -101,6 +101,45 @@ async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
     )
 
 
+async def send_pickup_alert(
+    bot: Bot, user_id: int, product_name: str, pincode: str, stores: list[dict],
+) -> None:
+    """
+    Send a pickup-availability notification (see database.pickup_tracking +
+    bot.run_pickup_check_cycle) — one call per (tracked product, pincode)
+    unavailable→available transition, never repeated for an already-available
+    store. `stores` is checkers.apple.available_stores_for_pickup()'s return
+    value: a list of {"store_name": ..., "location": ... | None} dicts, all
+    reported in one message rather than one alert per store.
+
+    Mirrors send_stock_alert's is_site_locked gate (an admin lock on "apple"
+    should suppress this too, same as the regular stock alert) but has no
+    UNRELIABLE_SITES/price-gate/WhatsApp-forward concerns of its own — those
+    are specific to the regular stock-alert path this feature doesn't share.
+    """
+    if is_site_locked("apple", user_id):
+        logger.info(
+            f"[pickup-alert-suppressed] apple is locked (global or for user "
+            f"{user_id}) — skipping pickup alert."
+        )
+        return
+    lang = get_user_lang(user_id)
+    lines = []
+    for store in stores:
+        name = html.escape(store.get("store_name") or "(unnamed store)")
+        location = store.get("location")
+        if location:
+            lines.append(f"🏬 <b>{name}</b> — {html.escape(location)}")
+        else:
+            lines.append(f"🏬 <b>{name}</b>")
+    stores_block = "\n".join(lines) if lines else "🏬 (store details unavailable)"
+    text = t(
+        "pickup_alert", lang,
+        name=html.escape(product_name), pincode=pincode, stores_block=stores_block,
+    )
+    await _safe_send(bot, user_id, text)
+
+
 async def _safe_send(bot: Bot, user_id: int, text: str) -> bool:
     """Send a plain HTML message to a user, logging (not raising) on failure —
     e.g. the user blocked the bot. Returns whether it succeeded."""

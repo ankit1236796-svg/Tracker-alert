@@ -254,6 +254,101 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Pickup-availability TRACKING (separate from refine_with_pincode above,
+# which only ever CONFIRMS the existing generic in-stock check and never
+# reports store-level detail). Used by /trackpickup + bot.run_pickup_check_cycle
+# — see database.py's pickup_tracking table and bot.py's module docstring
+# for the feature. Additive only: nothing below changes check(),
+# refine_with_pincode(), or _evaluate_pickup_availability()'s existing
+# behavior, so the regular per-pincode stock-confirmation path used in
+# production today is untouched.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Best-effort ONLY — unlike the SKU/auth/response-shape details confirmed
+# above via multiple independent sources, no confirmed field name for a
+# per-store distance or postal address was found on the store object inside
+# pickupMessage.stores (independent sources agree on storeName/storeNumber/
+# storeListNumber/city/state/partsAvailability, but none show a distance or
+# full-address field). Because this only affects optional, cosmetic
+# notification text — never the True/False availability signal itself — it's
+# safe to speculatively check a short list of plausible keys rather than
+# omitting the feature entirely: any that happen to exist in the real
+# response get included, any that don't are silently skipped, so a wrong
+# guess here can only make a notification slightly less detailed, never
+# incorrect.
+_STORE_LOCATION_KEYS = (
+    "storeDistanceWithUnit", "distance", "address", "city", "state",
+)
+
+
+def _extract_store_location(store: dict) -> str | None:
+    """Best-effort, optional 'distance/address' text for a pickup-alert
+    notification — see the module note above on why this speculatively
+    checks several plausible keys instead of a single confirmed one."""
+    parts = []
+    for key in _STORE_LOCATION_KEYS:
+        val = store.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+    if not parts:
+        return None
+    # De-dupe while preserving order (e.g. "city" and "state" might both
+    # legitimately appear; a key repeating the same text as another doesn't).
+    seen = set()
+    unique_parts = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            unique_parts.append(p)
+    return ", ".join(unique_parts)
+
+
+def _extract_product_name(soup: BeautifulSoup) -> str | None:
+    """Best-effort product display name for a pickup-tracking entry — tries
+    JSON-LD's "name" field first (same blocks _extract_sku already scans),
+    then falls back to the page <title> tag. Returns None if neither is
+    found; the caller falls back to a URL-derived name in that case."""
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if isinstance(item, dict) and item.get("name"):
+                return str(item["name"]).strip()
+
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+
+    return None
+
+
+def available_stores_for_pickup(data: dict, sku: str) -> list[dict]:
+    """
+    Returns every store in `data` (a raw fulfillment-messages response) where
+    `sku` currently shows pickupDisplay "available"/"eligible" — the same
+    positive-signal check _evaluate_pickup_availability uses, but returning
+    full per-store detail (name + best-effort location) instead of a
+    collapsed True/None verdict, for the pickup-tracker's notification text.
+    Empty list means "no store currently shows pickup available for this
+    SKU/pincode" — including the case where `data` has zero stores at all.
+    """
+    stores = (
+        (data.get("body") or {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
+    )
+    available = []
+    for store in stores:
+        part_info = (store.get("partsAvailability") or {}).get(sku, {})
+        pickup_display = part_info.get("pickupDisplay", "")
+        if pickup_display in ("available", "eligible"):
+            available.append({
+                "store_name": store.get("storeName") or "(unnamed store)",
+                "location": _extract_store_location(store),
+            })
+    return available
+
+
 async def refine_with_pincode(
     soup: BeautifulSoup, html: str, pincode: str, generic_result: bool
 ) -> bool:

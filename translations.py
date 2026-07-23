@@ -1299,4 +1299,145 @@ _T: dict[str, dict[str, str]] = {
         "tamil": "🚫 உங்கள் WhatsApp Channel forwarding admin ஆல் முடக்கப்பட்டுள்ளது. அவரைத் தொடர்பு கொள்ளுங்கள், அல்லது /setwhatsapp மூலம் புதிய link அனுப்புங்கள்.",
         "gujarati": "🚫 તમારું WhatsApp Channel forwarding admin દ્વારા બંધ કરવામાં આવ્યું છે. તેમનો સંપર્ક કરો, અથવા /setwhatsapp થી નવી link મોકલો.",
     },
+
+    # ── Apple Store pickup-availability tracking (/trackpickup) ───────────────
+    "trackpickup_usage": {
+        "en": ("📍 <b>Track Apple Store pickup availability</b>\n\n"
+               "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+               "Send the product page URL followed by one or more 6-digit pincodes. "
+               "You'll get a notification the moment pickup becomes available at any "
+               "nearby store for any of them."),
+        "hi": ("📍 <b>Apple Store pickup availability track करें</b>\n\n"
+               "इस्तेमाल करें: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+               "Product page का URL भेजें, उसके बाद एक या ज़्यादा 6-digit pincode। "
+               "जैसे ही किसी भी pincode के पास किसी store पर pickup available होगा, "
+               "आपको notification मिल जाएगा।"),
+        "hinglish": ("📍 <b>Apple Store pickup availability track karo</b>\n\n"
+                     "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                     "Product page ka URL bhejo, uske baad ek ya zyada 6-digit pincode. "
+                     "Jaise hi kisi bhi pincode ke paas kisi store pe pickup available "
+                     "hoga, notification mil jaayega."),
+        "punjabi": ("📍 <b>Apple Store pickup availability track karo ji</b>\n\n"
+                    "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                    "Product page da URL bhejo, uske baad ek ja zyada 6-digit pincode. "
+                    "Jiven hi kise vi pincode de nede kise store te pickup available "
+                    "hoyega, notification aa jaayega!"),
+        "haryanvi": ("📍 <b>Apple Store pickup availability track कर</b>\n\n"
+                     "इस्तेमाल कर: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                     "Product page का URL भेज, उसकै बाद एक या ज्यादा 6-digit pincode। "
+                     "ज्यूं ए कोए भी pincode कै धोरै किसे store पै pickup available "
+                     "होज्या, तन्नै notification मिलज्यागी।"),
+        "tamil": ("📍 <b>Apple Store pickup availability track செய்யுங்கள்</b>\n\n"
+                  "பயன்பாடு: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                  "Product page-இன் URL-ஐ அனுப்பவும், அதன் பின் ஒன்று அல்லது அதற்கு "
+                  "மேற்பட்ட 6-digit pincode-களை அனுப்பவும். எந்த pincode அருகிலும் "
+                  "எந்த store-லும் pickup available ஆன உடனேயே உங்களுக்கு notification "
+                  "வரும்."),
+        "gujarati": ("📍 <b>Apple Store pickup availability track કરો</b>\n\n"
+                     "ઉપયોગ: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                     "Product page નું URL મોકલો, પછી એક અથવા વધુ 6-digit pincode. "
+                     "જેવું કોઈપણ pincode ની નજીક કોઈ store પર pickup available થાય, "
+                     "તમને તરત notification મળી જશે."),
+    },
+    "trackpickup_invalid_url": {
+        "en": "⚠️ That doesn't look like an Apple Store product URL — pickup tracking only works for apple.com product pages.",
+        "hi": "⚠️ ये Apple Store का product URL नहीं लग रहा — pickup tracking सिर्फ apple.com की product pages के लिए काम करता है।",
+        "hinglish": "⚠️ Ye Apple Store ka product URL nahi lag raha — pickup tracking sirf apple.com ki product pages ke liye kaam karta hai.",
+        "punjabi": "⚠️ Eh Apple Store da product URL nahi lagda ji — pickup tracking sirf apple.com diyan product pages layi kaam karda hai.",
+        "haryanvi": "⚠️ ये Apple Store का product URL कोनी लाग्या — pickup tracking सिर्फ apple.com की product pages पै काम करै सै।",
+        "tamil": "⚠️ இது Apple Store product URL போல் தெரியவில்லை — pickup tracking apple.com product pages-க்கு மட்டுமே வேலை செய்யும்.",
+        "gujarati": "⚠️ આ Apple Store નું product URL લાગતું નથી — pickup tracking ફક્ત apple.com ની product pages માટે જ કામ કરે છે.",
+    },
+    "trackpickup_invalid_pincode": {
+        "en": "⚠️ <code>{pincode}</code> isn't a valid pincode — each one must be exactly 6 digits.",
+        "hi": "⚠️ <code>{pincode}</code> valid pincode नहीं है — हर pincode ठीक 6 digits का होना चाहिए।",
+        "hinglish": "⚠️ <code>{pincode}</code> valid pincode nahi hai — har pincode exactly 6 digits ka hona chahiye.",
+        "punjabi": "⚠️ <code>{pincode}</code> valid pincode nahi hai ji — har pincode bilkul 6 digits da hona chahida hai.",
+        "haryanvi": "⚠️ <code>{pincode}</code> सही pincode कोनी — हरेक pincode ठीक 6 digit का होणा चाहिए।",
+        "tamil": "⚠️ <code>{pincode}</code> சரியான pincode இல்லை — ஒவ்வொரு pincode-உம் சரியாக 6 digits ஆக இருக்க வேண்டும்.",
+        "gujarati": "⚠️ <code>{pincode}</code> માન્ય pincode નથી — દરેક pincode બરાબર 6 digits નું હોવું જોઈએ.",
+    },
+    "trackpickup_sku_failed": {
+        "en": ("⚠️ Couldn't read this product's details from the page — it may not "
+               "be a valid product URL, or Apple's page changed. Please double-check "
+               "the link and try again."),
+        "hi": ("⚠️ इस product की details page से नहीं पढ़ पाए — शायद ये valid product "
+               "URL नहीं है, या Apple के page में बदलाव हुआ है। कृपया link दोबारा चेक "
+               "करके फिर कोशिश करें।"),
+        "hinglish": ("⚠️ Is product ki details page se nahi padh paaye — shayad ye "
+                     "valid product URL nahi hai, ya Apple ke page mein change hua "
+                     "hai. Please link dobara check karke phir try karo."),
+        "punjabi": ("⚠️ Is product diyan details page ton nahi parh sake — shayad eh "
+                    "valid product URL nahi hai, ja Apple de page vich tabdeeli ho "
+                    "gayi hai. Link dobara check karke fer try karo ji."),
+        "haryanvi": ("⚠️ इस product की डिटेल page तै कोनी पढ़ पाया — शायद ये सही product "
+                     "URL कोनी सै, या Apple के page म्ह बदलाव होग्या सै। लिंक दोबारा "
+                     "चेक करकै फेर ट्राई कर।"),
+        "tamil": ("⚠️ இந்த product-இன் விவரங்களை page-இலிருந்து படிக்க முடியவில்லை — இது "
+                  "சரியான product URL இல்லாமல் இருக்கலாம், அல்லது Apple-இன் page "
+                  "மாறியிருக்கலாம். தயவுசெய்து link-ஐ மீண்டும் சரிபார்த்து முயற்சிக்கவும்."),
+        "gujarati": ("⚠️ આ product ની વિગતો page માંથી વાંચી ન શકાયું — કદાચ આ માન્ય "
+                     "product URL નથી, અથવા Apple ના page માં ફેરફાર થયો છે. કૃપા કરી "
+                     "link ફરી ચેક કરીને પ્રયત્ન કરો."),
+    },
+    "trackpickup_added": {
+        "en": ("✅ <b>Now tracking pickup availability!</b>\n\n"
+               "📦 <b>{name}</b>\n"
+               "📍 Pincodes: {pincodes}\n\n"
+               "You'll get a notification the moment pickup becomes available at any "
+               "nearby store for any of these pincodes."),
+        "hi": ("✅ <b>Pickup availability track होना शुरू!</b>\n\n"
+               "📦 <b>{name}</b>\n"
+               "📍 Pincodes: {pincodes}\n\n"
+               "इनमें से किसी भी pincode के पास किसी store पर pickup available होते "
+               "ही आपको notification मिल जाएगा।"),
+        "hinglish": ("✅ <b>Pickup availability track hona shuru!</b>\n\n"
+                     "📦 <b>{name}</b>\n"
+                     "📍 Pincodes: {pincodes}\n\n"
+                     "In mein se kisi bhi pincode ke paas kisi store pe pickup "
+                     "available hote hi notification mil jaayega."),
+        "punjabi": ("✅ <b>Pickup availability track honi shuru ho gayi!</b>\n\n"
+                    "📦 <b>{name}</b>\n"
+                    "📍 Pincodes: {pincodes}\n\n"
+                    "Inhan vichon kise vi pincode de nede kise store te pickup "
+                    "available hunde hi notification aa jaayega ji!"),
+        "haryanvi": ("✅ <b>Pickup availability track होणा शुरू!</b>\n\n"
+                     "📦 <b>{name}</b>\n"
+                     "📍 Pincodes: {pincodes}\n\n"
+                     "इन म्हसै कोए भी pincode कै धोरै किसे store पै pickup available "
+                     "होते ए तन्नै notification मिलज्यागी।"),
+        "tamil": ("✅ <b>Pickup availability track ஆரம்பம்!</b>\n\n"
+                  "📦 <b>{name}</b>\n"
+                  "📍 Pincodes: {pincodes}\n\n"
+                  "இவற்றில் எந்த pincode அருகிலும் எந்த store-லும் pickup available "
+                  "ஆன உடனேயே உங்களுக்கு notification வரும்."),
+        "gujarati": ("✅ <b>Pickup availability track કરવાનું શરૂ!</b>\n\n"
+                     "📦 <b>{name}</b>\n"
+                     "📍 Pincodes: {pincodes}\n\n"
+                     "આમાંથી કોઈપણ pincode ની નજીક કોઈ store પર pickup available "
+                     "થતાં જ તમને notification મળી જશે."),
+    },
+    "pickup_alert": {
+        "en": ("📍 <b>Pickup Available!</b>\n\n"
+               "📦 <b>{name}</b>\n"
+               "Near pincode <b>{pincode}</b>:\n\n{stores_block}"),
+        "hi": ("📍 <b>Pickup Available हो गया!</b>\n\n"
+               "📦 <b>{name}</b>\n"
+               "Pincode <b>{pincode}</b> के पास:\n\n{stores_block}"),
+        "hinglish": ("📍 <b>Pickup Available ho gaya!</b>\n\n"
+                     "📦 <b>{name}</b>\n"
+                     "Pincode <b>{pincode}</b> ke paas:\n\n{stores_block}"),
+        "punjabi": ("📍 <b>Pickup Available ho gaya ji!</b>\n\n"
+                    "📦 <b>{name}</b>\n"
+                    "Pincode <b>{pincode}</b> de nede:\n\n{stores_block}"),
+        "haryanvi": ("📍 <b>Pickup Available होग्या!</b>\n\n"
+                     "📦 <b>{name}</b>\n"
+                     "Pincode <b>{pincode}</b> कै धोरै:\n\n{stores_block}"),
+        "tamil": ("📍 <b>Pickup Available ஆகிவிட்டது!</b>\n\n"
+                  "📦 <b>{name}</b>\n"
+                  "Pincode <b>{pincode}</b> அருகில்:\n\n{stores_block}"),
+        "gujarati": ("📍 <b>Pickup Available થયું!</b>\n\n"
+                     "📦 <b>{name}</b>\n"
+                     "Pincode <b>{pincode}</b> ની નજીક:\n\n{stores_block}"),
+    },
 }

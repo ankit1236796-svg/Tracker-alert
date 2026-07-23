@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import logging
@@ -339,6 +340,35 @@ def init_db():
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+        conn.commit()
+
+        # ── Apple Store pickup-availability tracking (separate from `products` —
+        # see checkers/apple.py's pickup section + bot.run_pickup_check_cycle) ──
+        # One row per /trackpickup call: a product (URL + cached SKU, extracted
+        # once at track-time so the recurring check cycle only needs to call the
+        # fulfillment-messages API, no repeat product-page fetch) plus its list
+        # of tracked pincodes. `pincodes` is a JSON-encoded list of strings;
+        # `pincode_status` is a JSON-encoded {pincode: 0/1} dict of the last
+        # known "any store showed pickup-available" result per pincode, used
+        # solely to detect the unavailable→available transition the feature
+        # alerts on (see bot.py) — never as a stock-status source of truth the
+        # way `products.in_stock` is.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pickup_tracking (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id        INTEGER NOT NULL,
+                name           TEXT    NOT NULL,
+                url            TEXT    NOT NULL,
+                sku            TEXT    NOT NULL,
+                pincodes       TEXT    NOT NULL,
+                pincode_status TEXT    NOT NULL DEFAULT '{}',
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(user_id, url)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pickup_tracking_user_id ON pickup_tracking(user_id)
+        """)
         conn.commit()
 
         # Migration: every pre-existing user (found via products/pin_codes) who
@@ -962,6 +992,67 @@ def list_all_whatsapp_channels() -> list[dict]:
             "SELECT * FROM whatsapp_channels ORDER BY registered_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Apple Store pickup-availability tracking (see pickup_tracking table above)
+# ---------------------------------------------------------------------------
+
+def _row_to_pickup_dict(row: sqlite3.Row) -> dict:
+    """Parses the JSON-encoded pincodes/pincode_status columns into real
+    Python objects — every caller wants the decoded form, never the raw
+    JSON text, so this is applied uniformly rather than repeated at each
+    call site."""
+    d = dict(row)
+    try:
+        d["pincodes"] = json.loads(d["pincodes"])
+    except (TypeError, ValueError):
+        d["pincodes"] = []
+    try:
+        d["pincode_status"] = json.loads(d["pincode_status"])
+    except (TypeError, ValueError):
+        d["pincode_status"] = {}
+    return d
+
+
+def add_pickup_tracking(user_id: int, name: str, url: str, sku: str, pincodes: list[str]) -> tuple[bool, str]:
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO pickup_tracking (user_id, name, url, sku, pincodes) VALUES (?, ?, ?, ?, ?)",
+                (user_id, name, url, sku, json.dumps(pincodes)),
+            )
+            conn.commit()
+        return True, "Pickup tracking added successfully."
+    except sqlite3.IntegrityError:
+        return False, "You are already tracking pickup availability for this URL."
+    except Exception as e:
+        logger.error(f"add_pickup_tracking error: {e}")
+        return False, "Database error while adding pickup tracking."
+
+
+def list_pickup_tracking(user_id: int) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pickup_tracking WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ).fetchall()
+    return [_row_to_pickup_dict(row) for row in rows]
+
+
+def get_all_pickup_tracking() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM pickup_tracking").fetchall()
+    return [_row_to_pickup_dict(row) for row in rows]
+
+
+def update_pickup_status(tracking_id: int, pincode_status: dict) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE pickup_tracking SET pincode_status = ? WHERE id = ?",
+            (json.dumps(pincode_status), tracking_id),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     CallbackQuery,
 )
+from bs4 import BeautifulSoup
 
 from states import AddProductStates, PinCodeStates, SearchStates, SelectStates
 from database import (
@@ -38,10 +39,13 @@ from database import (
     register_whatsapp_channel,
     get_whatsapp_channel,
     approve_whatsapp_channel,
+    add_pickup_tracking,
+    is_site_locked,
 )
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
 from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
+from checkers import fetch_page, apple as apple_checker
 from translations import t, LANG_LABEL, LANGS
 from config import (
     SUPPORTED_SITES,
@@ -1460,3 +1464,79 @@ async def cmd_whatsappstatus(message: Message):
             "disabled": "whatsapp_status_disabled",
         }.get(channel["status"], "whatsapp_status_none")
     await message.answer(t(key, lang), parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# /trackpickup — Apple Store pickup-availability tracking. Separate from the
+# regular /add flow (own table, own check cycle — see
+# database.pickup_tracking + bot.run_pickup_check_cycle); doesn't count
+# against a plan's max_items. The product page is fetched here, once, purely
+# to cache the SKU (checkers.apple._extract_sku, the same extractor
+# refine_with_pincode already uses in production) — the recurring check
+# cycle then only needs the lightweight fulfillment-messages API call per
+# pincode, not a repeat page fetch every interval.
+# ---------------------------------------------------------------------------
+
+@router.message(Command("trackpickup"))
+async def cmd_trackpickup(message: Message, command: CommandObject):
+    user_id = message.from_user.id
+    lang = get_user_lang(user_id)
+
+    if not command.args:
+        await message.answer(t("trackpickup_usage", lang), parse_mode="HTML")
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(t("trackpickup_usage", lang), parse_mode="HTML")
+        return
+
+    url, pincodes = parts[0], parts[1:]
+
+    if not url.startswith(("http://", "https://")) or detect_site(url) != "apple":
+        await message.answer(t("trackpickup_invalid_url", lang), parse_mode="HTML")
+        return
+
+    # Reuses the admin's existing site-lock control (the same one
+    # check_can_add_item enforces for /add) directly rather than that whole
+    # function, which also enforces the REGULAR products table's max_items —
+    # pickup tracking is a separate, unlimited-for-now feature, so only the
+    # site-lock half applies here.
+    if is_site_locked("apple", user_id):
+        await message.answer(
+            t("store_locked", lang, site=get_site_label("apple")), parse_mode="HTML"
+        )
+        return
+
+    for pincode in pincodes:
+        if not pincode.isdigit() or len(pincode) != 6:
+            await message.answer(
+                t("trackpickup_invalid_pincode", lang, pincode=pincode), parse_mode="HTML"
+            )
+            return
+
+    try:
+        resp = await fetch_page(url, render_js=apple_checker.NEEDS_JS, timeout=30.0)
+        resp.raise_for_status()
+        html_text = resp.text
+    except Exception as exc:
+        logger.error(f"[trackpickup] product page fetch failed for {url!r}: {exc}")
+        await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
+        return
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    sku = apple_checker._extract_sku(soup, html_text)
+    if not sku:
+        await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
+        return
+
+    name = apple_checker._extract_product_name(soup) or _auto_name(url, "apple")
+
+    ok, msg = add_pickup_tracking(user_id, name, url, sku, pincodes)
+    if ok:
+        await message.answer(
+            t("trackpickup_added", lang, name=name, pincodes=", ".join(pincodes)),
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(f"⚠️ {msg}")
