@@ -23,7 +23,6 @@ from database import (
     is_service_paused,
     list_paused_user_ids,
     get_all_pickup_tracking,
-    update_pickup_status,
 )
 from handlers import router
 from notifications import (
@@ -31,7 +30,6 @@ from notifications import (
     should_alert_for_price,
     send_expiry_reminder,
     send_data_purged_notice,
-    send_pickup_alert,
 )
 from stock_checker import check_stock
 from checkers import apple as apple_checker
@@ -190,65 +188,15 @@ async def run_stock_check_cycle(bot: Bot) -> dict:
 # stock_checker_loop below) rather than its own separate timer.
 # ---------------------------------------------------------------------------
 
-async def _check_pickup_row(bot: Bot, row: dict) -> None:
+async def _check_pickup_row(bot: Bot, row: dict) -> dict:
     """
-    Checks every saved pincode for one tracked-pickup row, sequentially
-    (never concurrently within the SAME row) so the row's pincode_status
-    dict can be safely read-modified-written once at the end without a
-    lost-update race between two pincodes of the same row finishing at
-    different times. Different rows still run concurrently (see the
-    semaphore-gated gather in run_pickup_check_cycle) — this only serializes
-    within a row, matching the low pincode-per-row counts the feature
-    expects (a handful of pincodes at most).
-
-    A pincode whose API call fails (data is None — network error, non-200,
-    non-JSON/challenge page) is left completely untouched for this cycle:
-    mirrors bot._apply_result_to_row's "None = inconclusive, skip the write"
-    convention for the regular stock checker — a transient failure must
-    never flip a previously-available pincode back to unavailable, which
-    would otherwise manufacture a spurious future "transition" and a
-    duplicate/false alert once the API recovers.
-
-    A successful call with zero available stores (including zero stores
-    returned at all) IS a real, known "unavailable" answer for this
-    feature's specific question ("is pickup available near this pincode
-    right now") — unlike the generic OOS-inference use in
-    _evaluate_pickup_availability, there's no separate signal here that a
-    "no stores nearby" result could be confused with, so it's safe to
-    persist as False.
+    Thin wrapper around checkers.apple.check_pickup_row — the actual check/
+    persist/notify logic now lives there so handlers.py's on-demand
+    /mypickups command can share it too, without importing bot.py (which
+    would be circular — bot.py imports handlers.router). Kept as a bot.py-
+    local name for backward compatibility with existing call sites/tests.
     """
-    status = dict(row["pincode_status"])
-    changed = False
-    for pincode in row["pincodes"]:
-        try:
-            data = await apple_checker._fetch_pickup_availability(row["sku"], pincode)
-        except Exception as exc:
-            logger.error(
-                f"[pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
-            )
-            continue
-        if data is None:
-            continue  # inconclusive this cycle — leave prior status untouched
-
-        stores = apple_checker.available_stores_for_pickup(data, row["sku"])
-        now_available = bool(stores)
-        was_available = bool(status.get(pincode, False))
-
-        if now_available != was_available:
-            status[pincode] = now_available
-            changed = True
-
-        if now_available and not was_available:
-            try:
-                await send_pickup_alert(bot, row["user_id"], row["name"], pincode, stores)
-            except Exception as exc:
-                logger.error(
-                    f"[pickup] error sending alert for tracking #{row['id']} "
-                    f"pincode={pincode!r}: {exc}"
-                )
-
-    if changed:
-        update_pickup_status(row["id"], status)
+    return await apple_checker.check_pickup_row(bot, row)
 
 
 async def run_pickup_check_cycle(bot: Bot) -> dict:
@@ -423,6 +371,7 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="setwhatsapp", description="Link your WhatsApp Channel/Community for alerts"),
         BotCommand(command="whatsappstatus", description="Check your WhatsApp channel link status"),
         BotCommand(command="trackpickup", description="Track Apple Store pickup availability by pincode"),
+        BotCommand(command="mypickups", description="Check your tracked pickup items right now"),
         BotCommand(command="cancel", description="Cancel the current operation"),
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())

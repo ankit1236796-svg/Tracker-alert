@@ -372,6 +372,99 @@ def available_stores_for_pickup(data: dict, sku: str) -> list[dict]:
     return available
 
 
+async def check_pickup_row(bot, row: dict) -> dict:
+    """
+    Checks every saved pincode for one database.pickup_tracking row RIGHT
+    NOW: calls the fulfillment-messages API per pincode, updates the row's
+    persisted pincode_status on any change, and sends a pickup-availability
+    notification (notifications.send_pickup_alert) on a genuine
+    unavailable->available transition.
+
+    Lives HERE rather than in bot.py (where it originated) so both
+    bot.run_pickup_check_cycle's scheduled cycle AND handlers.py's
+    on-demand /mypickups command can share ONE implementation — handlers.py
+    can't import bot.py directly (bot.py imports handlers.router, so that
+    would be circular), but both already import checkers.apple.
+
+    Sequential across pincodes WITHIN this row (never concurrent) so
+    pincode_status can be safely read-modified-written once at the end
+    without a lost-update race between two pincodes of the SAME row
+    finishing at different times. Callers may still run different ROWS
+    concurrently (see run_pickup_check_cycle's semaphore-gated gather) —
+    this only serializes within a row, matching the low pincode-per-row
+    counts the feature expects (a handful of pincodes at most).
+
+    Returns {pincode: [store dicts]} for every pincode actually checked
+    this call — used by /mypickups to show the caller a live per-pincode
+    result immediately, on top of the DB-update-and-notify side effects
+    this function already performs (the scheduled cycle simply ignores the
+    return value). A pincode whose API call fails this round is absent
+    from the returned dict, mirroring its "left untouched" DB-status
+    behavior below.
+
+    A pincode whose API call fails (data is None — network error, non-200,
+    non-JSON/challenge page) is left completely untouched: mirrors
+    bot._apply_result_to_row's "None = inconclusive, skip the write"
+    convention for the regular stock checker — a transient failure must
+    never flip a previously-available pincode back to unavailable, which
+    would otherwise manufacture a spurious future "transition" and a
+    duplicate/false alert once the API recovers.
+
+    A successful call with zero available stores (including zero stores
+    returned at all) IS a real, known "unavailable" answer for this
+    feature's specific question ("is pickup available near this pincode
+    right now") — unlike the generic OOS-inference use in
+    _evaluate_pickup_availability, there's no separate signal here that a
+    "no stores nearby" result could be confused with, so it's safe to
+    persist as False.
+    """
+    # Deferred imports: database.py/notifications.py don't import checkers
+    # back (verified — no cycle either direction), but keeping these local
+    # avoids any import-order surprise and matches this codebase's
+    # established caution around cross-module imports (see
+    # checkers/flipkart_api.py's check_stock_with_fallback for the same
+    # pattern).
+    from database import update_pickup_status
+    from notifications import send_pickup_alert
+
+    status = dict(row["pincode_status"])
+    changed = False
+    results: dict[str, list[dict]] = {}
+    for pincode in row["pincodes"]:
+        try:
+            data = await _fetch_pickup_availability(row["sku"], pincode)
+        except Exception as exc:
+            logger.error(
+                f"[apple][pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
+            )
+            continue
+        if data is None:
+            continue  # inconclusive this call — leave prior status untouched
+
+        stores = available_stores_for_pickup(data, row["sku"])
+        results[pincode] = stores
+        now_available = bool(stores)
+        was_available = bool(status.get(pincode, False))
+
+        if now_available != was_available:
+            status[pincode] = now_available
+            changed = True
+
+        if now_available and not was_available:
+            try:
+                await send_pickup_alert(bot, row["user_id"], row["name"], pincode, stores)
+            except Exception as exc:
+                logger.error(
+                    f"[apple][pickup] error sending alert for tracking #{row['id']} "
+                    f"pincode={pincode!r}: {exc}"
+                )
+
+    if changed:
+        update_pickup_status(row["id"], status)
+
+    return results
+
+
 async def refine_with_pincode(
     soup: BeautifulSoup, html: str, pincode: str, generic_result: bool
 ) -> bool:

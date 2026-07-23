@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import re
 from datetime import datetime
@@ -40,6 +41,7 @@ from database import (
     get_whatsapp_channel,
     approve_whatsapp_channel,
     add_pickup_tracking,
+    list_pickup_tracking,
     is_site_locked,
 )
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
@@ -1549,6 +1551,103 @@ async def cmd_trackpickup(message: Message, command: CommandObject):
             await message.answer(f"⚠️ {msg}")
     except Exception as exc:
         logger.error(f"[trackpickup] unexpected error for user {user_id}: {exc}", exc_info=True)
+        try:
+            await message.answer(t("unexpected_error", lang), parse_mode="HTML")
+        except Exception:
+            pass  # even the error reply failed (e.g. user blocked the bot) — nothing more to do
+
+
+# ---------------------------------------------------------------------------
+# /mypickups — on-demand, RIGHT NOW pickup-availability check for every
+# product the caller has tracked via /trackpickup (not waiting for the next
+# scheduled run_pickup_check_cycle). Reuses checkers.apple.check_pickup_row
+# directly — the SAME check/persist/notify logic the background cycle uses
+# — so this also updates pincode_status and fires a genuine unavailable->
+# available transition's normal notification immediately (mirroring how
+# /check's _parallel_check already fires send_stock_alert on a manual
+# check for the regular stock-tracking flow, rather than only ever
+# displaying a result the background loop would separately re-detect and
+# notify about later). handlers.py can't import bot.py directly (bot.py
+# imports handlers.router — that would be circular), which is exactly why
+# check_pickup_row was factored into checkers/apple.py in the first place.
+# ---------------------------------------------------------------------------
+
+def _format_store_list(stores: list[dict]) -> str:
+    parts = []
+    for s in stores:
+        name = html.escape(s.get("store_name") or "(unnamed store)")
+        location = s.get("location")
+        parts.append(f"{name} ({html.escape(location)})" if location else name)
+    return ", ".join(parts)
+
+
+def _format_mypickups_results(rows_with_results: list[tuple[dict, dict]], lang: str) -> str:
+    """
+    rows_with_results: list of (row, results) where results is
+    {pincode: [store dicts]} as returned by checkers.apple.check_pickup_row
+    — a pincode ABSENT from results means its check failed this round
+    (inconclusive; see check_pickup_row's docstring on why that's left
+    untouched rather than shown as "unavailable"), shown as its own
+    distinct line rather than conflated with a genuine "not available"
+    result.
+    """
+    lines = [t("mypickups_header", lang), ""]
+    for row, results in rows_with_results:
+        lines.append(f"📦 <b>{html.escape(row['name'])}</b>")
+        for pincode in row["pincodes"]:
+            if pincode not in results:
+                lines.append(t("mypickups_line_check_failed", lang, pincode=pincode))
+                continue
+            stores = results[pincode]
+            if stores:
+                lines.append(
+                    t("mypickups_line_available", lang, pincode=pincode, stores=_format_store_list(stores))
+                )
+            else:
+                lines.append(t("mypickups_line_unavailable", lang, pincode=pincode))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+@router.message(Command("mypickups"))
+async def cmd_mypickups(message: Message):
+    user_id = message.from_user.id
+    lang = get_user_lang(user_id)
+    try:
+        rows = list_pickup_tracking(user_id)
+        if not rows:
+            await message.answer(t("mypickups_empty", lang), parse_mode="HTML")
+            return
+
+        progress = await message.answer(
+            t("mypickups_checking", lang, count=len(rows)), parse_mode="HTML"
+        )
+
+        sem = asyncio.Semaphore(10)
+
+        async def _check_one(row: dict) -> tuple[dict, dict]:
+            async with sem:
+                try:
+                    results = await apple_checker.check_pickup_row(message.bot, row)
+                except Exception as exc:
+                    # One product's check failing (e.g. a transient network
+                    # error) shouldn't blank out results for every OTHER
+                    # tracked product — falls through to the same "check
+                    # failed" per-pincode line check_pickup_row's own
+                    # per-pincode failures already produce.
+                    logger.error(
+                        f"[mypickups] check failed for tracking #{row['id']}: {exc}", exc_info=True
+                    )
+                    results = {}
+                return row, results
+
+        rows_with_results = list(await asyncio.gather(*[_check_one(row) for row in rows]))
+
+        await progress.edit_text(
+            _format_mypickups_results(rows_with_results, lang), parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.error(f"[mypickups] unexpected error for user {user_id}: {exc}", exc_info=True)
         try:
             await message.answer(t("unexpected_error", lang), parse_mode="HTML")
         except Exception:
