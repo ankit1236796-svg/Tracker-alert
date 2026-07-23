@@ -42,6 +42,7 @@ from database import (
     approve_whatsapp_channel,
     add_pickup_tracking,
     list_pickup_tracking,
+    remove_pickup_tracking,
     is_site_locked,
 )
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
@@ -1652,3 +1653,71 @@ async def cmd_mypickups(message: Message):
             await message.answer(t("unexpected_error", lang), parse_mode="HTML")
         except Exception:
             pass  # even the error reply failed (e.g. user blocked the bot) — nothing more to do
+
+
+# ---------------------------------------------------------------------------
+# /untrackpickup — stop tracking a pickup item. Mirrors /remove's own
+# inline-button flow (cmd_remove/callback_remove above) exactly: an
+# inline-keyboard prompt keyed by the pickup_tracking row's id, a Cancel
+# option, and a callback handler that deletes and edits the message in
+# place. Only ever touches pickup_tracking (database.remove_pickup_tracking
+# is scoped to id+user_id) — the regular products table and its own
+# /remove flow are completely untouched.
+# ---------------------------------------------------------------------------
+
+@router.message(Command("untrackpickup"))
+async def cmd_untrackpickup(message: Message):
+    user_id = message.from_user.id
+    lang = get_user_lang(user_id)
+    rows = list_pickup_tracking(user_id)
+
+    if not rows:
+        await message.answer(t("untrackpickup_empty", lang))
+        return
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"🗑 {r['name']} ({', '.join(r['pincodes'])})",
+                callback_data=f"untrackpickup:{r['id']}",
+            )
+        ]
+        for r in rows
+    ]
+    buttons.append(
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="untrackpickup:cancel")]
+    )
+
+    await message.answer(
+        t("untrackpickup_prompt", lang),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("untrackpickup:"))
+async def callback_untrackpickup(call: CallbackQuery):
+    payload = call.data.split(":", 1)[1]
+
+    if payload == "cancel":
+        await call.message.edit_text("❌ Removal cancelled.")
+        await call.answer()
+        return
+
+    try:
+        tracking_id = int(payload)
+    except ValueError:
+        await call.answer("Invalid selection.", show_alert=True)
+        return
+
+    deleted = remove_pickup_tracking(call.from_user.id, tracking_id)
+    if deleted:
+        await call.message.edit_text(
+            f"✅ Pickup tracking <b>#{tracking_id}</b> has been removed.",
+            parse_mode="HTML",
+        )
+    else:
+        await call.message.edit_text(
+            "⚠️ Could not remove that tracked item. It may have already been removed."
+        )
+    await call.answer()

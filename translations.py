@@ -1507,4 +1507,24 @@ _T: dict[str, dict[str, str]] = {
         "tamil": "  ⚠️ <code>{pincode}</code>: check தோல்வியடைந்தது — சிறிது நேரம் கழித்து முயற்சிக்கவும்",
         "gujarati": "  ⚠️ <code>{pincode}</code>: check નિષ્ફળ ગયું — થોડી વાર પછી ફરી પ્રયત્ન કરો",
     },
+
+    # ── /untrackpickup — stop tracking a pickup item ───────────────────────────
+    "untrackpickup_empty": {
+        "en": "📭 You have no tracked pickup items.\nUse /trackpickup to start tracking one!",
+        "hi": "📭 आपका कोई tracked pickup item नहीं है।\nShuru karne ke liye /trackpickup इस्तेमाल करें!",
+        "hinglish": "📭 Aapka koi tracked pickup item nahi hai.\nShuru karne ke liye /trackpickup use karo!",
+        "punjabi": "📭 Tuhada koi tracked pickup item nahi hai ji.\nShuru karan layi /trackpickup use karo!",
+        "haryanvi": "📭 थारा कोए tracked pickup item कोनी।\nशुरू करण खात्तर /trackpickup दबा दे!",
+        "tamil": "📭 உங்களிடம் tracked pickup item இல்லை.\nதொடங்க /trackpickup பயன்படுத்துங்கள்!",
+        "gujarati": "📭 તમારી પાસે કોઈ tracked pickup item નથી.\nશરૂ કરવા /trackpickup નો ઉપયોગ કરો!",
+    },
+    "untrackpickup_prompt": {
+        "en": "🗑 <b>Select a pickup item to stop tracking:</b>",
+        "hi": "🗑 <b>Tracking बंद करने के लिए कोई pickup item चुनें:</b>",
+        "hinglish": "🗑 <b>Tracking band karne ke liye koi pickup item choose karo:</b>",
+        "punjabi": "🗑 <b>Tracking band karan layi koi pickup item choose karo ji:</b>",
+        "haryanvi": "🗑 <b>Tracking बंद करण खात्तर कोए pickup item छाँट ले:</b>",
+        "tamil": "🗑 <b>Tracking-ஐ நிறுத்த ஒரு pickup item-ஐ தேர்ந்தெடுங்கள்:</b>",
+        "gujarati": "🗑 <b>Tracking બંધ કરવા કોઈ pickup item પસંદ કરો:</b>",
+    },
 }

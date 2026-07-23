@@ -1055,6 +1055,20 @@ def update_pickup_status(tracking_id: int, pincode_status: dict) -> None:
         conn.commit()
 
 
+def remove_pickup_tracking(user_id: int, tracking_id: int) -> bool:
+    """Deletes one pickup_tracking row — mirrors remove_product's shape
+    exactly. Scoped to (id, user_id) so a user can never remove another
+    user's tracked pickup item. Only ever touches pickup_tracking; the
+    regular products table (and its own /remove flow) is untouched."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM pickup_tracking WHERE id = ? AND user_id = ?",
+            (tracking_id, user_id),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # Users / access control
 # ---------------------------------------------------------------------------

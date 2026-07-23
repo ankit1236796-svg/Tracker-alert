@@ -372,6 +372,7 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="whatsappstatus", description="Check your WhatsApp channel link status"),
         BotCommand(command="trackpickup", description="Track Apple Store pickup availability by pincode"),
         BotCommand(command="mypickups", description="Check your tracked pickup items right now"),
+        BotCommand(command="untrackpickup", description="Stop tracking a pickup item"),
         BotCommand(command="cancel", description="Cancel the current operation"),
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
