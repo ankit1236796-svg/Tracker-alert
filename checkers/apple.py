@@ -125,6 +125,29 @@ _SKU_INLINE_PATTERN = re.compile(r'"partNumber"\s*:\s*"([A-Z0-9]{5,14}/A)"')
 _SKU_JSONLD_INLINE_PATTERN = re.compile(r'"sku"\s*:\s*"([A-Z0-9]{5,14}/A)"')
 
 
+def _sku_from_offers(offers) -> str | None:
+    """
+    JSON-LD's "offers" field is usually a single Offer object (a dict), but
+    some product pages embed it as a LIST of Offer objects instead (e.g. one
+    entry per variant/color) — indexing it with `.get("sku")` directly
+    crashed with "'list' object has no attribute 'get'" for those pages
+    (the root cause fixed here, not just caught at a caller). Handles both
+    shapes; returns the first sku found across list entries, or None if
+    `offers` is neither shape or yields no sku.
+    """
+    if isinstance(offers, dict):
+        sku = offers.get("sku")
+        return str(sku) if sku else None
+    if isinstance(offers, list):
+        for entry in offers:
+            if isinstance(entry, dict):
+                sku = entry.get("sku")
+                if sku:
+                    return str(sku)
+        return None
+    return None
+
+
 def _extract_sku(soup: BeautifulSoup, html: str) -> str | None:
     """
     Extract Apple's public SKU/part number from the already-fetched product
@@ -140,7 +163,7 @@ def _extract_sku(soup: BeautifulSoup, html: str) -> str | None:
         for item in (data if isinstance(data, list) else [data]):
             if not isinstance(item, dict):
                 continue
-            sku = item.get("sku") or (item.get("offers") or {}).get("sku")
+            sku = item.get("sku") or _sku_from_offers(item.get("offers"))
             if sku:
                 logger.info(f"[apple][resolve] SKU from JSON-LD: {sku!r}")
                 return str(sku)

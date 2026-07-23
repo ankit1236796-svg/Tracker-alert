@@ -1482,61 +1482,74 @@ async def cmd_trackpickup(message: Message, command: CommandObject):
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
 
-    if not command.args:
-        await message.answer(t("trackpickup_usage", lang), parse_mode="HTML")
-        return
+    # Outer safety net: everything below is wrapped so ANY unanticipated
+    # exception (a page-structure edge case none of the inner handling
+    # anticipated, a future bug, ...) still gets a clear reply to the user
+    # instead of the command silently hanging — aiogram has no dispatcher-
+    # wide error handler registered, so an unhandled exception here would
+    # otherwise just vanish into the logs with no user-visible response.
+    try:
+        if not command.args:
+            await message.answer(t("trackpickup_usage", lang), parse_mode="HTML")
+            return
 
-    parts = command.args.strip().split()
-    if len(parts) < 2:
-        await message.answer(t("trackpickup_usage", lang), parse_mode="HTML")
-        return
+        parts = command.args.strip().split()
+        if len(parts) < 2:
+            await message.answer(t("trackpickup_usage", lang), parse_mode="HTML")
+            return
 
-    url, pincodes = parts[0], parts[1:]
+        url, pincodes = parts[0], parts[1:]
 
-    if not url.startswith(("http://", "https://")) or detect_site(url) != "apple":
-        await message.answer(t("trackpickup_invalid_url", lang), parse_mode="HTML")
-        return
+        if not url.startswith(("http://", "https://")) or detect_site(url) != "apple":
+            await message.answer(t("trackpickup_invalid_url", lang), parse_mode="HTML")
+            return
 
-    # Reuses the admin's existing site-lock control (the same one
-    # check_can_add_item enforces for /add) directly rather than that whole
-    # function, which also enforces the REGULAR products table's max_items —
-    # pickup tracking is a separate, unlimited-for-now feature, so only the
-    # site-lock half applies here.
-    if is_site_locked("apple", user_id):
-        await message.answer(
-            t("store_locked", lang, site=get_site_label("apple")), parse_mode="HTML"
-        )
-        return
-
-    for pincode in pincodes:
-        if not pincode.isdigit() or len(pincode) != 6:
+        # Reuses the admin's existing site-lock control (the same one
+        # check_can_add_item enforces for /add) directly rather than that
+        # whole function, which also enforces the REGULAR products table's
+        # max_items — pickup tracking is a separate, unlimited-for-now
+        # feature, so only the site-lock half applies here.
+        if is_site_locked("apple", user_id):
             await message.answer(
-                t("trackpickup_invalid_pincode", lang, pincode=pincode), parse_mode="HTML"
+                t("store_locked", lang, site=get_site_label("apple")), parse_mode="HTML"
             )
             return
 
-    try:
-        resp = await fetch_page(url, render_js=apple_checker.NEEDS_JS, timeout=30.0)
-        resp.raise_for_status()
-        html_text = resp.text
+        for pincode in pincodes:
+            if not pincode.isdigit() or len(pincode) != 6:
+                await message.answer(
+                    t("trackpickup_invalid_pincode", lang, pincode=pincode), parse_mode="HTML"
+                )
+                return
+
+        try:
+            resp = await fetch_page(url, render_js=apple_checker.NEEDS_JS, timeout=30.0)
+            resp.raise_for_status()
+            html_text = resp.text
+        except Exception as exc:
+            logger.error(f"[trackpickup] product page fetch failed for {url!r}: {exc}")
+            await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
+            return
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        sku = apple_checker._extract_sku(soup, html_text)
+        if not sku:
+            await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
+            return
+
+        name = apple_checker._extract_product_name(soup) or _auto_name(url, "apple")
+
+        ok, msg = add_pickup_tracking(user_id, name, url, sku, pincodes)
+        if ok:
+            await message.answer(
+                t("trackpickup_added", lang, name=name, pincodes=", ".join(pincodes)),
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(f"⚠️ {msg}")
     except Exception as exc:
-        logger.error(f"[trackpickup] product page fetch failed for {url!r}: {exc}")
-        await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
-        return
-
-    soup = BeautifulSoup(html_text, "html.parser")
-    sku = apple_checker._extract_sku(soup, html_text)
-    if not sku:
-        await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
-        return
-
-    name = apple_checker._extract_product_name(soup) or _auto_name(url, "apple")
-
-    ok, msg = add_pickup_tracking(user_id, name, url, sku, pincodes)
-    if ok:
-        await message.answer(
-            t("trackpickup_added", lang, name=name, pincodes=", ".join(pincodes)),
-            parse_mode="HTML",
-        )
-    else:
-        await message.answer(f"⚠️ {msg}")
+        logger.error(f"[trackpickup] unexpected error for user {user_id}: {exc}", exc_info=True)
+        try:
+            await message.answer(t("unexpected_error", lang), parse_mode="HTML")
+        except Exception:
+            pass  # even the error reply failed (e.g. user blocked the bot) — nothing more to do

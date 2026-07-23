@@ -1440,4 +1440,15 @@ _T: dict[str, dict[str, str]] = {
                      "📦 <b>{name}</b>\n"
                      "Pincode <b>{pincode}</b> ની નજીક:\n\n{stores_block}"),
     },
+
+    # ── Generic fallback for an unanticipated handler-level exception ─────────
+    "unexpected_error": {
+        "en": "⚠️ Something went wrong while processing that. Please try again in a moment — if it keeps happening, let the admin know.",
+        "hi": "⚠️ इसे process करते समय कुछ गड़बड़ हो गई। कृपया थोड़ी देर बाद फिर कोशिश करें — अगर बार-बार हो रहा है तो admin को बताएं।",
+        "hinglish": "⚠️ Isse process karte waqt kuch gadbad ho gayi. Thodi der baad phir try karo — agar baar-baar ho raha hai to admin ko batao.",
+        "punjabi": "⚠️ Eh process karde waqt kujh gadbad ho gayi ji. Thodi der baad fer try karo — je vaar-vaar ho reha hai taan admin nu dasso.",
+        "haryanvi": "⚠️ ये process करदे टेम कुछ गड़बड़ होगी। थोड़ी देर बाद फेर ट्राई कर — जै बार-बार होरया सै तो admin नै बता दे।",
+        "tamil": "⚠️ இதை process செய்யும்போது ஏதோ தவறு ஏற்பட்டது. சிறிது நேரம் கழித்து மீண்டும் முயற்சிக்கவும் — தொடர்ந்து நடந்தால் admin-க்குத் தெரியப்படுத்துங்கள்.",
+        "gujarati": "⚠️ આ process કરતી વખતે કંઈક ખોટું થયું. થોડી વાર પછી ફરી પ્રયત્ન કરો — જો વારંવાર થાય તો admin ને જણાવો.",
+    },
 }
