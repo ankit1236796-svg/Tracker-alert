@@ -34,18 +34,18 @@ SHARE_TRIAL_ROUNDS_REQUIRED = int(os.getenv("SHARE_TRIAL_ROUNDS_REQUIRED", "5"))
 SHARE_TRIAL_TAP_DELAY_SECONDS = int(os.getenv("SHARE_TRIAL_TAP_DELAY_SECONDS", "10"))
 
 # Sites whose results are confirmed unreliable enough that AUTOMATIC alerts
-# must be suppressed until root-caused and fixed — added after Croma was
-# observed flipping between correct and fully-inverted results across two
-# manual checks ~8-9 minutes apart, for the same tracked products (the old
-# HTML-scraping checker). Manual /check still runs and shows a result, but
-# with an explicit reliability warning (see handlers.py) rather than
-# silently trusting it. checkers/croma.py's checker has SINCE been
-# replaced entirely with Croma's own internal inventory API (a structured
-# JSON response, not the page-text heuristics that caused the original
-# flip-flopping) — but "croma" is deliberately still left in this set
-# until that new checker has been validated against real traffic; remove
-# it here once it has (see SUPPORTED_SITES' Croma comment below).
-UNRELIABLE_SITES = {"croma"}
+# must be suppressed until root-caused and fixed — Croma was here after
+# being observed flipping between correct and fully-inverted results
+# across two manual checks ~8-9 minutes apart, for the same tracked
+# products (the old HTML-scraping checker). Manual /check still runs and
+# shows a result, but with an explicit reliability warning (see
+# handlers.py) rather than silently trusting it. Removed once a site's
+# checker is fixed AND validated against real traffic — Croma's checker
+# was replaced entirely with Croma's own internal inventory API (see
+# SUPPORTED_SITES' Croma comment below) and manually verified accurate
+# against the live site for both in-stock and out-of-stock cases, so it's
+# no longer listed here; automatic "back in stock" alerts fire for it again.
+UNRELIABLE_SITES = set()
 
 # Playwright settings
 PLAYWRIGHT_HEADLESS = True
@@ -103,11 +103,9 @@ SCRAPING_PROVIDER = os.getenv("SCRAPING_PROVIDER", "zyte").strip().lower()
 # own free internal inventory API (checkers.croma.check_via_api) — a
 # structured JSON response, not page-text/DOM heuristics, so the specific
 # failure mode above (an HTML-signal guess quietly going wrong) no longer
-# applies the same way. Deliberately still left in UNRELIABLE_SITES below
-# for now, though: the new checker hasn't been validated against real
-# production traffic yet, so automatic "back in stock" alerts stay
-# suppressed (manual /check still works, with the reliability warning)
-# until that's confirmed — remove "croma" from UNRELIABLE_SITES once it is.
+# applies the same way. Manually verified accurate against the live site
+# for both in-stock and out-of-stock cases, so it's no longer in
+# UNRELIABLE_SITES above either — automatic alerts are back on.
 SUPPORTED_SITES = {
     "amazon":          ["amazon.in", "amazon.com"],
     "flipkart":        ["flipkart.com"],
