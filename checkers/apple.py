@@ -202,47 +202,44 @@ def _build_fulfillment_target(sku: str, pincode: str) -> str:
     return f"{_FULFILLMENT_URL}?{urlencode(params)}"
 
 
-async def _fetch_pickup_availability(sku: str, pincode: str) -> dict | None:
+async def _fetch_pickup_availability_attempt(
+    target: str, *, render_js: bool, super_proxy: bool, method_label: str,
+) -> dict | None:
     """
-    Calls Apple's public fulfillment-messages API. Returns the raw parsed
-    JSON, or None on any failure (network error, non-200, non-JSON response —
-    e.g. a block/challenge page). Never raises; the caller falls back to the
-    generic page-based check() on None.
+    One attempt at the fulfillment-messages call at a given render/proxy
+    tier. Returns the parsed JSON on success, None on any failure (network
+    error, non-200, non-JSON response) — logs enough detail (exception
+    type/message/status/body if available, or HTTP status/body, or the raw
+    non-JSON text) to diagnose exactly what went wrong for THIS tier.
+    Factored out of _fetch_pickup_availability so its render_js=True ->
+    super_proxy=True escalation doesn't duplicate this logic per tier.
     """
-    target = _build_fulfillment_target(sku, pincode)
-    # render_js=False: this is a JSON API endpoint, not a page needing a
-    # headless-browser render (same reasoning as Blinkit's autoSuggest/info
-    # calls) — and every working third-party implementation calls it cold,
-    # with no special headers/cookies required.
-    logger.info(f"[apple][resolve] fulfillment-messages target={target!r}")
-
     try:
-        resp = await fetch_page(target, render_js=False, timeout=_FULFILLMENT_TIMEOUT, site="apple")
+        resp = await fetch_page(
+            target, render_js=render_js, super_proxy=super_proxy,
+            timeout=_FULFILLMENT_TIMEOUT, site="apple",
+        )
     except Exception as exc:
-        # Previously just logged str(exc), which is empty/unhelpful for many
-        # httpx exception types (e.g. bare ConnectTimeout) — made it
-        # impossible to tell a DNS failure from a TLS error from a Zyte/
-        # Scrape.do-side problem. Now logs the exception TYPE (always
-        # present, unlike the message), the message, status code + response
-        # body IF the exception happens to carry a `.response` (most
-        # network-level errors raised before a response was ever received
-        # won't — e.g. ConnectError/ConnectTimeout/ReadTimeout — but an
-        # httpx.HTTPStatusError or similar would), and the full traceback
-        # via exc_info=True so the exact failing call site is visible.
+        # Logs the exception TYPE (always present, unlike the message,
+        # which is empty for many httpx exceptions like a bare
+        # ConnectTimeout), status code + response body IF the exception
+        # happens to carry a `.response`, and the full traceback via
+        # exc_info=True so the exact failing call site is visible.
         exc_response = getattr(exc, "response", None)
         status_part = f" http_status={exc_response.status_code}" if exc_response is not None else ""
         body_part = f" response_body={exc_response.text[:300]!r}" if exc_response is not None else ""
         logger.warning(
-            f"[apple][resolve] fulfillment-messages request failed: "
+            f"[apple][resolve] fulfillment-messages ({method_label}) request failed: "
             f"{type(exc).__name__}: {exc}{status_part}{body_part}",
             exc_info=True,
         )
         return None
 
-    logger.info(f"[apple][resolve] fulfillment-messages status={resp.status_code}")
+    logger.info(f"[apple][resolve] fulfillment-messages ({method_label}) status={resp.status_code}")
     if resp.status_code != 200:
         logger.warning(
-            f"[apple][resolve] fulfillment-messages HTTP {resp.status_code}: {resp.text[:200]!r}"
+            f"[apple][resolve] fulfillment-messages ({method_label}) HTTP "
+            f"{resp.status_code}: {resp.text[:200]!r}"
         )
         return None
 
@@ -250,12 +247,55 @@ async def _fetch_pickup_availability(sku: str, pincode: str) -> dict | None:
         data = resp.json()
     except Exception:
         logger.warning(
-            f"[apple][resolve] fulfillment-messages non-JSON response "
+            f"[apple][resolve] fulfillment-messages ({method_label}) non-JSON response "
             f"(likely a block/challenge page): {resp.text[:300]!r}"
         )
         return None
 
     return data
+
+
+async def _fetch_pickup_availability(sku: str, pincode: str) -> tuple[dict | None, str | None]:
+    """
+    Calls Apple's public fulfillment-messages API. Returns (data, method)
+    where method is "render" or "super_proxy" — whichever tier actually
+    succeeded — or (None, None) if both failed. Never raises; callers that
+    only need the data can unpack as `data, _ = await ...`; the caller
+    falls back to the generic page-based check() on data=None.
+
+    Was a single plain (render_js=False) request — confirmed via real
+    /debugpickup runs to CONSISTENTLY time out (SKU extraction itself was
+    correct, e.g. MXWV3HN/A, but the API call hung every time), strongly
+    suggesting Apple's bot-protection silently stalls requests that don't
+    look like a real browser rather than rejecting them outright with a
+    clean error. Switched to the SAME render_js=True -> super_proxy=True
+    escalation that fixed OnePlus/RelianceDigital's blocking (see
+    stock_checker.py's _JS_SITES / _SUPER_PROXY_FALLBACK_SITES) — even
+    though this is a JSON API endpoint rather than an HTML page, Scrape.do/
+    Zyte's browser tier makes the outbound request look like a real browser
+    navigation, which is what's actually being selected for/against here,
+    not the response's content type.
+    """
+    target = _build_fulfillment_target(sku, pincode)
+    logger.info(f"[apple][resolve] fulfillment-messages target={target!r}")
+
+    data = await _fetch_pickup_availability_attempt(
+        target, render_js=True, super_proxy=False, method_label="render",
+    )
+    if data is not None:
+        return data, "render"
+
+    logger.warning(
+        "[apple][resolve] fulfillment-messages render_js=True attempt failed — "
+        "retrying with super_proxy=True (Scrape.do/Zyte's premium proxy tier)"
+    )
+    data = await _fetch_pickup_availability_attempt(
+        target, render_js=True, super_proxy=True, method_label="super_proxy",
+    )
+    if data is not None:
+        return data, "super_proxy"
+
+    return None, None
 
 
 def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
@@ -458,7 +498,7 @@ async def check_pickup_row(bot, row: dict) -> dict:
     results: dict[str, list[dict]] = {}
     for pincode in row["pincodes"]:
         try:
-            data = await _fetch_pickup_availability(row["sku"], pincode)
+            data, _method = await _fetch_pickup_availability(row["sku"], pincode)
         except Exception as exc:
             logger.error(
                 f"[apple][pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
@@ -510,7 +550,7 @@ async def refine_with_pincode(
         )
         return generic_result
 
-    data = await _fetch_pickup_availability(sku, pincode)
+    data, _method = await _fetch_pickup_availability(sku, pincode)
     if data is None:
         return generic_result
 

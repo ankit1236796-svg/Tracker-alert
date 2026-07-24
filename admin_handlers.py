@@ -2351,17 +2351,24 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
     await _debug_send(message, f"✅ Extracted SKU: {sku!r}")
 
     target = apple._build_fulfillment_target(sku, pincode)
-    await _debug_send(message, f"🔍 Calling fulfillment-messages API for pincode {pincode}:\n{target}")
+    await _debug_send(
+        message,
+        f"🔍 Calling fulfillment-messages API for pincode {pincode} — tries "
+        f"render_js=True first, then super_proxy=True if that fails "
+        f"(see checkers/apple.py's _fetch_pickup_availability):\n{target}",
+    )
 
-    data = await apple._fetch_pickup_availability(sku, pincode)
+    data, method = await apple._fetch_pickup_availability(sku, pincode)
     if data is None:
         await _debug_send(
             message,
-            "⚠️ fulfillment-messages API call failed, returned a non-200 status, or "
-            "returned a non-JSON response (likely a block/challenge page) — see "
-            "Railway logs for the exact status/body.",
+            "⚠️ fulfillment-messages API call failed on BOTH the render_js=True "
+            "and super_proxy=True attempts — see Railway logs for the exact "
+            "exception/status/body from each tier.",
         )
         return
+
+    await _debug_send(message, f"✅ Succeeded via method={method!r}")
 
     raw_json = json.dumps(data, indent=2)
     await _debug_send(message, f"Raw JSON response ({len(raw_json)} chars, sending in full):")
