@@ -115,7 +115,16 @@ def check(soup: BeautifulSoup, html: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _FULFILLMENT_URL = "https://www.apple.com/in/shop/fulfillment-messages"
-_FULFILLMENT_TIMEOUT = 20.0
+# Was 20.0 — real-world /mypickups + background-cycle logs (see the
+# improved error logging added in the prior round) showed httpx.ReadTimeout
+# failures against this endpoint, meaning Apple's fulfillment-messages API
+# is sometimes slower to respond than 20s allows. Bumped to 30s (the top of
+# the 20-30s range that seemed reasonable) to give real headroom rather
+# than nudging by a couple of seconds — a slow-but-successful response is
+# still strictly better than a guaranteed timeout. This only affects THIS
+# one API call's own timeout; every other checker's fetch_page timeout is
+# untouched.
+_FULFILLMENT_TIMEOUT = 30.0
 
 # Apple part numbers ("SKUs") are alphanumeric, always ending in a 2-letter
 # country code + "/A" (e.g. "MG6M4HN/A" for India). Matched generically rather
