@@ -210,7 +210,24 @@ async def _fetch_pickup_availability(sku: str, pincode: str) -> dict | None:
     try:
         resp = await fetch_page(target, render_js=False, timeout=_FULFILLMENT_TIMEOUT, site="apple")
     except Exception as exc:
-        logger.warning(f"[apple][resolve] fulfillment-messages request failed: {exc}")
+        # Previously just logged str(exc), which is empty/unhelpful for many
+        # httpx exception types (e.g. bare ConnectTimeout) — made it
+        # impossible to tell a DNS failure from a TLS error from a Zyte/
+        # Scrape.do-side problem. Now logs the exception TYPE (always
+        # present, unlike the message), the message, status code + response
+        # body IF the exception happens to carry a `.response` (most
+        # network-level errors raised before a response was ever received
+        # won't — e.g. ConnectError/ConnectTimeout/ReadTimeout — but an
+        # httpx.HTTPStatusError or similar would), and the full traceback
+        # via exc_info=True so the exact failing call site is visible.
+        exc_response = getattr(exc, "response", None)
+        status_part = f" http_status={exc_response.status_code}" if exc_response is not None else ""
+        body_part = f" response_body={exc_response.text[:300]!r}" if exc_response is not None else ""
+        logger.warning(
+            f"[apple][resolve] fulfillment-messages request failed: "
+            f"{type(exc).__name__}: {exc}{status_part}{body_part}",
+            exc_info=True,
+        )
         return None
 
     logger.info(f"[apple][resolve] fulfillment-messages status={resp.status_code}")
