@@ -371,6 +371,29 @@ def init_db():
         """)
         conn.commit()
 
+        # ── Apple official-store pickup auto-check (separate feature/table
+        # from pickup_tracking above — see checkers/apple.py's "official-
+        # store pickup checker" module note + bot.run_apple_official_
+        # pickup_cycle). Keyed by URL (not product_id/user_id): the 6
+        # official-store pincodes are FIXED/global, so every user tracking
+        # the identical apple.com URL shares ONE row/check per cycle
+        # instead of one per (user, product) pair — a deliberate cross-user
+        # dedup, since re-checking the same fixed pincodes once per tracker
+        # would multiply Scrape.do/Zyte cost for no additional information.
+        # sku is cached here after first successful extraction (mirrors
+        # pickup_tracking.sku) so steady-state cycles don't need a repeat
+        # product-page fetch just to re-derive it.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS apple_official_pickup_status (
+                url            TEXT    PRIMARY KEY,
+                sku            TEXT,
+                pincode_status TEXT    NOT NULL DEFAULT '{}',
+                last_checked   TEXT,
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+
         # Migration: every pre-existing user (found via products/pin_codes) who
         # doesn't yet have a `users` row is switched into the access-control
         # system "as if their trial just ended" — access_until = now, giving
@@ -1067,6 +1090,64 @@ def remove_pickup_tracking(user_id: int, tracking_id: int) -> bool:
         )
         conn.commit()
     return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Apple official-store pickup auto-check (see apple_official_pickup_status
+# table above — a separate feature/table from pickup_tracking, keyed by
+# URL rather than user_id/id, for the cross-user dedup reasoning in that
+# table's own comment).
+# ---------------------------------------------------------------------------
+
+def get_apple_official_pickup_status(url: str) -> dict | None:
+    """Returns {'url', 'sku', 'pincode_status' (decoded dict),
+    'last_checked', 'created_at'} for one tracked Apple product URL, or
+    None if it's never been seen before."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM apple_official_pickup_status WHERE url = ?", (url,)
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    try:
+        d["pincode_status"] = json.loads(d["pincode_status"])
+    except (TypeError, ValueError):
+        d["pincode_status"] = {}
+    return d
+
+
+def upsert_apple_official_pickup_status(
+    url: str, sku: str | None, pincode_status: dict, mark_checked: bool = True,
+) -> None:
+    """
+    Creates or updates the row for `url`. `sku` is only overwritten when a
+    non-None value is passed (so a transient re-extraction failure never
+    wipes out a previously cached SKU — mirrors get_or_create_user's own
+    "None never overwrites a stored value" convention). mark_checked sets
+    last_checked to now; pass False when persisting a status change
+    without this being a full pass over every pincode (not currently used,
+    kept for symmetry/future callers — the production caller always
+    passes the default True).
+    """
+    now = now_ist_str() if mark_checked else None
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT sku FROM apple_official_pickup_status WHERE url = ?", (url,)
+        ).fetchone()
+        final_sku = sku if sku is not None else (existing["sku"] if existing else None)
+        conn.execute(
+            """
+            INSERT INTO apple_official_pickup_status (url, sku, pincode_status, last_checked)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+                sku = excluded.sku,
+                pincode_status = excluded.pincode_status,
+                last_checked = COALESCE(excluded.last_checked, apple_official_pickup_status.last_checked)
+            """,
+            (url, final_sku, json.dumps(pincode_status), now),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------

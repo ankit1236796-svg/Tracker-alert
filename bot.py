@@ -8,10 +8,14 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from bs4 import BeautifulSoup
 
 from access import AccessControlMiddleware, compute_access, STATUS_TRIAL, STATUS_LOCKED
 from admin_handlers import router as admin_router
-from config import BOT_TOKEN, CHECK_INTERVAL, ADMIN_USER_ID, ACCESS_CHECK_INTERVAL, REMINDER_HOURS_BEFORE_EXPIRY
+from config import (
+    BOT_TOKEN, CHECK_INTERVAL, ADMIN_USER_ID, ACCESS_CHECK_INTERVAL, REMINDER_HOURS_BEFORE_EXPIRY,
+    APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
+)
 from database import (
     init_db,
     get_all_products,
@@ -23,6 +27,8 @@ from database import (
     is_service_paused,
     list_paused_user_ids,
     get_all_pickup_tracking,
+    get_apple_official_pickup_status,
+    upsert_apple_official_pickup_status,
 )
 from handlers import router
 from notifications import (
@@ -30,9 +36,10 @@ from notifications import (
     should_alert_for_price,
     send_expiry_reminder,
     send_data_purged_notice,
+    send_pickup_alert,
 )
 from stock_checker import check_stock
-from checkers import apple as apple_checker
+from checkers import apple as apple_checker, fetch_page
 from url_normalize import product_group_key
 
 logging.basicConfig(
@@ -235,6 +242,115 @@ async def run_pickup_check_cycle(bot: Bot) -> dict:
     return {"tracked": len(rows)}
 
 
+# ---------------------------------------------------------------------------
+# Apple official-store pickup auto-check (checkers.apple.
+# check_pickup_at_official_stores + database.apple_official_pickup_status)
+# — a THIRD, separate Apple signal, distinct from both the generic
+# check()-based alert above and the opt-in /trackpickup system. Runs
+# automatically for every /add-tracked apple.com product, checking the 6
+# fixed official-store pincodes (config.APPLE_PICKUP_PINCODES) rather than
+# any user-chosen ones. See config.py's own module note on all three.
+# ---------------------------------------------------------------------------
+
+async def _check_apple_official_pickup_group(bot: Bot, url: str, rows: list[dict]) -> None:
+    """
+    Checks one distinct Apple product URL (shared across every user
+    tracking that exact URL — see apple_official_pickup_status's own
+    table comment for why this is keyed by URL, not per-user/per-row) and
+    fans out any new-availability notification to every one of those
+    users. `rows` is never empty (only called with a real group).
+    """
+    cached = get_apple_official_pickup_status(url)
+    sku = cached["sku"] if cached else None
+
+    if not sku:
+        try:
+            resp = await fetch_page(url, render_js=apple_checker.NEEDS_JS, timeout=30.0, site="apple")
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            sku = apple_checker._extract_sku(soup, resp.text)
+        except Exception as exc:
+            logger.error(f"[apple][official-stores] product page fetch/SKU extraction failed for {url!r}: {exc}")
+            return
+        if not sku:
+            logger.warning(f"[apple][official-stores] could not extract a SKU from {url!r} — skipping this cycle")
+            return
+
+    try:
+        results = await apple_checker.check_pickup_at_official_stores(sku, APPLE_PICKUP_PINCODES)
+    except Exception as exc:
+        logger.error(f"[apple][official-stores] check failed for {url!r} sku={sku!r}: {exc}")
+        return
+
+    prior_status: dict = cached["pincode_status"] if cached else {}
+    new_status = dict(prior_status)
+    representative_name = rows[0]["name"]
+
+    for pincode in APPLE_PICKUP_PINCODES:
+        if pincode not in results:
+            continue  # this pincode's request failed this cycle — leave its prior status untouched
+        stores = results[pincode]
+        now_available = bool(stores)
+        was_available = bool(prior_status.get(pincode, False))
+        new_status[pincode] = now_available
+
+        if now_available and not was_available:
+            logger.info(
+                f"[apple][official-stores] {url!r} pincode={pincode!r} "
+                f"({', '.join(s['store_name'] for s in stores)}) transitioned to available"
+            )
+            if APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED:
+                for row in rows:
+                    try:
+                        await send_pickup_alert(bot, row["user_id"], representative_name, pincode, stores)
+                    except Exception as exc:
+                        logger.error(
+                            f"[apple][official-stores] alert failed for user {row['user_id']} "
+                            f"url={url!r} pincode={pincode!r}: {exc}"
+                        )
+            else:
+                logger.info(
+                    "[apple][official-stores] alert suppressed — "
+                    "config.APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED is False"
+                )
+
+    upsert_apple_official_pickup_status(url, sku, new_status)
+
+
+async def run_apple_official_pickup_cycle(bot: Bot) -> dict:
+    """
+    One check pass across every /add-tracked apple.com product's fixed 6
+    official-store pincodes (all users, cross-user-deduplicated by exact
+    URL — see _check_apple_official_pickup_group). Same pause semantics as
+    every other cycle: a global pause skips entirely; individually-paused
+    users' rows are excluded before grouping.
+    """
+    if is_service_paused():
+        logger.info("[apple][official-stores] service globally paused — skipping this check cycle entirely")
+        return {"products": 0, "groups": 0, "paused": True}
+
+    products = [p for p in get_all_products() if p["site"] == "apple"]
+    paused_user_ids = set(list_paused_user_ids())
+    if paused_user_ids:
+        products = [p for p in products if p["user_id"] not in paused_user_ids]
+
+    if not products:
+        return {"products": 0, "groups": 0}
+
+    groups: dict[str, list[dict]] = {}
+    for product in products:
+        groups.setdefault(product["url"], []).append(product)
+
+    sem = asyncio.Semaphore(10)
+
+    async def _bounded(url, rows):
+        async with sem:
+            await _check_apple_official_pickup_group(bot, url, rows)
+
+    await asyncio.gather(*[_bounded(url, rows) for url, rows in groups.items()])
+    return {"products": len(products), "groups": len(groups)}
+
+
 async def stock_checker_loop(bot: Bot):
     """
     Runs on a fixed CHECK_INTERVAL period measured from the start of each cycle,
@@ -247,10 +363,12 @@ async def stock_checker_loop(bot: Bot):
     For Amazon items with a target_price, only alerts when price ≤ target.
 
     Also runs run_pickup_check_cycle (Apple Store pickup-availability
-    tracking — a separate feature/table, see database.pickup_tracking) on
-    this SAME interval right after the regular stock check, rather than on
-    its own timer — simplest way to satisfy "the existing check-cycle
-    interval" without adding a second background loop.
+    tracking — a separate feature/table, see database.pickup_tracking) and
+    run_apple_official_pickup_cycle (the fixed-6-official-store auto-check,
+    a further separate feature/table — see database.
+    apple_official_pickup_status) on this SAME interval right after the
+    regular stock check, rather than on their own timers — simplest way to
+    satisfy "the existing check-cycle interval" without extra background loops.
     """
     logger.info("Stock checker loop started.")
     while True:
@@ -263,6 +381,10 @@ async def stock_checker_loop(bot: Bot):
             await run_pickup_check_cycle(bot)
         except Exception as exc:
             logger.error(f"Pickup checker cycle error: {exc}")
+        try:
+            await run_apple_official_pickup_cycle(bot)
+        except Exception as exc:
+            logger.error(f"Apple official-store pickup cycle error: {exc}")
 
         # Sleep only the remainder of CHECK_INTERVAL, measured from cycle start,
         # so total cycle time ≈ CHECK_INTERVAL instead of checking_time + CHECK_INTERVAL.
