@@ -32,7 +32,10 @@ from checkers import (
     sangeethamobiles, vijaysales, tataneu, iqoo, vivo, croma,
     CHECKER_MAP,
 )
-from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER
+from config import (
+    ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER,
+    APPLE_PICKUP_PINCODES, APPLE_PICKUP_STORE_LABELS, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
+)
 from database import (
     IST,
     now_ist_str,
@@ -2875,3 +2878,86 @@ async def cmd_debugcroma(message: Message, command: CommandObject):
         f"(promise.suggestedOption.option.promiseLines.promiseLine "
         f"{'non-empty' if result else 'empty/missing'} for pincode {pincode!r})",
     )
+
+
+# ---------------------------------------------------------------------------
+# /debugapplestores — verify checkers/apple.py's official-store pickup
+# checker (checkers.apple.check_pickup_at_official_stores) against a real
+# tracked Apple product URL, across all 6 fixed config.APPLE_PICKUP_PINCODES
+# — no pincode argument needed, unlike /debugpickup. This is a THIRD,
+# separate Apple signal from /debugpickup (the opt-in /trackpickup system's
+# checker) — see checkers/apple.py's "official-store pickup checker"
+# module note for how the three don't overlap. Exists specifically so
+# real-world accuracy can be verified before
+# config.APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED is turned on. NOT wired into
+# CHECKER_MAP or gated by CHECKER_MAP at all. Safe to delete once no
+# longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_APPLE_STORES_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter — this calls Apple's fulfillment-messages API 6
+# times (once per official store) for an arbitrary caller-supplied URL.
+
+
+@router.message(Command("debugapplestores"))
+async def cmd_debugapplestores(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_APPLE_STORES_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugapplestores &lt;apple_url&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    url = command.args.strip().split()[0]
+
+    await _debug_send(message, f"🔍 Fetching product page (render={apple.NEEDS_JS}): {url}")
+    try:
+        resp = await fetch_page(url, render_js=apple.NEEDS_JS, timeout=30.0)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Product page fetch failed: {exc}")
+        return
+
+    soup = BeautifulSoup(html, "html.parser")
+    sku = apple._extract_sku(soup, html)
+    if not sku:
+        await _debug_send(
+            message,
+            "⚠️ Could not extract a SKU/part number from this page — cannot "
+            "call the fulfillment-messages API without one.",
+        )
+        return
+    await _debug_send(message, f"✅ Extracted SKU: {sku!r}")
+
+    await _debug_send(
+        message,
+        f"🔍 Checking pickup availability across all {len(APPLE_PICKUP_PINCODES)} "
+        f"official-store pincodes: {', '.join(APPLE_PICKUP_PINCODES)}\n"
+        f"(alerts currently {'ENABLED' if APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED else 'DISABLED'} "
+        f"via config.APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED)",
+    )
+
+    try:
+        results = await apple.check_pickup_at_official_stores(sku, APPLE_PICKUP_PINCODES)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ check_pickup_at_official_stores crashed unexpectedly: {exc}")
+        return
+
+    lines = []
+    for pincode in APPLE_PICKUP_PINCODES:
+        label = APPLE_PICKUP_STORE_LABELS.get(pincode, pincode)
+        if pincode not in results:
+            lines.append(f"⚠️ {pincode} ({label}): request failed — see Railway logs")
+            continue
+        stores = results[pincode]
+        if stores:
+            store_desc = "; ".join(
+                f"{s['store_name']}" + (f" ({s['location']})" if s.get("location") else "")
+                for s in stores
+            )
+            lines.append(f"✅ {pincode} ({label}): AVAILABLE — {store_desc}")
+        else:
+            lines.append(f"❌ {pincode} ({label}): not available")
+    await _debug_send(message, "\n".join(lines))

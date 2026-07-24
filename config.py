@@ -186,3 +186,58 @@ WHATSAPP_FORWARDER_URL = os.getenv("WHATSAPP_FORWARDER_URL", "").rstrip("/")
 # Shared secret the bot sends as a Bearer token on every forward request; must
 # match the same value configured on the whatsapp_forwarder service.
 WHATSAPP_FORWARDER_SECRET = os.getenv("WHATSAPP_FORWARDER_SECRET", "")
+
+# ---------------------------------------------------------------------------
+# Apple official-store pickup-availability auto-check (checkers/apple.py's
+# check_pickup_at_official_stores + bot.run_apple_official_pickup_cycle) —
+# a THIRD, separate Apple signal from the two that already exist:
+#   1. checkers.apple.check() — the generic Add-to-Bag/JSON-LD page checker
+#      (CHECKER_MAP, runs for every /add-tracked apple.com product).
+#   2. checkers.apple.refine_with_pincode() — confirms in-stock via the
+#      fulfillment-messages API for the USER'S OWN saved primary pincode
+#      only (stock_checker.check_stock()'s site=="apple" branch).
+#   3. THIS feature — automatically checks all 6 fixed official Apple
+#      Store pincodes below for every /add-tracked apple.com product
+#      (no user opt-in/pincode selection involved, unlike the separate
+#      /trackpickup + pickup_tracking system, which lets a user track
+#      pincodes of their own choosing). Reports which specific store(s)
+#      show pickup available.
+# These three don't interfere with each other; this one is purely additive.
+#
+# Fixed list of India's 6 physical Apple Store pincodes as of this writing
+# (confirmed via WebSearch cross-referencing apple.com/in/retail/storelist/
+# and each store's own listing — including 201301 for Apple Noida,
+# specifically double-checked). Override via env var (comma-separated) if a
+# new store opens or one of these needs correcting; no code change needed.
+APPLE_PICKUP_PINCODES = [
+    p.strip() for p in os.getenv(
+        "APPLE_PICKUP_PINCODES", "110017,400051,400066,560092,411001,201301"
+    ).split(",") if p.strip()
+]
+
+# Pincode -> human-readable store label, for reporting when Apple's own
+# fulfillment-messages response doesn't include a usable storeName for a
+# given pincode (e.g. zero stores returned there) — lets a report/log line
+# still say WHICH of the 6 official stores a pincode corresponds to.
+APPLE_PICKUP_STORE_LABELS = {
+    "110017": "Apple Saket, New Delhi",
+    "400051": "Apple BKC, Mumbai",
+    "400066": "Apple Borivali, Mumbai",
+    "560092": "Apple Hebbal, Bengaluru",
+    "411001": "Apple Koregaon Park, Pune",
+    "201301": "Apple Noida",
+}
+
+# Feature-scoped alert gate — NOT config.UNRELIABLE_SITES, which would also
+# suppress the two EXISTING, already-working Apple signals above (the
+# generic checker + single-pincode refinement). This flag gates ONLY this
+# new feature's own notifications: the check still RUNS every cycle either
+# way (so accuracy can be watched via Railway logs / /debugapplestores),
+# but send_pickup_alert is only actually called once this is explicitly
+# turned on — defaults to disabled until manually verified against real
+# store data, per how Croma's own rollout was gated (there, via
+# UNRELIABLE_SITES; here, via a dedicated flag instead, since that
+# mechanism is scoped to a whole SITE, not one feature within a site).
+APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED = os.getenv(
+    "APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes")

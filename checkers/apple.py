@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -678,3 +679,113 @@ async def refine_with_pincode(
         return generic_result
 
     return pincode_result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Official-store pickup checker (checkers.apple.check_pickup_at_official_
+# stores + bot.run_apple_official_pickup_cycle) — a THIRD, separate Apple
+# signal from check()/refine_with_pincode() above. Checks the SAME
+# fulfillment-messages endpoint, but against a FIXED list of India's 6
+# physical Apple Store pincodes (config.APPLE_PICKUP_PINCODES) for every
+# /add-tracked apple.com product automatically — unlike refine_with_pincode
+# (the user's own single saved pincode only) or the separate opt-in
+# /trackpickup system (user-chosen pincodes, requires a command to set up).
+#
+# Deliberately uses a PLAIN GET via checkers.common.fetch_page — NOT the
+# navigate-then-fetch-within-session workaround _fetch_pickup_availability
+# above uses. That workaround exists because a plain GET was found to
+# consistently ReadTimeout via Zyte specifically; whether the same happens
+# via Scrape.do (checkers.common.fetch_page is provider-agnostic — see
+# config.SCRAPING_PROVIDER, currently "zyte" by default, so THIS runs
+# through Zyte too until that flag changes) is untested. If real logs show
+# this timing out the same way, the fix is the same one already proven
+# for _fetch_pickup_availability — reuse that approach here rather than
+# reinventing it.
+#
+# Endpoint/params as supplied for this task (a different param combination
+# than _build_fulfillment_target's above — fae/little/mts.0/mts.1/fts vs
+# fae/pl/mts.0 — both plausibly real variations of what Apple's storefront
+# sends in different contexts; kept as its own independent builder rather
+# than merged into the existing one, matching this being a separate,
+# additive feature). `location` as the pincode param name and 201301 for
+# Apple Noida were both independently confirmed via WebSearch cross-
+# referencing before this was implemented.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_OFFICIAL_STORE_TIMEOUT = 20.0
+
+
+def _build_official_store_fulfillment_url(sku: str, pincode: str) -> str:
+    params = {
+        "fae": "true",
+        "little": "false",
+        "parts.0": sku,
+        "mts.0": "regular",
+        "mts.1": "sticky",
+        "fts": "true",
+        "location": pincode,
+    }
+    return f"{_FULFILLMENT_URL}?{urlencode(params)}"
+
+
+async def _fetch_official_store_availability(sku: str, pincode: str) -> dict | None:
+    """
+    One plain GET (via checkers.common.fetch_page — Scrape.do or Zyte,
+    whichever config.SCRAPING_PROVIDER currently is) for one pincode.
+    Returns the parsed JSON on success, None on any failure (network
+    error, non-200, non-JSON — logged with enough detail to diagnose which
+    it was, same convention as _fetch_pickup_availability_attempt above).
+    Never raises.
+    """
+    target = _build_official_store_fulfillment_url(sku, pincode)
+    logger.info(f"[apple][official-stores] target={target!r}")
+    try:
+        resp = await fetch_page(target, render_js=False, timeout=_OFFICIAL_STORE_TIMEOUT, site="apple")
+    except Exception as exc:
+        exc_response = getattr(exc, "response", None)
+        status_part = f" http_status={exc_response.status_code}" if exc_response is not None else ""
+        body_part = f" response_body={exc_response.text[:300]!r}" if exc_response is not None else ""
+        logger.warning(
+            f"[apple][official-stores] pincode={pincode!r} request failed: "
+            f"{type(exc).__name__}: {exc}{status_part}{body_part}",
+            exc_info=True,
+        )
+        return None
+
+    logger.info(f"[apple][official-stores] pincode={pincode!r} status={resp.status_code}")
+    if resp.status_code != 200:
+        logger.warning(
+            f"[apple][official-stores] pincode={pincode!r} HTTP {resp.status_code}: "
+            f"{resp.text[:200]!r}"
+        )
+        return None
+
+    try:
+        return resp.json()
+    except Exception:
+        logger.warning(
+            f"[apple][official-stores] pincode={pincode!r} non-JSON response "
+            f"(likely a block/challenge page): {resp.text[:300]!r}"
+        )
+        return None
+
+
+async def check_pickup_at_official_stores(sku: str, pincodes: list[str]) -> dict[str, list[dict]]:
+    """
+    Checks `sku` against every pincode in `pincodes` (config.
+    APPLE_PICKUP_PINCODES in production) concurrently, returning
+    {pincode: [store dicts]} — the SAME shape checkers.apple.
+    check_pickup_row/available_stores_for_pickup already use, reused here
+    rather than a parallel parsing implementation. A pincode whose request
+    failed (see _fetch_official_store_availability) is simply absent from
+    the returned dict — the caller treats a missing key as "inconclusive
+    this cycle for that pincode", never as a confirmed "not available".
+    """
+    async def _one(pincode: str) -> tuple[str, list[dict] | None]:
+        data = await _fetch_official_store_availability(sku, pincode)
+        if data is None:
+            return pincode, None
+        return pincode, available_stores_for_pickup(data, sku)
+
+    results = await asyncio.gather(*[_one(p) for p in pincodes])
+    return {pincode: stores for pincode, stores in results if stores is not None}
