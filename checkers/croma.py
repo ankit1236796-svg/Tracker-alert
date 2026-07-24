@@ -1,305 +1,253 @@
-import json
+"""
+checkers/croma.py
+~~~~~~~~~~~~~~~~~~
+Croma's own internal inventory/order-promising API — a free, structured
+JSON endpoint (the request/response terminology — promiseLines,
+allocationRuleID, organizationCode, sourcingClassification — matches
+Oracle Order Management/Commerce conventions, consistent with Croma
+running on an Oracle Commerce-family stack) rather than scraping
+croma.com's product pages via Zyte/Scrape.do. REPLACES the previous
+HTML-scraping checker entirely — the old check() (JSON-LD/button/
+delivery-restriction text matching) is deleted, not kept alongside this.
+See config.py's SUPPORTED_SITES/UNRELIABLE_SITES history for why: the old
+scraper was pulled from production after being observed flipping between
+correct and fully-inverted results, then degrading to reporting every
+product OOS, with no root cause ever found.
+
+Endpoint / headers / payload shape as supplied directly for this task
+(presumably captured via real browser network inspection) — NOT
+independently re-verified against a live Croma request from this sandbox
+(no live network access to croma.com). See the itemID note below for the
+one part of this flow that IS a guess.
+
+  POST https://api.croma.com/inventory/oms/v2/tms/details-pwa/
+  Headers: accept, content-type, oms-apim-subscription-key (env
+  CROMA_APIM_KEY, defaults to the key supplied for this task — expected to
+  need rotation eventually, see check_via_api's 401/403 handling), origin,
+  referer.
+  Body: {"promise": {"allocationRuleID": "SYSTEM", "checkInventory": "Y",
+  "organizationCode": "CROMA", "sourcingClassification": "EC",
+  "promiseLines": {"promiseLine": [{"fulfillmentType": "HDEL",
+  "itemID": <id>, "lineId": "1", "requiredQty": "1",
+  "shipToAddress": {"zipCode": <pincode>}, "extn": {"widerStoreFlag": "N"}}]}}}
+
+Stock signal: promise.suggestedOption.option.promiseLines.promiseLine is a
+non-empty list -> deliverable/in stock at that pincode; empty or missing
+-> out of stock. Every level of this path is walked defensively
+(isinstance-guarded, tolerating a list where a dict is expected) rather
+than assuming a fixed shape — mirrors this codebase's established handling
+for other third-party JSON shapes seen to vary (e.g. checkers/apple.py's
+_sku_from_offers, added after a real "'list' object has no attribute
+'get'" crash on a similarly-shaped field).
+
+NOT confirmed (flagged explicitly, unlike the endpoint/payload/response-
+path above, which came directly from the task): how to derive `itemID`
+from a tracked Croma product URL. There is no existing extractor for
+Croma anywhere in this codebase (url_normalize.py's own comment already
+notes Croma's URL id pattern "wasn't verified to high confidence"). This
+module extracts it via a regex against the common `/p/<id>` trailing-
+path-segment convention seen across many Indian e-commerce storefronts —
+a BEST GUESS, not verified against a real croma.com URL from this
+sandbox. If real /debugcroma runs show tracked URLs don't match this
+pattern, extract_item_id() is the first place to fix.
+
+Does NOT go through checkers.common.fetch_page / zyte_client.py at all —
+a deliberate, direct httpx call, since this is Croma's own free
+public-facing API, not a scrape needing Zyte/Scrape.do. Consequently this
+checker spends ZERO Zyte/Scrape.do credits and is automatically absent
+from database.get_zyte_usage_summary's per-site breakdown (that table is
+only ever written to from inside zyte_client.fetch_page) — no
+credit-tracking code needed or touched for this.
+"""
+
 import logging
+import os
 import re
+
+import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-NEEDS_JS = True
+# This site does NOT participate in stock_checker._JS_SITES or go through
+# checkers.common.fetch_page at all — it owns its own direct HTTP call,
+# special-cased in stock_checker.check_stock() for "croma" (mirrors
+# checkers/shopatsc.py's own check_via_html special-case).
+NEEDS_JS = False
 
-_ADD_PATTERNS = ["add to cart", "buy now", "add to bag"]
+_INVENTORY_URL = "https://api.croma.com/inventory/oms/v2/tms/details-pwa/"
+_TIMEOUT = 10.0
 
-_DELIVERY_RESTRICTION_PATTERNS = [
-    "not available for your pincode",
-    "not available for your location",
-    "unfortunately not available for your location",
-    "unfortunately not available",
-]
+# Supplied directly for this task; may expire/rotate — see check_via_api's
+# 401/403 handling, which logs a clear "key needs to be refreshed" message
+# rather than silently guessing at stock status.
+_DEFAULT_APIM_KEY = "1131858141634e2abe2efb2b3a2a2a5d"
 
 
-def _normalized_text(soup: BeautifulSoup) -> str:
+def _apim_key() -> str:
+    # Read at call time (mirrors checkers/common.py's SCRAPEDO_KEY and
+    # zyte_client.py's ZYTE_API_KEY pattern) so a Railway env var change
+    # takes effect without an import-order dependency on this module's own
+    # import time.
+    return os.environ.get("CROMA_APIM_KEY", "").strip() or _DEFAULT_APIM_KEY
+
+
+# Best-guess extraction of Croma's product itemID from a tracked URL's
+# trailing "/p/<id>" path segment — see this module's docstring for why
+# this is flagged as unverified rather than confirmed.
+_ITEM_ID_RE = re.compile(r"/p/([A-Za-z0-9]+)(?:[/?#]|$)")
+
+
+def extract_item_id(url: str) -> str | None:
+    m = _ITEM_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _promise_lines(data: dict) -> list:
     """
-    Collapse the page's visible text into a single whitespace-normalized,
-    lowercased string. Croma often splits a phrase like "Not Available for
-    your pincode" across several sibling tags (e.g. separate <span>s), so a
-    plain substring check against soup.get_text() can miss it if get_text()
-    preserves the original inter-tag whitespace/newlines. Normalizing here
-    lets _DELIVERY_RESTRICTION_PATTERNS match regardless of markup structure.
+    Defensively walks promise -> suggestedOption -> option -> promiseLines
+    -> promiseLine, tolerating any intermediate level being a list instead
+    of a dict (or missing/None) rather than assuming a fixed shape and
+    crashing — see this module's docstring for why.
     """
-    return re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).lower()
+    promise = data.get("promise") if isinstance(data, dict) else None
+    if not isinstance(promise, dict):
+        return []
+
+    suggested = promise.get("suggestedOption")
+    if isinstance(suggested, list):
+        suggested = suggested[0] if suggested else None
+    if not isinstance(suggested, dict):
+        return []
+
+    option = suggested.get("option")
+    if isinstance(option, list):
+        option = option[0] if option else None
+    if not isinstance(option, dict):
+        return []
+
+    promise_lines = option.get("promiseLines")
+    if not isinstance(promise_lines, dict):
+        return []
+
+    lines = promise_lines.get("promiseLine")
+    if isinstance(lines, list):
+        return lines
+    if isinstance(lines, dict):
+        return [lines]
+    return []
 
 
-_OOS_PATTERNS = [
-    "out of stock", "sold out", "currently unavailable",
-    "notify me when available", "coming soon",
-]
-_CART_CLASSES = ["add-to-cart", "addToCart", "plp-add-to-cart"]
-
-
-# Class tokens that mark a button/anchor as DISABLED. A bare "disabled" or
-# "inactive" substring match catches most sites, but Croma's own OOS pages
-# were observed disabling Buy Now / Add to Cart via CSS class alone (e.g.
-# "disableBuyNow", "disableCartBtn") with no `disabled`/`aria-disabled` HTML
-# attribute present at all — so those exact tokens are listed explicitly too.
-# NOTE: Croma also has a *structural* hook class, "disable-btn-in-pdp", that
-# appears on the button wrapper regardless of stock state (i.e. it's present
-# on ACTIVE buttons too) — it is deliberately NOT included here. Matching a
-# bare "disable" substring would false-positive on that class and mark
-# in-stock products as OOS. If a future production log shows a genuinely
-# disabled button whose only signal is an unlisted class, add that class
-# explicitly rather than widening this to a generic "disable" substring.
-_DISABLED_CLASS_MARKERS = ("disabled", "inactive", "disablebuynow", "disablecartbtn")
-
-
-def _is_disabled(el) -> bool:
+async def check_via_api(url: str, pincode: str | None) -> bool | None:
     """
-    Return True if a BS4 element is visually/semantically disabled — via the
-    `disabled` attribute, `aria-disabled="true"`, or one of
-    _DISABLED_CLASS_MARKERS in its class list (see that constant's comment
-    for why "disable-btn-in-pdp" is deliberately excluded).
+    Sole production stock-check path for Croma, via its own internal
+    inventory/order-promising API (see this module's docstring for the
+    endpoint/payload/response details). Returns:
+      True  - promiseLine is a non-empty list: deliverable at this pincode.
+      False - promiseLine is empty/missing: a genuine, confirmed answer
+              from a real API response — not a guess.
+      None  - inconclusive: no pincode available, no itemID could be
+              extracted from the URL, the API key was rejected (401/403 —
+              logged clearly so it can be rotated), a network error/
+              timeout, or a non-JSON/unexpected response. Never raises;
+              the caller (stock_checker.check_stock()) must treat None as
+              "skip this update", the same convention every other
+              inconclusive-capable checker in this codebase follows (see
+              checkers/apple.py, checkers/inventstore.py).
     """
-    if el.get("disabled") is not None:
-        return True
-    if el.get("aria-disabled", "").lower() == "true":
-        return True
-    classes = " ".join(el.get("class", [])).lower()
-    return any(marker in classes for marker in _DISABLED_CLASS_MARKERS)
-
-
-def _offer_availability(offers) -> str:
-    """
-    Extract the first availability string from an 'offers' value that may be:
-      • a single Offer dict     {"availability": "https://schema.org/InStock"}
-      • an AggregateOffer dict  {"offers": [{"availability": "..."}], ...}
-      • a list of Offer dicts   [{"availability": "..."}, ...]
-    Returns "" when no availability can be found.
-    """
-    if isinstance(offers, dict):
-        avail = offers.get("availability", "")
-        if avail:
-            return str(avail)
-        nested = offers.get("offers", [])
-        if isinstance(nested, list):
-            for o in nested:
-                if isinstance(o, dict):
-                    a = o.get("availability", "")
-                    if a:
-                        return str(a)
-        elif isinstance(nested, dict):
-            a = nested.get("availability", "")
-            if a:
-                return str(a)
-    elif isinstance(offers, list):
-        for o in offers:
-            if isinstance(o, dict):
-                a = o.get("availability", "")
-                if a:
-                    return str(a)
-    return ""
-
-
-def _log_delivery_diagnostics(soup: BeautifulSoup, html: str) -> None:
-    """
-    Dump the decision trail to logs: delivery-restriction pattern hits (both
-    raw-HTML and normalized-visible-text), keyword scans, delivery/pincode-ish
-    elements, JSON-LD availability, OOS text matches, and buy/cart button
-    state (class/attrs/disabled). This is log-only and never affects the
-    returned value — it exists so a wrong assumption in the detection logic
-    below is visible and correctable from real production logs (this is how
-    the original Croma disabled-button and tag-split-pincode-text bugs were
-    diagnosed and fixed) instead of being guessed at again.
-    """
-    html_lower = html.lower()
-    text = _normalized_text(soup)
-    logger.info(f"[croma][diag] HTML length={len(html)}, visible-text length={len(text)}")
-    logger.info(f"[croma][diag] head: {html[:200]!r}")
-
-    for p in _DELIVERY_RESTRICTION_PATTERNS:
-        logger.info(
-            f"[croma][diag] restriction {p!r}: in_html={p in html_lower} in_visible_text={p in text}"
+    if not pincode:
+        logger.warning(
+            "[croma] no pincode set for this user — Croma's inventory API "
+            "requires a real delivery pincode (shipToAddress.zipCode), "
+            "cannot check without one. Use /pins to add one."
         )
+        return None
 
-    for kw in ("not available", "unfortunately", "not serviceable"):
-        idx = text.find(kw)
-        if idx != -1:
-            logger.info(f"[croma][diag] visible-text ...{text[max(0, idx - 60):idx + 90]!r}...")
+    item_id = extract_item_id(url)
+    if not item_id:
+        logger.warning(f"[croma] could not extract an itemID from url={url!r}")
+        return None
 
-    for kw in (
-        "not available", "not serviceable", "unfortunately", "pincode",
-        "pin code", "deliver by", "delivered by", "delivery at", "check delivery",
-        "enter pincode", "enter your pincode", "notify me", "sold out",
-    ):
-        if kw in html_lower:
-            logger.info(f"[croma][diag] keyword present: {kw!r}")
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "oms-apim-subscription-key": _apim_key(),
+        "origin": "https://www.croma.com",
+        "referer": "https://www.croma.com/",
+    }
+    payload = {
+        "promise": {
+            "allocationRuleID": "SYSTEM",
+            "checkInventory": "Y",
+            "organizationCode": "CROMA",
+            "sourcingClassification": "EC",
+            "promiseLines": {
+                "promiseLine": [
+                    {
+                        "fulfillmentType": "HDEL",
+                        "itemID": item_id,
+                        "lineId": "1",
+                        "requiredQty": "1",
+                        "shipToAddress": {"zipCode": pincode},
+                        "extn": {"widerStoreFlag": "N"},
+                    }
+                ]
+            },
+        }
+    }
 
-    hits = 0
-    for el in soup.find_all(class_=True):
-        cls = " ".join(el.get("class", [])).lower()
-        if any(tok in cls for tok in ("deliver", "pincode", "serviceab", "availab", "location")):
-            txt = el.get_text(" ", strip=True)[:120]
-            logger.info(f"[croma][diag] el <{el.name}> class={el.get('class')} text={txt!r}")
-            hits += 1
-            if hits >= 25:
-                logger.info("[croma][diag] (delivery-ish element dump capped at 25)")
-                break
+    logger.info(f"[croma] POST {_INVENTORY_URL} itemID={item_id!r} pincode={pincode!r}")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(_INVENTORY_URL, headers=headers, json=payload)
+    except Exception as exc:
+        logger.warning(f"[croma] inventory API request failed: {type(exc).__name__}: {exc}")
+        return None
 
-    for kw in ("not available", "unfortunately", "pincode", "notify me"):
-        idx = html_lower.find(kw)
-        if idx != -1:
-            logger.info(f"[croma][diag] ...{html[max(0, idx - 90):idx + 90]!r}...")
+    logger.info(f"[croma] inventory API status={resp.status_code}")
+    if resp.status_code in (401, 403):
+        logger.error(
+            f"[croma] inventory API returned HTTP {resp.status_code} — the "
+            f"oms-apim-subscription-key has likely EXPIRED and needs to be "
+            f"refreshed (set a new value for the CROMA_APIM_KEY env var). "
+            f"Skipping this product for now."
+        )
+        return None
+    if resp.status_code != 200:
+        logger.warning(f"[croma] inventory API HTTP {resp.status_code}: {resp.text[:300]!r}")
+        return None
 
-    found_ld = False
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            for item in (data if isinstance(data, list) else [data]):
-                if isinstance(item, dict) and item.get("offers") is not None:
-                    avail = _offer_availability(item.get("offers", {}))
-                    if avail:
-                        found_ld = True
-                        logger.info(f"[croma][diag] JSON-LD availability={avail!r}")
-        except Exception:
-            pass
-    if not found_ld:
-        logger.info("[croma][diag] JSON-LD availability: none found")
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning(f"[croma] inventory API non-JSON response: {resp.text[:300]!r}")
+        return None
 
-    for p in _OOS_PATTERNS:
-        in_html = p in html_lower
-        in_text = p in text
-        if in_html or in_text:
-            logger.info(f"[croma][diag] OOS pattern {p!r}: in_html={in_html} in_visible_text={in_text}")
-
-    btn_count = 0
-    for el in soup.find_all(["button", "a"]):
-        label = " ".join(filter(None, [
-            el.get_text(" ", strip=True),
-            el.get("aria-label", "") or "",
-            el.get("data-testid", "") or "",
-            el.get("id", "") or "",
-            " ".join(el.get("class", []) or []),
-        ])).lower()
-        if any(pat in label for pat in _ADD_PATTERNS):
-            logger.info(
-                f"[croma][diag] buy/cart <{el.name}> "
-                f"text={el.get_text(' ', strip=True)[:40]!r} class={el.get('class')} "
-                f"disabled_attr={el.get('disabled')!r} aria-disabled={el.get('aria-disabled')!r} "
-                f"style={el.get('style')!r} → _is_disabled={_is_disabled(el)}"
-            )
-            btn_count += 1
-            if btn_count >= 10:
-                break
-    if btn_count == 0:
-        logger.info("[croma][diag] no Buy Now / Add-to-Cart button matched")
+    lines = _promise_lines(data)
+    in_stock = len(lines) > 0
+    logger.info(
+        f"[croma] {url} → {'IN STOCK' if in_stock else 'OUT OF STOCK'} "
+        f"({len(lines)} promiseLine(s) for pincode {pincode!r})"
+    )
+    return in_stock
 
 
 def check(soup: BeautifulSoup, html: str) -> bool:
-    html_lower = html.lower()
-    text = _normalized_text(soup)
-
-    _log_delivery_diagnostics(soup, html)
-
-    # ── Delivery restriction — highest priority ─────────────────────────────
-    # Checked before JSON-LD/buttons: a page can carry a stale/cached
-    # "InStock" JSON-LD block and an enabled-looking Add to Cart button while
-    # still showing "Not Available for your pincode" — the delivery gate is
-    # the most trustworthy signal on record pages when it fires. Matched
-    # against BOTH the normalized visible text (handles the phrase being
-    # split across sibling tags, e.g. separate <span>s) and raw HTML.
-    for pattern in _DELIVERY_RESTRICTION_PATTERNS:
-        if pattern in text or pattern in html_lower:
-            src = "visible-text" if pattern in text else "raw-html"
-            logger.info(f"[croma] delivery restriction ({src}): '{pattern}' → False")
-            return False
-
-    # Scoped delivery-element check — catches delivery/pincode-labelled
-    # elements whose restriction text didn't match the patterns above
-    # verbatim (e.g. differently worded serviceability messages).
-    for el in soup.find_all(class_=True):
-        cls = " ".join(el.get("class", [])).lower()
-        if not any(tok in cls for tok in ("deliver", "serviceab", "pincode", "availab")):
-            continue
-        etxt = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).lower()
-        if any(sig in etxt for sig in ("not available", "unfortunately", "not serviceable")):
-            logger.info(
-                f"[croma] delivery element <{el.name}> class={el.get('class')} "
-                f"text={etxt[:120]!r} → False"
-            )
-            return False
-
-    # ── JSON-LD pass ─────────────────────────────────────────────────────────
-    # InStock is deferred rather than returned immediately: JSON-LD on Croma
-    # has been observed stale (still says InStock after the product actually
-    # went OOS), so it is only trusted as a last-resort fallback below, after
-    # the button scan has had a chance to override it. OutOfStock/Discontinued
-    # is trusted immediately since a false negative there is safe (rare) and a
-    # site would not label a genuinely in-stock product as OutOfStock.
-    json_ld_in_stock = False
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            for item in (data if isinstance(data, list) else [data]):
-                if not isinstance(item, dict):
-                    continue
-                avail = _offer_availability(item.get("offers", {}))
-                if not avail:
-                    continue
-                if "InStock" in avail:
-                    logger.info("[croma] JSON-LD: InStock (deferred)")
-                    json_ld_in_stock = True
-                elif "OutOfStock" in avail or "Discontinued" in avail:
-                    logger.info("[croma] JSON-LD: OutOfStock → False")
-                    return False
-        except Exception:
-            pass
-
-    # ── OOS text patterns ─────────────────────────────────────────────────────
-    for pattern in _OOS_PATTERNS:
-        if pattern in html_lower:
-            logger.info(f"[croma] OOS text: '{pattern}' → False")
-            return False
-
-    # ── Button state ──────────────────────────────────────────────────────────
-    cart_buttons = []
-    seen_ids = set()
-
-    def _add_candidate(el):
-        if id(el) not in seen_ids:
-            seen_ids.add(id(el))
-            cart_buttons.append(el)
-
-    for cls in _CART_CLASSES:
-        for el in soup.find_all(class_=cls):
-            _add_candidate(el)
-    for el in soup.find_all(["button", "a"]):
-        if any(p in el.get_text(strip=True).lower() for p in _ADD_PATTERNS):
-            _add_candidate(el)
-    for attr in ("data-testid", "aria-label", "id"):
-        for el in soup.find_all(attrs={attr: True}):
-            if any(p in (el.get(attr) or "").lower() for p in _ADD_PATTERNS):
-                _add_candidate(el)
-
-    if cart_buttons:
-        active = [b for b in cart_buttons if not _is_disabled(b)]
-        if active:
-            el = active[0]
-            logger.info(
-                f"[croma] active buy/cart <{el.name}> "
-                f"text={el.get_text(' ', strip=True)[:40]!r} class={el.get('class')} → True"
-            )
-            return True
-        logger.info(
-            f"[croma] all {len(cart_buttons)} buy/cart button(s) disabled "
-            f"(overrides JSON-LD InStock={json_ld_in_stock}) → False"
-        )
-        return False
-
-    # ── Final fallback: only trust JSON-LD if NO buttons found at all. If we
-    # found buttons, the block above already returned — this is reached only
-    # when the button scan found nothing to check, so a lingering InStock
-    # JSON-LD is the best remaining signal.
-    if json_ld_in_stock and not cart_buttons:
-        logger.info("[croma] JSON-LD InStock confirmed → True")
-        return True
-
-    logger.info("[croma] no conclusive signal → False")
+    """
+    NOT used in production. checkers.croma's real stock-detection logic
+    lives entirely in check_via_api() above (Croma's own inventory API) —
+    special-cased in stock_checker.check_stock() for site=="croma", the
+    exact same pattern checkers/shopatsc.py's check_via_html uses. This
+    soup/html-based stub exists ONLY so CHECKER_MAP still has a non-None
+    entry for "croma" (stock_checker.check_stock()'s `if checker is None`
+    guard would otherwise short-circuit before ever reaching the "croma"
+    special case) — mirrors checkers/shopatsc.py's own check() for the
+    identical structural reason. Should never actually be invoked with
+    real arguments in production.
+    """
+    logger.warning(
+        "[croma] check(soup, html) called directly — this should never "
+        "happen in production; checkers.croma.check_via_api (Croma's "
+        "internal inventory API) is the real stock-detection path."
+    )
     return False

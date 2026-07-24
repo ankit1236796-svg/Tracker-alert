@@ -36,10 +36,15 @@ SHARE_TRIAL_TAP_DELAY_SECONDS = int(os.getenv("SHARE_TRIAL_TAP_DELAY_SECONDS", "
 # Sites whose results are confirmed unreliable enough that AUTOMATIC alerts
 # must be suppressed until root-caused and fixed — added after Croma was
 # observed flipping between correct and fully-inverted results across two
-# manual checks ~8-9 minutes apart, for the same tracked products. Manual
-# /check still runs and shows a result, but with an explicit reliability
-# warning (see handlers.py) rather than silently trusting it. Remove a site
-# from this set once the root cause is found and fixed.
+# manual checks ~8-9 minutes apart, for the same tracked products (the old
+# HTML-scraping checker). Manual /check still runs and shows a result, but
+# with an explicit reliability warning (see handlers.py) rather than
+# silently trusting it. checkers/croma.py's checker has SINCE been
+# replaced entirely with Croma's own internal inventory API (a structured
+# JSON response, not the page-text heuristics that caused the original
+# flip-flopping) — but "croma" is deliberately still left in this set
+# until that new checker has been validated against real traffic; remove
+# it here once it has (see SUPPORTED_SITES' Croma comment below).
 UNRELIABLE_SITES = {"croma"}
 
 # Playwright settings
@@ -88,15 +93,21 @@ SCRAPING_PROVIDER = os.getenv("SCRAPING_PROVIDER", "zyte").strip().lower()
 # the four unreliable signals would produce false alerts; skip until a better
 # diagnostic approach is found or Vijay Sales changes its site architecture.
 #
-# Croma deliberately excluded (not "not yet built" — actively removed): the
-# checker was confirmed to flip between correct and fully-inverted results
-# across consecutive checks, then later degraded to reporting every product
-# OOS regardless of real status, with no root cause identified. Shipping
-# that behavior would produce false alerts (or false silence) for users, so
-# it's pulled from /add and /stores until the underlying cause is found and
-# fixed. checkers/croma.py, its CHECKER_MAP/_JS_SITES entries, and
-# config.UNRELIABLE_SITES are all left intact — re-adding "croma" here is
-# the only step needed to bring it back once fixed.
+# Croma: RE-ADDED here. It was previously pulled from /add and /stores
+# entirely (see git history) after its old HTML-scraping checker was
+# confirmed to flip between correct and fully-inverted results across
+# consecutive checks, then later degrade to reporting every product OOS,
+# with no root cause ever identified — shipping that would produce false
+# alerts (or false silence) for users. checkers/croma.py's scraping-based
+# check() has since been replaced ENTIRELY with a direct call to Croma's
+# own free internal inventory API (checkers.croma.check_via_api) — a
+# structured JSON response, not page-text/DOM heuristics, so the specific
+# failure mode above (an HTML-signal guess quietly going wrong) no longer
+# applies the same way. Deliberately still left in UNRELIABLE_SITES below
+# for now, though: the new checker hasn't been validated against real
+# production traffic yet, so automatic "back in stock" alerts stay
+# suppressed (manual /check still works, with the reliability warning)
+# until that's confirmed — remove "croma" from UNRELIABLE_SITES once it is.
 SUPPORTED_SITES = {
     "amazon":          ["amazon.in", "amazon.com"],
     "flipkart":        ["flipkart.com"],
@@ -110,6 +121,7 @@ SUPPORTED_SITES = {
     "apple":           ["apple.com"],
     "oneplus":         ["oneplus.in"],
     "tataneu":         ["tataneu.com"],
+    "croma":           ["croma.com"],
     # Brand storefronts (BBK group, like OnePlus). Bare-domain entries so the
     # shopping subdomains resolve via detect_site's endswith("."+domain) check
     # (e.g. mshop.vivo.com → vivo.com, mshop.iqoo.com/shop.iqoo.com → iqoo.com).
@@ -124,7 +136,8 @@ SUPPORTED_SITES = {
 
 # Domains handled specially in /add with a "Coming Soon" message instead of
 # the generic "unsupported site" one — see handlers.py's _coming_soon_message.
-COMING_SOON_DOMAINS = {"croma.com"}
+# croma.com REMOVED from here now that it's back in SUPPORTED_SITES above.
+COMING_SOON_DOMAINS: set[str] = set()
 
 # Per-site display-name override for user-facing text (Telegram messages,
 # product listings, /stores). Falls back to site.capitalize() via

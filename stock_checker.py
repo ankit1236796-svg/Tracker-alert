@@ -16,6 +16,7 @@ from checkers import (
 )
 from checkers import apple as apple_checker
 from checkers import shopatsc as shopatsc_checker
+from checkers import croma as croma_checker
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ async def _fetch_direct(
 # this was deliberately committed separately from the Reliance
 # Digital/JioMart switch so it can be reverted independently.
 _JS_SITES = {
-    "zepto", "bigbasket", "croma", "instamart", "myntra",
+    "zepto", "bigbasket", "instamart", "myntra",
     "oneplus", "tataneu", "vivo", "iqoo",
     # New marketplace checkers (unicornstore, vijaysales, inventstore,
     # sangeethamobiles) — real markup hasn't been inspected from this
@@ -222,6 +223,11 @@ _JS_SITES = {
 # first, render=true only if that looks incomplete), the opposite default
 # order from every other site in this set. See
 # checkers.shopatsc.check_via_html for the full reasoning.
+#
+# Croma also deliberately NOT here (removed — it used to be) — it's
+# special-cased near the top of check_stock() too, but doesn't fetch/
+# render a page at ALL anymore: it calls Croma's own free inventory API
+# directly. See checkers.croma.check_via_api.
 
 # OnePlus renders incompletely under a plain render=true (confirmed via the
 # /debugoneplus admin command — the page's JS/XHR activity hadn't settled
@@ -410,6 +416,25 @@ async def check_stock(
             logger.error(f"[shopatsc] check_via_html failed: {exc}")
             return False, None
         logger.info(f"[shopatsc] {url} → {'IN STOCK' if result else 'OUT OF STOCK'}")
+        return result, None
+
+    if site == "croma":
+        # Sole signal: Croma's own internal inventory/order-promising API
+        # (free, no Zyte/Scrape.do credits spent — see
+        # checkers.croma.check_via_api's module docstring). Never raises
+        # (returns None for any inconclusive case — missing pincode/itemID,
+        # expired API key, network error, malformed response), so this
+        # try/except is a final defensive safety net, not the expected
+        # error path.
+        try:
+            result = await croma_checker.check_via_api(url, pincode)
+        except Exception as exc:
+            logger.error(f"[croma] check_via_api failed: {exc}")
+            return None, None
+        logger.info(
+            f"[croma] {url} → "
+            f"{'IN STOCK' if result else ('OUT OF STOCK' if result is False else 'INCONCLUSIVE')}"
+        )
         return result, None
 
     set_cookies = None

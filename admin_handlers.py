@@ -29,7 +29,7 @@ import stock_checker
 from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_GRACE, STATUS_LOCKED
 from checkers import (
     fetch_page, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital, apple,
-    sangeethamobiles, vijaysales, tataneu, iqoo, vivo,
+    sangeethamobiles, vijaysales, tataneu, iqoo, vivo, croma,
     CHECKER_MAP,
 )
 from config import ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER
@@ -2794,3 +2794,84 @@ async def cmd_debugrenderfalse(message: Message, command: CommandObject):
     _CHUNK_SIZE = 3800
     for i in range(0, len(snippet), _CHUNK_SIZE):
         await _debug_send(message, snippet[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
+# /debugcroma — verify checkers/croma.py's new internal-inventory-API
+# checker (itemID extraction from the tracked URL, the raw request sent,
+# and Croma's raw response) against a real tracked Croma URL + pincode.
+# The itemID-from-URL extraction specifically is a BEST GUESS (see
+# checkers/croma.py's module docstring) — this command exists so that can
+# be confirmed/corrected against real URLs before being trusted in
+# production. NOT wired into CHECKER_MAP or the regular check cycle
+# (check_via_api already IS the production path, called directly from
+# stock_checker.check_stock()'s "croma" special case — this command is
+# purely for manual verification, same purpose every other /debug* command
+# in this file serves). Safe to delete once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_CROMA_ADMIN_ID = 5004721766  # same hardcoded restriction as every
+# other /debug* command above, on top of the router's own ADMIN_USER_ID
+# filter — this calls Croma's own inventory API for an arbitrary
+# caller-supplied URL/pincode.
+
+
+@router.message(Command("debugcroma"))
+async def cmd_debugcroma(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_CROMA_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugcroma &lt;croma_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: <code>/debugcroma &lt;croma_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML"
+        )
+        return
+    url, pincode = parts[0], parts[1]
+
+    item_id = croma.extract_item_id(url)
+    if not item_id:
+        await _debug_send(
+            message,
+            "⚠️ Could not extract an itemID from this URL via the current "
+            "'/p/<id>' pattern (see checkers/croma.py's module docstring — "
+            "this extraction is a BEST GUESS, not verified against a real "
+            "croma.com URL). Paste the real URL structure back so "
+            "extract_item_id() can be corrected.",
+        )
+        return
+    await _debug_send(message, f"✅ Extracted itemID: {item_id!r}")
+
+    aff_key = croma._apim_key()
+    await _debug_send(
+        message,
+        f"oms-apim-subscription-key: {'set via CROMA_APIM_KEY env var' if aff_key != croma._DEFAULT_APIM_KEY else 'using the built-in default (CROMA_APIM_KEY not set)'}",
+    )
+
+    await _debug_send(message, f"🔍 Calling Croma's inventory API for itemID={item_id!r} pincode={pincode!r}…")
+    try:
+        result = await croma.check_via_api(url, pincode)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ check_via_api crashed unexpectedly: {exc}")
+        return
+
+    if result is None:
+        await _debug_send(
+            message,
+            "⚠️ Inconclusive (None) — the API call failed, the key was "
+            "rejected (401/403 — check Railway logs for a clear 'key "
+            "expired' message), or the response was malformed/non-JSON. "
+            "See Railway logs for the exact reason.",
+        )
+        return
+
+    await _debug_send(
+        message,
+        f"✅ Result: {'IN STOCK' if result else 'OUT OF STOCK'} "
+        f"(promise.suggestedOption.option.promiseLines.promiseLine "
+        f"{'non-empty' if result else 'empty/missing'} for pincode {pincode!r})",
+    )
