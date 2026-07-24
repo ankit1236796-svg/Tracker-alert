@@ -2305,13 +2305,20 @@ async def cmd_debuginventstore(message: Message, command: CommandObject):
 # pickupDisplay value and the full JSON response, not just the collapsed
 # True/None verdict production only needs.
 #
+# _fetch_pickup_availability itself now calls Apple's fulfillment-messages
+# API directly (real Cookie/User-Agent headers from APPLE_USER_AGENT/
+# APPLE_COOKIES env vars — see checkers/apple.py's _cookie_auth_fetch),
+# NOT via Scrape.do/Zyte — only the product-page fetch below (for SKU
+# extraction) still goes through fetch_page and spends a credit.
+#
 # NOT wired into CHECKER_MAP or the regular check cycle. Safe to delete once
 # no longer needed.
 # ---------------------------------------------------------------------------
 _DEBUG_PICKUP_ADMIN_ID = 5004721766  # same hardcoded restriction as every
 # other /debug* command above, on top of the router's own ADMIN_USER_ID
-# filter — this fetches an arbitrary caller-supplied Apple URL plus calls
-# Apple's fulfillment-messages API via Scrape.do (spends credits).
+# filter — this fetches an arbitrary caller-supplied Apple URL (one
+# Scrape.do/Zyte credit for the product page) plus calls Apple's
+# fulfillment-messages API directly via cookies (no credit).
 
 
 @router.message(Command("debugpickup"))
@@ -2356,16 +2363,15 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
     target = apple._build_fulfillment_target(sku, pincode)
     await _debug_send(
         message,
-        f"🔍 Calling fulfillment-messages API for pincode {pincode} — navigates "
-        f"to the product page first (render_js=True), then triggers the API "
-        f"call as an in-page fetch() from WITHIN that browser session (real "
-        f"referrer/cookies), escalating to super_proxy=True if that fails "
+        f"🔍 Calling fulfillment-messages API for pincode {pincode} — direct "
+        f"httpx GET with real Cookie/User-Agent headers from APPLE_COOKIES/"
+        f"APPLE_USER_AGENT env vars, no Scrape.do/Zyte involved "
         f"(see checkers/apple.py's _fetch_pickup_availability):\n{target}",
     )
 
     data, method, diagnostics = await apple._fetch_pickup_availability(sku, pincode, url)
 
-    diag_lines = ["Per-tier diagnostics:"]
+    diag_lines = ["Diagnostics:"]
     for method_label, err in diagnostics:
         diag_lines.append(f"  • {method_label}: {'✅ succeeded' if err is None else f'❌ {err}'}")
     await _debug_send(message, "\n".join(diag_lines))
@@ -2373,9 +2379,10 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
     if data is None:
         await _debug_send(
             message,
-            "⚠️ fulfillment-messages call failed on every tier tried above — "
-            "see the per-tier reasons and Railway logs for the exact "
-            "exception/status/body.",
+            "⚠️ fulfillment-messages call failed — see the reason above and "
+            "Railway logs for the exact exception/status/body. If this is a "
+            "401/403 or non-JSON response, APPLE_COOKIES has likely expired "
+            "and needs a refresh.",
         )
         return
 

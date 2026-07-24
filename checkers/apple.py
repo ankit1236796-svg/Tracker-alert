@@ -118,15 +118,12 @@ def check(soup: BeautifulSoup, html: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _FULFILLMENT_URL = "https://www.apple.com/in/shop/fulfillment-messages"
-# Was 20.0 — real-world /mypickups + background-cycle logs (see the
-# improved error logging added in the prior round) showed httpx.ReadTimeout
-# failures against this endpoint, meaning Apple's fulfillment-messages API
-# is sometimes slower to respond than 20s allows. Bumped to 30s (the top of
-# the 20-30s range that seemed reasonable) to give real headroom rather
-# than nudging by a couple of seconds — a slow-but-successful response is
-# still strictly better than a guaranteed timeout. This only affects THIS
-# one API call's own timeout; every other checker's fetch_page timeout is
-# untouched.
+# Timeout for the direct httpx call in _fetch_pickup_availability (see
+# _cookie_auth_fetch) — kept generous (30s vs. the official-store
+# checker's 20s) since this endpoint has shown slow-but-successful
+# responses in the past; a slow response is still strictly better than a
+# timeout. Only affects this one call; every other checker's fetch_page
+# timeout is untouched.
 _FULFILLMENT_TIMEOUT = 30.0
 
 # Apple part numbers ("SKUs") are alphanumeric, always ending in a 2-letter
@@ -205,213 +202,163 @@ def _build_fulfillment_target(sku: str, pincode: str) -> str:
     return f"{_FULFILLMENT_URL}?{urlencode(params)}"
 
 
-# ── Navigate-then-fetch-within-session (replaces the old standalone-URL
-# attempts below) ─────────────────────────────────────────────────────────
+# ── Direct cookie-based fetch (shared by every fulfillment-messages caller
+# below AND by the official-store checker further down this file) ─────────
 #
-# Real /debugpickup runs showed the fulfillment-messages endpoint hit as a
-# cold, standalone URL (render_js=True, then render_js=True+super_proxy=True)
-# ReadTimeout's every single time, no exceptions — even with a full headless
-# browser. This endpoint is, in Apple's real storefront, only ever triggered
-# by JS running ON the loaded product page (referrer + whatever session/
-# cookie state that page load established), never hit in isolation. The
-# working theory: Apple's bot-protection silently stalls a request that
-# doesn't carry that context, rather than rejecting it outright.
+# Formerly a navigate-to-the-product-page-then-run-an-in-page-fetch()-via-
+# Scrape.do's-"Execute"/Zyte's-"evaluate"-browser-action workaround (built
+# after a COLD standalone GET was found to consistently ReadTimeout via
+# Zyte). That workaround was itself found broken in production — real
+# Railway logs showed "marker not found in returned HTML — Execute/
+# evaluate action did not run" on every attempt, both the plain-session
+# and super_proxy tiers, every cycle. Root-caused (not just worked around
+# again) to the in-page script's own JS: it began with a bare top-level
+# `return`, which is a SyntaxError when a provider's evaluate/Execute
+# action evaluates the supplied source as a plain expression rather than a
+# function body (the documented pattern for both providers avoids `return`
+# entirely) — so the script likely never ran at all, on either tier, every
+# time, which is exactly what a hard syntax error (not a proxy/timing
+# issue) would produce.
 #
-# Fix: navigate to the actual product page first (full render_js=True load),
-# THEN issue the fulfillment-messages fetch as an in-page fetch() from
-# WITHIN that same browser session via Scrape.do's "Execute" / Zyte's
-# "evaluate" browser action (see zyte_client._translate_actions — this is
-# the SAME action-chain mechanism already used for RelianceDigital's pincode
-# entry, just a different action type: "Execute"/"evaluate" runs arbitrary
-# JS in-page rather than clicking/filling a specific element). A same-origin
-# fetch() issued from the product page's own JS naturally carries the real
-# referrer and whatever cookies/session that page load established — no
-# separate cookie-capture-and-replay step needed.
-#
-# Confirmed via WebSearch (two independent result sets) that Zyte API's
-# actions list supports "evaluate" (in the SAME actions array as click/type/
-# waitForTimeout/waitForSelector, not a separate product) and that Scrape.do's
-# playWithBrowser supports {"Action": "Execute", "Execute": "<js>"} — same
-# verification bar as every other third-party API detail in this codebase
-# (direct WebFetch of docs.zyte.com/scrape.do returns 403 from this sandbox).
-# NOT confirmed: whether either provider reliably surfaces an evaluate/
-# Execute action's own RETURN VALUE in a parseable response field — so
-# rather than depend on that, the in-page script ALSO writes its result into
-# a hidden marker <div> in the DOM, which shows up in the final captured
-# browserHtml the exact same way RelianceDigital's pincode-interaction
-# result already does (see checkers/reliancedigital.py's
-# fetch_with_pincode_interaction) — a mechanism this codebase already
-# relies on elsewhere, unlike the unconfirmed action-return-value path.
-_PICKUP_RESULT_MARKER_ID = "__apple_pickup_result__"
-
-# Higher than _FULFILLMENT_TIMEOUT (a bare API call) since this now waits
-# for a full product-page render PLUS the in-page fetch to complete —
-# matches the same ballpark as RelianceDigital's pincode-interaction tier
-# (90s) rather than reusing the old 30s tuned for a much lighter request.
-_FULFILLMENT_SESSION_TIMEOUT = 60.0
+# Rather than keep fighting the proxy layer, this now mirrors the
+# reference implementation directly: a real browser User-Agent + a real
+# logged-in Cookie header, loaded from Railway env vars (APPLE_USER_AGENT,
+# APPLE_COOKIES) rather than captured/managed by this bot itself — the
+# admin refreshes them manually (their own local Chrome cookie-extraction
+# script) when Apple's session expires. Same operational model as
+# checkers/croma.py's CROMA_APIM_KEY, and the exact approach already
+# proven out for the official-store checker below (_fetch_official_store_
+# availability originally had its own near-identical copy of this; the two
+# were unified into this one shared helper once both existed, since the
+# only difference between them was the target URL's param set and log
+# labels — the auth/error-handling logic itself was already duplicated
+# verbatim, so keeping two copies risked exactly the "fixed one, forgot
+# the other" bug this refactor eliminates).
+def _apple_user_agent() -> str:
+    # Read at call time (mirrors checkers/croma.py's _apim_key() pattern)
+    # so a Railway env var change (a manual cookie/UA refresh) takes effect
+    # without an import-order dependency on this module's own import time.
+    return os.environ.get("APPLE_USER_AGENT", "").strip()
 
 
-def _build_in_page_fetch_script(target: str) -> str:
-    """
-    JS executed IN the browser, after the product page has fully loaded,
-    via the Execute/evaluate action. Fetches `target` (the fulfillment-
-    messages URL) as a same-origin request from the page's own context —
-    real referrer, real cookies, exactly like Apple's own storefront JS —
-    then writes the result into a hidden marker <div> (see
-    _PICKUP_RESULT_MARKER_ID) so it's recoverable from the plain captured
-    HTML afterward. Also RETURNS the same result at the top level (via an
-    explicit `return`) in case a provider's evaluate/Execute action DOES
-    surface it directly — belt-and-suspenders, since neither extraction
-    path is independently confirmed for either provider (see this
-    section's module note above).
-    """
-    return f"""
-return (async () => {{
-  var marker = document.createElement('div');
-  marker.id = {json.dumps(_PICKUP_RESULT_MARKER_ID)};
-  marker.style.display = 'none';
-  try {{
-    const r = await fetch({json.dumps(target)}, {{credentials: 'include'}});
-    const t = await r.text();
-    marker.setAttribute('data-status', String(r.status));
-    marker.textContent = t;
-    document.body.appendChild(marker);
-    return t;
-  }} catch (e) {{
-    marker.setAttribute('data-status', 'error');
-    marker.textContent = String(e);
-    document.body.appendChild(marker);
-    return null;
-  }}
-}})();
-""".strip()
+def _apple_cookies() -> str:
+    return os.environ.get("APPLE_COOKIES", "").strip()
 
 
-def _extract_marker_result(html: str) -> tuple[dict | None, str | None]:
-    """
-    Parses the hidden marker <div> _build_in_page_fetch_script's JS writes
-    into the DOM, out of the final captured product-page HTML. Returns
-    (parsed_json, error) — error is a short, specific description of
-    exactly which sub-step failed:
-      - marker missing entirely: the Execute/evaluate action itself likely
-        wasn't supported/didn't run (see zyte_client._translate_actions —
-        an unrecognized action type is logged and skipped, not raised).
-      - data-status="error": the in-page script's own fetch() call itself
-        failed (network error, CORS, etc. — visible in the marker text).
-      - present but not valid JSON: fetch() succeeded but Apple returned a
-        non-JSON body (likely a block/challenge page) even WITH real
-        page-session context.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    marker = soup.find(id=_PICKUP_RESULT_MARKER_ID)
-    if marker is None:
-        return None, "marker not found in returned HTML — Execute/evaluate action did not run"
-
-    status = marker.get("data-status", "")
-    text = marker.get_text()
-    if status == "error":
-        return None, f"in-page fetch() failed: {text[:300]}"
-
-    try:
-        return json.loads(text), None
-    except Exception:
-        return None, f"in-page fetch() returned non-JSON (status={status!r}): {text[:300]!r}"
-
-
-async def _fetch_pickup_availability_attempt_via_session(
-    product_url: str, target: str, *, super_proxy: bool, method_label: str,
+async def _cookie_auth_fetch(
+    target: str, *, log_tag: str, context: str, timeout: float,
 ) -> tuple[dict | None, str | None]:
     """
-    One attempt: navigate to product_url (full render_js=True load), run
-    the in-page fetch script, then parse its result out of the final
-    captured HTML. Returns (data, error) — error is None on success, else
-    a short description of exactly which sub-step failed (product-page
-    navigation itself, vs. the in-page fetch/marker extraction — see
-    _extract_marker_result above), for /debugpickup to report verbatim.
+    One direct httpx GET to `target` (an Apple fulfillment-messages URL) —
+    real browser User-Agent + Cookie headers from APPLE_USER_AGENT/
+    APPLE_COOKIES env vars, no Scrape.do/Zyte involved. Returns
+    (data, error) — error is None on success, else a short human-readable
+    reason (missing env vars, network error, HTTP status, non-JSON body),
+    for callers that want to surface WHY a fetch failed (e.g.
+    /debugpickup's diagnostics, or check_pickup_at_official_stores'
+    pincode->result reporting). Never raises.
+
+    401/403, or a 200 that isn't valid JSON (Apple's real API always
+    returns JSON when the session is genuinely accepted — a non-JSON 200
+    body is the same "silently stalled/challenge page" signature this
+    endpoint has shown before, now most likely an expired/rejected cookie
+    jar) are both logged as a clear "APPLE_COOKIES likely expired"
+    message, mirroring checkers/croma.py's check_via_api 401/403 handling
+    for CROMA_APIM_KEY — so an admin scanning logs doesn't have to
+    reverse-engineer a generic failure into "go refresh the cookies."
+
+    `log_tag`/`context` control only the log-line prefix (e.g.
+    log_tag="resolve", context="fulfillment-messages pincode='400051'") so
+    each caller's Railway logs stay grep-able under its own existing
+    prefix rather than a generic shared one.
     """
+    logger.info(f"[apple][{log_tag}] {context} target={target!r}")
+
+    user_agent = _apple_user_agent()
+    cookies = _apple_cookies()
+    if not user_agent or not cookies:
+        reason = "APPLE_USER_AGENT and/or APPLE_COOKIES env var is not set"
+        logger.error(
+            f"[apple][{log_tag}] {context} {reason} — cannot call Apple's "
+            f"fulfillment-messages API directly. Skipping."
+        )
+        return None, reason
+
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.apple.com/in/shop/buy-iphone",
+    }
+
     try:
-        resp = await fetch_page(
-            product_url, render_js=True, super_proxy=super_proxy,
-            play_with_browser=[{"Action": "Execute", "Execute": _build_in_page_fetch_script(target)}],
-            timeout=_FULFILLMENT_SESSION_TIMEOUT, site="apple",
-        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(target, headers=headers)
     except Exception as exc:
-        exc_response = getattr(exc, "response", None)
-        status_part = f" http_status={exc_response.status_code}" if exc_response is not None else ""
-        body_part = f" response_body={exc_response.text[:300]!r}" if exc_response is not None else ""
-        logger.warning(
-            f"[apple][resolve] fulfillment-messages ({method_label}) product-page "
-            f"navigation failed: {type(exc).__name__}: {exc}{status_part}{body_part}",
-            exc_info=True,
-        )
-        return None, f"product-page navigation failed: {type(exc).__name__}: {exc}"
+        reason = f"request failed: {type(exc).__name__}: {exc}"
+        logger.warning(f"[apple][{log_tag}] {context} {reason}", exc_info=True)
+        return None, reason
 
-    logger.info(f"[apple][resolve] fulfillment-messages ({method_label}) navigation status={resp.status_code}")
+    logger.info(f"[apple][{log_tag}] {context} status={resp.status_code}")
+
+    if resp.status_code in (401, 403):
+        reason = f"HTTP {resp.status_code} — APPLE_COOKIES likely expired"
+        logger.error(
+            f"[apple][{log_tag}] {context} HTTP {resp.status_code} — "
+            f"APPLE_COOKIES likely expired, refresh needed (re-run your "
+            f"local cookie-extraction script and update the APPLE_COOKIES "
+            f"/ APPLE_USER_AGENT Railway env vars). Skipping."
+        )
+        return None, reason
     if resp.status_code != 200:
-        logger.warning(
-            f"[apple][resolve] fulfillment-messages ({method_label}) product-page HTTP "
-            f"{resp.status_code}: {resp.text[:200]!r}"
-        )
-        return None, f"product-page HTTP {resp.status_code}: {resp.text[:200]!r}"
+        reason = f"HTTP {resp.status_code}: {resp.text[:200]!r}"
+        logger.warning(f"[apple][{log_tag}] {context} {reason}")
+        return None, reason
 
-    data, err = _extract_marker_result(resp.text)
-    if err:
-        logger.warning(f"[apple][resolve] fulfillment-messages ({method_label}) {err}")
-        return None, err
-    return data, None
+    try:
+        return resp.json(), None
+    except Exception:
+        reason = f"non-JSON response (likely a bot-check/challenge page): {resp.text[:200]!r}"
+        logger.error(
+            f"[apple][{log_tag}] {context} non-JSON response (likely a "
+            f"bot-check/challenge page) — APPLE_COOKIES likely expired, "
+            f"refresh needed. body={resp.text[:200]!r}"
+        )
+        return None, reason
 
 
 async def _fetch_pickup_availability(
     sku: str, pincode: str, product_url: str | None = None,
 ) -> tuple[dict | None, str | None, list[tuple[str, str | None]]]:
     """
-    Calls Apple's fulfillment-messages endpoint via the navigate-then-
-    fetch-within-session approach (see the module note above this
-    section). Returns (data, method, diagnostics):
-      - method is "session" or "session_super_proxy" (whichever tier
-        succeeded), or None if both failed.
-      - diagnostics is a list of (method_label, error_or_None) for EVERY
-        tier actually attempted, in order, so a caller like /debugpickup
-        can report exactly which sub-step succeeded/failed at each tier —
-        not just the final pass/fail.
+    Calls Apple's fulfillment-messages endpoint directly (see
+    _cookie_auth_fetch above). Returns (data, method, diagnostics):
+      - method is "direct" on success, None on failure.
+      - diagnostics is a single-entry list [("direct", error_or_None)] —
+        kept as a list (not a bare tuple) for backward compatibility with
+        every existing caller (check_pickup_row, refine_with_pincode,
+        admin_handlers.py's /debugpickup) that already unpacks/iterates
+        it, even though there's only ever one attempt now — no more
+        "session"/"session_super_proxy" tiers to report (that whole
+        navigate-then-execute-in-session approach is gone; see
+        _cookie_auth_fetch's module note above).
     Never raises; callers that only need the data can unpack as
-    `data, _method, _diag = await ...`.
+    `data, _method, _diag = await ...`, exactly as before.
 
-    Requires product_url — the whole point of this approach is triggering
-    the fetch from within a real navigation to that page, so there's no
-    meaningful standalone fallback left (the old direct-fetch approach was
-    removed entirely after confirming it consistently times out — see
-    the module note above). Called with no product_url returns
-    (None, None, [...]) immediately rather than guessing.
+    product_url is accepted for backward compatibility with every existing
+    call site's signature but is no longer used — the old navigate-first
+    approach needed it to establish a page session before triggering the
+    in-page fetch; the direct cookie-based approach doesn't navigate
+    anywhere, so there's nothing left to pass it to.
     """
     target = _build_fulfillment_target(sku, pincode)
-    logger.info(f"[apple][resolve] fulfillment-messages target={target!r}")
-
-    if not product_url:
-        reason = "no product_url supplied — cannot navigate to establish page session"
-        logger.warning(f"[apple][resolve] fulfillment-messages {reason}")
-        return None, None, [("session", reason)]
-
-    diagnostics: list[tuple[str, str | None]] = []
-
-    data, err = await _fetch_pickup_availability_attempt_via_session(
-        product_url, target, super_proxy=False, method_label="session",
+    data, err = await _cookie_auth_fetch(
+        target, log_tag="resolve", context=f"fulfillment-messages pincode={pincode!r}",
+        timeout=_FULFILLMENT_TIMEOUT,
     )
-    diagnostics.append(("session", err))
+    diagnostics: list[tuple[str, str | None]] = [("direct", err)]
     if data is not None:
-        return data, "session", diagnostics
-
-    logger.warning(
-        f"[apple][resolve] fulfillment-messages session attempt failed ({err}) — "
-        f"retrying with super_proxy=True"
-    )
-    data, err = await _fetch_pickup_availability_attempt_via_session(
-        product_url, target, super_proxy=True, method_label="session_super_proxy",
-    )
-    diagnostics.append(("session_super_proxy", err))
-    if data is not None:
-        return data, "session_super_proxy", diagnostics
-
+        return data, "direct", diagnostics
     return None, None, diagnostics
 
 
@@ -659,10 +606,10 @@ async def refine_with_pincode(
     available for pickup), it returns generic_result unchanged, so accuracy
     is never worse than the pre-existing page-based check.
 
-    `url` is the tracked product page URL — _fetch_pickup_availability now
-    needs it to navigate there first (establishing real referrer/session
-    context) before triggering the in-page fulfillment-messages fetch; see
-    that function's module note for why.
+    `url` is the tracked product page URL. It's threaded through to
+    _fetch_pickup_availability for signature backward-compatibility only —
+    that function no longer uses it (see its own docstring); kept here so
+    this function's own signature/callers don't need to change either.
     """
     sku = _extract_sku(soup, html)
     if not sku:
@@ -693,44 +640,25 @@ async def refine_with_pincode(
 # (the user's own single saved pincode only) or the separate opt-in
 # /trackpickup system (user-chosen pincodes, requires a command to set up).
 #
-# Direct httpx GET, no Scrape.do/Zyte involved — a plain fetch_page() call
-# (via either provider) was found to consistently fail against this
-# endpoint (Zyte: ReadTimeout every time; the navigate-then-execute-in-
-# session workaround built for _fetch_pickup_availability above to work
-# around that was itself found broken in production — see the
-# "marker not found ... Execute/evaluate action did not run" investigation).
-# Rather than keep fighting the proxy layer, this now mirrors the reference
-# implementation directly: a real browser User-Agent + a real logged-in
-# Cookie header, loaded from Railway env vars (APPLE_USER_AGENT,
-# APPLE_COOKIES) rather than captured/managed by this bot itself — the
-# admin refreshes them manually (their own local Chrome cookie-extraction
-# script) when Apple's session expires, the same operational model as
-# checkers/croma.py's CROMA_APIM_KEY. See _fetch_official_store_availability
-# for the 401/403/non-JSON "cookies likely expired" handling.
-#
-# Does NOT go through checkers.common.fetch_page/zyte_client.py at all — a
-# deliberate, direct httpx call, exactly mirroring checkers/croma.py's
-# check_via_api (see that module's docstring). Consequently this checker
-# spends ZERO Scrape.do/Zyte credits and is automatically absent from
-# database.get_zyte_usage_summary's per-site breakdown / admin_handlers.py's
+# Shares _cookie_auth_fetch/_apple_user_agent/_apple_cookies (defined above,
+# next to _fetch_pickup_availability) for the actual HTTP call — both this
+# and _fetch_pickup_availability hit the exact same Apple endpoint the
+# exact same way (real Cookie/User-Agent headers, no Scrape.do/Zyte); only
+# the target URL's param set (see _build_official_store_fulfillment_url vs
+# _build_fulfillment_target — kept as two independent builders, since
+# they're plausibly real variations Apple's storefront sends in different
+# contexts, not confirmed identical) and what happens with the result
+# differ between the two features. Consequently this checker spends ZERO
+# Scrape.do/Zyte credits and is automatically absent from database.
+# get_zyte_usage_summary's per-site breakdown / admin_handlers.py's
 # /creditusage (that table is only ever written to from inside
 # zyte_client.fetch_page) — no separate credit-tracking exclusion needed.
 #
-# _fetch_pickup_availability above (refine_with_pincode + the opt-in
-# /trackpickup system's check_pickup_row) is DELIBERATELY left unchanged —
-# still going through the Scrape.do/Zyte navigate-then-execute-in-session
-# path, which has its own known bug (see that section's own comments).
-# Whether to migrate those to this same cookie-based approach is a
-# separate decision, not made here.
-#
 # Endpoint/params as supplied for this task (a different param combination
 # than _build_fulfillment_target's above — fae/little/mts.0/mts.1/fts vs
-# fae/pl/mts.0 — both plausibly real variations of what Apple's storefront
-# sends in different contexts; kept as its own independent builder rather
-# than merged into the existing one, matching this being a separate,
-# additive feature). `location` as the pincode param name and 201301 for
-# Apple Noida were both independently confirmed via WebSearch cross-
-# referencing before this was implemented.
+# fae/pl/mts.0). `location` as the pincode param name and 201301 for Apple
+# Noida were both independently confirmed via WebSearch cross-referencing
+# before this was implemented.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _OFFICIAL_STORE_TIMEOUT = 20.0
@@ -749,92 +677,21 @@ def _build_official_store_fulfillment_url(sku: str, pincode: str) -> str:
     return f"{_FULFILLMENT_URL}?{urlencode(params)}"
 
 
-def _apple_user_agent() -> str:
-    # Read at call time (mirrors checkers/croma.py's _apim_key() pattern)
-    # so a Railway env var change (a manual cookie/UA refresh) takes effect
-    # without an import-order dependency on this module's own import time.
-    return os.environ.get("APPLE_USER_AGENT", "").strip()
-
-
-def _apple_cookies() -> str:
-    return os.environ.get("APPLE_COOKIES", "").strip()
-
-
 async def _fetch_official_store_availability(sku: str, pincode: str) -> dict | None:
     """
     One direct httpx GET straight to Apple's fulfillment-messages endpoint
-    — real browser User-Agent + Cookie headers from APPLE_USER_AGENT/
-    APPLE_COOKIES env vars, no Scrape.do/Zyte involved (see this section's
-    module note above for why). Returns the parsed JSON on success, None
-    on any failure. Never raises.
-
-    401/403, or a 200 that isn't valid JSON (Apple's real API always
-    returns JSON when the session is genuinely accepted — a non-JSON 200
-    body is the same "silently stalled/challenge page" signature this
-    endpoint has shown before, now most likely an expired/rejected
-    cookie jar) are both logged as a clear "APPLE_COOKIES likely expired"
-    message, mirroring checkers/croma.py's check_via_api 401/403 handling
-    for CROMA_APIM_KEY — so an admin scanning logs doesn't have to
-    reverse-engineer a generic failure into "go refresh the cookies."
+    for one official-store pincode — see _cookie_auth_fetch (shared with
+    _fetch_pickup_availability above) for the actual request/auth/error-
+    handling logic. Returns the parsed JSON on success, None on any
+    failure (missing env vars, network error, HTTP status, non-JSON body —
+    all logged there). Never raises.
     """
     target = _build_official_store_fulfillment_url(sku, pincode)
-    logger.info(f"[apple][official-stores] target={target!r}")
-
-    user_agent = _apple_user_agent()
-    cookies = _apple_cookies()
-    if not user_agent or not cookies:
-        logger.error(
-            "[apple][official-stores] APPLE_USER_AGENT and/or APPLE_COOKIES "
-            "env var is not set — cannot call Apple's fulfillment-messages "
-            "API directly. Skipping this pincode."
-        )
-        return None
-
-    headers = {
-        "User-Agent": user_agent,
-        "Cookie": cookies,
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.apple.com/in/shop/buy-iphone",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=_OFFICIAL_STORE_TIMEOUT) as client:
-            resp = await client.get(target, headers=headers)
-    except Exception as exc:
-        logger.warning(
-            f"[apple][official-stores] pincode={pincode!r} request failed: "
-            f"{type(exc).__name__}: {exc}",
-            exc_info=True,
-        )
-        return None
-
-    logger.info(f"[apple][official-stores] pincode={pincode!r} status={resp.status_code}")
-
-    if resp.status_code in (401, 403):
-        logger.error(
-            f"[apple][official-stores] pincode={pincode!r} HTTP {resp.status_code} — "
-            f"APPLE_COOKIES likely expired, refresh needed (re-run your local "
-            f"cookie-extraction script and update the APPLE_COOKIES / "
-            f"APPLE_USER_AGENT Railway env vars). Skipping this pincode."
-        )
-        return None
-    if resp.status_code != 200:
-        logger.warning(
-            f"[apple][official-stores] pincode={pincode!r} HTTP {resp.status_code}: "
-            f"{resp.text[:200]!r}"
-        )
-        return None
-
-    try:
-        return resp.json()
-    except Exception:
-        logger.error(
-            f"[apple][official-stores] pincode={pincode!r} non-JSON response "
-            f"(likely a bot-check/challenge page) — APPLE_COOKIES likely "
-            f"expired, refresh needed. Skipping this pincode. "
-            f"body={resp.text[:200]!r}"
-        )
-        return None
+    data, _err = await _cookie_auth_fetch(
+        target, log_tag="official-stores", context=f"pincode={pincode!r}",
+        timeout=_OFFICIAL_STORE_TIMEOUT,
+    )
+    return data
 
 
 async def check_pickup_at_official_stores(sku: str, pincodes: list[str]) -> dict[str, list[dict]]:
