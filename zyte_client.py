@@ -114,17 +114,21 @@ def _api_key() -> str:
 def _translate_actions(play_with_browser: list[dict]) -> list[dict]:
     """
     Best-effort translation of this codebase's Scrape.do playWithBrowser
-    action chain (Click/Fill/Wait/WaitSelector — see checkers/common.py's
-    build_scraper_url) into Zyte API's own "actions" list. click and
-    waitForSelector are confirmed field names/shapes from Zyte's docs; the
-    exact field name for a Fill/type action's typed value ("text") and
-    waitForTimeout's time unit (assumed seconds, per Zyte's own
-    '"timeout": 0' example) are lower-confidence than the rest of this
-    module and not independently confirmed beyond that one example — same
-    "best guess now, verify via a debug command later" posture already
-    used elsewhere in this codebase for target-site CSS selectors. Any
-    unrecognized action type is logged and skipped rather than raising, so
-    one untranslatable step doesn't abort the whole chain.
+    action chain (Click/Fill/Wait/WaitSelector/Execute — see
+    checkers/common.py's build_scraper_url) into Zyte API's own "actions"
+    list. click and waitForSelector are confirmed field names/shapes from
+    Zyte's docs; the exact field name for a Fill/type action's typed value
+    ("text"), waitForTimeout's time unit (assumed seconds, per Zyte's own
+    '"timeout": 0' example), and evaluate's source-code field name
+    ("source" — confirmed via WebSearch cross-referencing Zyte's own
+    `page.evaluate(source)` scripting-API terminology, but not the exact
+    JSON field name in a plain actions[] entry specifically) are
+    lower-confidence than the rest of this module and not independently
+    confirmed beyond that — same "best guess now, verify via a debug
+    command later" posture already used elsewhere in this codebase for
+    target-site CSS selectors. Any unrecognized action type is logged and
+    skipped rather than raising, so one untranslatable step doesn't abort
+    the whole chain.
     """
     actions = []
     for step in play_with_browser:
@@ -149,6 +153,15 @@ def _translate_actions(play_with_browser: list[dict]) -> list[dict]:
             actions.append({
                 "action": "waitForSelector",
                 "selector": {"type": "css", "value": step["WaitSelector"]},
+            })
+        elif action == "Execute":
+            # Zyte's "evaluate" action runs arbitrary JS in-page and (per
+            # Zyte's own docs) resolves to whatever the evaluated code
+            # returns — used by checkers/apple.py's navigate-then-fetch-
+            # within-session approach for the fulfillment-messages API.
+            actions.append({
+                "action": "evaluate",
+                "source": step.get("Execute", ""),
             })
         else:
             logger.warning(f"[zyte] no translation for playWithBrowser action {action!r} — skipped")

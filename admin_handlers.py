@@ -2353,18 +2353,26 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
     target = apple._build_fulfillment_target(sku, pincode)
     await _debug_send(
         message,
-        f"🔍 Calling fulfillment-messages API for pincode {pincode} — tries "
-        f"render_js=True first, then super_proxy=True if that fails "
+        f"🔍 Calling fulfillment-messages API for pincode {pincode} — navigates "
+        f"to the product page first (render_js=True), then triggers the API "
+        f"call as an in-page fetch() from WITHIN that browser session (real "
+        f"referrer/cookies), escalating to super_proxy=True if that fails "
         f"(see checkers/apple.py's _fetch_pickup_availability):\n{target}",
     )
 
-    data, method = await apple._fetch_pickup_availability(sku, pincode)
+    data, method, diagnostics = await apple._fetch_pickup_availability(sku, pincode, url)
+
+    diag_lines = ["Per-tier diagnostics:"]
+    for method_label, err in diagnostics:
+        diag_lines.append(f"  • {method_label}: {'✅ succeeded' if err is None else f'❌ {err}'}")
+    await _debug_send(message, "\n".join(diag_lines))
+
     if data is None:
         await _debug_send(
             message,
-            "⚠️ fulfillment-messages API call failed on BOTH the render_js=True "
-            "and super_proxy=True attempts — see Railway logs for the exact "
-            "exception/status/body from each tier.",
+            "⚠️ fulfillment-messages call failed on every tier tried above — "
+            "see the per-tier reasons and Railway logs for the exact "
+            "exception/status/body.",
         )
         return
 

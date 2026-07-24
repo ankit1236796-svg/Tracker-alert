@@ -578,7 +578,7 @@ async def check_stock(
 
         if site == "apple" and pincode:
             result = await apple_checker.refine_with_pincode(
-                soup, html, pincode, generic_result=result
+                soup, html, pincode, generic_result=result, url=url,
             )
 
         price: float | None = None
