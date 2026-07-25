@@ -34,8 +34,7 @@ from checkers import (
 )
 from config import (
     ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER,
-    APPLE_PICKUP_PINCODES, APPLE_PICKUP_STORE_LABELS, APPLE_PICKUP_STORE_CODES,
-    APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
+    APPLE_PICKUP_PINCODES, APPLE_PICKUP_STORE_LABELS, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
 )
 from database import (
     IST,
@@ -2361,28 +2360,10 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
         return
     await _debug_send(message, f"✅ Extracted SKU: {sku!r}")
 
-    nearest_pincode, store_code = apple.resolve_nearest_official_store(pincode)
-    if not store_code:
-        await _debug_send(
-            message,
-            f"⚠️ No Apple store code available near pincode {pincode} "
-            + (
-                f"(nearest known official store: {nearest_pincode}, code not "
-                f"yet captured — see config.APPLE_PICKUP_STORE_CODES)"
-                if nearest_pincode else
-                "(no official Apple Store near this pincode at all)"
-            )
-            + ". Cannot call the fulfillment-messages API without a store code "
-              "(location=<pincode> now 541s — see checkers/apple.py's "
-              "_cookie_auth_fetch module note).",
-        )
-        return
-
-    target = apple._build_official_store_fulfillment_url(sku, store_code)
+    target = apple._build_fulfillment_target(sku, pincode)
     await _debug_send(
         message,
-        f"🔍 Calling fulfillment-messages API for pincode {pincode} (nearest "
-        f"official store: {nearest_pincode}, code={store_code}) — direct "
+        f"🔍 Calling fulfillment-messages API for pincode {pincode} — direct "
         f"httpx GET with real Cookie/User-Agent headers from APPLE_COOKIES/"
         f"APPLE_USER_AGENT env vars, no Scrape.do/Zyte involved "
         f"(see checkers/apple.py's _fetch_pickup_availability):\n{target}",
@@ -2974,9 +2955,6 @@ async def cmd_debugapplestores(message: Message, command: CommandObject):
     lines = []
     for pincode in APPLE_PICKUP_PINCODES:
         label = APPLE_PICKUP_STORE_LABELS.get(pincode, pincode)
-        if not APPLE_PICKUP_STORE_CODES.get(pincode):
-            lines.append(f"⏭️ {pincode} ({label}): no Apple store code configured yet — skipped (see config.APPLE_PICKUP_STORE_CODES)")
-            continue
         if pincode not in results:
             lines.append(f"⚠️ {pincode} ({label}): request failed — see Railway logs")
             continue
