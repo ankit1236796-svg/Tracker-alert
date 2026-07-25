@@ -731,6 +731,25 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
                 cookies_list = context.cookies()
                 cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies_list)
 
+                # Diagnostic only — NAMES, never values (this Cookie header is
+                # a live Apple session; values shouldn't land in Railway
+                # logs). Added to investigate a session dying in ~9 minutes
+                # (far faster than the ~2-hour manual-cookie pattern this
+                # replaced) — _abck/bm_sz/ak_bmsc are Akamai Bot Manager's
+                # own marker cookie names; their ABSENCE, or presence in an
+                # under-validated state, would support the hypothesis that
+                # this flow captures cookies before Akamai's own sensor/
+                # telemetry JS has had time to validate the session (no dwell
+                # time between page load and the in-page fetch, and the
+                # browser closes immediately after — see the module note
+                # above _refresh_apple_cookies). Not yet acted on — this is
+                # observation only until the actual log output is reviewed.
+                diagnostics["cookie_names"] = sorted(c["name"] for c in cookies_list)
+                diagnostics["akamai_markers_present"] = {
+                    name: (name in diagnostics["cookie_names"])
+                    for name in ("_abck", "bm_sz", "ak_bmsc")
+                }
+
                 logger.info(
                     f"[refresh-apple-cookies] {url}: {len(cookies_list)} cookie(s) captured, "
                     f"pincode_check_confirmed={pincode_check_confirmed}, diagnostics={diagnostics}"

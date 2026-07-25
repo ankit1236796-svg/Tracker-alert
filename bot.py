@@ -489,7 +489,8 @@ async def run_apple_cookie_refresh_cycle() -> bool:
     set_apple_session_cookies(cookies, user_agent)
     logger.info(
         f"[apple][cookie-refresh] stored a freshly-refreshed Apple session "
-        f"(pincode_check_confirmed={data.get('pincode_check_confirmed')})"
+        f"(pincode_check_confirmed={data.get('pincode_check_confirmed')}, "
+        f"diagnostics={data.get('diagnostics')})"
     )
     return True
 
