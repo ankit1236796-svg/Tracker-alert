@@ -3,6 +3,7 @@ import logging
 import os
 import time
 
+import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -15,6 +16,8 @@ from admin_handlers import router as admin_router
 from config import (
     BOT_TOKEN, CHECK_INTERVAL, ADMIN_USER_ID, ACCESS_CHECK_INTERVAL, REMINDER_HOURS_BEFORE_EXPIRY,
     APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED, APPLE_PICKUP_CHECK_INTERVAL,
+    PLAYWRIGHT_SCRAPER_URL, PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN, APPLE_COOKIE_REFRESH_INTERVAL,
+    APPLE_COOKIE_REFRESH_PRODUCT_URL, APPLE_COOKIE_REFRESH_PINCODE,
 )
 from database import (
     init_db,
@@ -29,6 +32,7 @@ from database import (
     get_all_pickup_tracking,
     get_apple_official_pickup_status,
     upsert_apple_official_pickup_status,
+    set_apple_session_cookies,
 )
 from handlers import router
 from notifications import (
@@ -414,6 +418,111 @@ async def stock_checker_loop(bot: Bot):
 
 
 # ---------------------------------------------------------------------------
+# Apple cookie auto-refresher — replaces manual DevTools cookie extraction +
+# a Railway env var update with a periodic real-browser session, run by the
+# separate playwright_scraper service (POST /refresh-apple-cookies). A
+# genuine Chromium session carries a real, matching TLS fingerprint at the
+# point Apple mints the cookies, unlike httpx's own fingerprint — see
+# config.py's APPLE_COOKIE_REFRESH_* settings for the full rationale. The
+# fast per-check requests (check_pickup_at_official_stores, /trackpickup,
+# refine_with_pincode) are UNCHANGED — still plain httpx, reading whatever
+# session this loop last stored via database.get_apple_session_cookies (see
+# checkers/apple.py's _resolve_apple_session). Runs as its own independent
+# loop, own cadence — a Playwright round-trip (~5-30s) has no reason to
+# share timing with CHECK_INTERVAL or APPLE_PICKUP_CHECK_INTERVAL.
+# ---------------------------------------------------------------------------
+
+async def run_apple_cookie_refresh_cycle() -> bool:
+    """
+    One refresh attempt: POSTs to playwright_scraper's
+    /refresh-apple-cookies, and on success stores the returned cookies +
+    User-Agent via database.set_apple_session_cookies. Returns True on a
+    successful refresh, False otherwise. Never raises — a Playwright crash,
+    a network error, or the service being down/misconfigured all just mean
+    this cycle's refresh didn't happen; whatever session is already stored
+    (or the APPLE_COOKIES/APPLE_USER_AGENT env var fallback) keeps serving
+    fast checks in the meantime.
+    """
+    if not PLAYWRIGHT_SCRAPER_URL:
+        return False
+
+    headers = {}
+    if PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN:
+        headers["X-Internal-Token"] = PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                f"{PLAYWRIGHT_SCRAPER_URL}/refresh-apple-cookies",
+                json={
+                    "url": APPLE_COOKIE_REFRESH_PRODUCT_URL,
+                    "pincode": APPLE_COOKIE_REFRESH_PINCODE,
+                },
+                headers=headers,
+            )
+    except Exception as exc:
+        logger.warning(f"[apple][cookie-refresh] request to playwright_scraper failed: {exc}")
+        return False
+
+    if resp.status_code != 200:
+        logger.warning(
+            f"[apple][cookie-refresh] playwright_scraper returned HTTP "
+            f"{resp.status_code}: {resp.text[:300]!r}"
+        )
+        return False
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        logger.warning(f"[apple][cookie-refresh] non-JSON response from playwright_scraper: {exc}")
+        return False
+
+    cookies = (data.get("cookies") or "").strip()
+    user_agent = (data.get("user_agent") or "").strip()
+    if not cookies or not user_agent:
+        logger.warning(
+            f"[apple][cookie-refresh] playwright_scraper response missing "
+            f"cookies/user_agent: {data}"
+        )
+        return False
+
+    set_apple_session_cookies(cookies, user_agent)
+    logger.info(
+        f"[apple][cookie-refresh] stored a freshly-refreshed Apple session "
+        f"(pincode_check_confirmed={data.get('pincode_check_confirmed')})"
+    )
+    return True
+
+
+async def apple_cookie_refresh_loop():
+    """
+    Runs every APPLE_COOKIE_REFRESH_INTERVAL seconds, independent of every
+    other loop in this file. No-ops (logs once, then returns — never spins
+    a pointless forever-loop) when PLAYWRIGHT_SCRAPER_URL isn't configured,
+    so a deploy that hasn't set up the Playwright refresher behaves exactly
+    as before (APPLE_COOKIES/APPLE_USER_AGENT env vars only).
+    """
+    if not PLAYWRIGHT_SCRAPER_URL:
+        logger.info(
+            "[apple][cookie-refresh] PLAYWRIGHT_SCRAPER_URL not set — "
+            "auto-refresher disabled, using APPLE_COOKIES/APPLE_USER_AGENT "
+            "env vars only."
+        )
+        return
+
+    logger.info(
+        f"[apple][cookie-refresh] loop started (interval="
+        f"{APPLE_COOKIE_REFRESH_INTERVAL}s, target={PLAYWRIGHT_SCRAPER_URL})"
+    )
+    while True:
+        try:
+            await run_apple_cookie_refresh_cycle()
+        except Exception as exc:
+            logger.error(f"[apple][cookie-refresh] cycle error: {exc}")
+        await asyncio.sleep(APPLE_COOKIE_REFRESH_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Access maintenance (expiry reminders + grace-period data purge)
 # ---------------------------------------------------------------------------
 
@@ -576,11 +685,13 @@ async def main():
 
     await register_commands(bot)
 
-    # Background tasks: stock checking (existing) and access maintenance
-    # (reminders + grace-period purge) run as independent concurrent loops
-    # on their own cadences (CHECK_INTERVAL vs ACCESS_CHECK_INTERVAL).
+    # Background tasks: stock checking (existing), access maintenance
+    # (reminders + grace-period purge), and the Apple cookie auto-refresher
+    # run as independent concurrent loops on their own cadences
+    # (CHECK_INTERVAL vs ACCESS_CHECK_INTERVAL vs APPLE_COOKIE_REFRESH_INTERVAL).
     checker_task = asyncio.create_task(stock_checker_loop(bot))
     access_task = asyncio.create_task(access_maintenance_loop(bot))
+    apple_cookie_task = asyncio.create_task(apple_cookie_refresh_loop())
 
     logger.info("Bot is starting…")
     try:
@@ -588,6 +699,7 @@ async def main():
     finally:
         checker_task.cancel()
         access_task.cancel()
+        apple_cookie_task.cancel()
         await bot.session.close()
 
 

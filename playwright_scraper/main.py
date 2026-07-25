@@ -1,18 +1,30 @@
 """
 playwright_scraper/main.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-Standalone pilot scraper service (Playwright + Chromium) for iQOO and Vivo,
-built to test replacing their current Scrape.do render=true checks — those
-burn render credits at scale; this self-hosts the same JS-rendering step
-behind an optional metered proxy instead.
+Standalone Playwright + Chromium service, serving two independent purposes
+in the main bot's architecture:
+
+1. A pilot scraper for iQOO and Vivo, built to test replacing their current
+   Scrape.do render=true checks — those burn render credits at scale; this
+   self-hosts the same JS-rendering step behind an optional metered proxy
+   instead. NOT wired into the main bot's production checkers (checkers/
+   iqoo.py, checkers/vivo.py are untouched) — /check-stock exists purely for
+   standalone testing/comparison.
+2. The main bot's Apple pickup-checking IS wired to this service, but only
+   for periodic cookie refresh (/refresh-apple-cookies, called by bot.py's
+   apple_cookie_refresh_loop every APPLE_COOKIE_REFRESH_INTERVAL) — never
+   for the actual per-check requests, which stay on plain httpx in the main
+   bot for speed. See that endpoint's own section below for why.
 
 ISOLATION: this is a completely separate Railway service — its own
 container, its own process, its own requirements.txt (Playwright is NOT a
-dependency of the main bot). The main bot's existing iQOO/Vivo Scrape.do
-checkers (checkers/iqoo.py, checkers/vivo.py) are UNTOUCHED and remain live
-in production; nothing here is wired into the main bot yet. If this crashes,
-gets blocked, or a proxy runs out of quota, the main bot is unaffected — it
-simply isn't calling this service (nothing does, yet).
+dependency of the main bot). If this crashes, gets blocked, or a proxy runs
+out of quota: /check-stock's iQOO/Vivo pilot is simply unaffected (nothing
+in the main bot calls it); /refresh-apple-cookies failing just means the
+main bot's stored Apple session goes unrefreshed until the next cycle or
+this service recovers — the main bot falls back to whatever session it last
+had, then to the APPLE_COOKIES/APPLE_USER_AGENT env vars (see
+checkers/apple.py's _resolve_apple_session). Never fatal to the main bot.
 
 HTTP surface:
   POST /check-stock    Body: {"url": str, "store": "iqoo"|"vivo"}. Returns
@@ -43,8 +55,32 @@ HTTP surface:
                         For admin diagnostic use (e.g. RelianceDigital's
                         /debugreliance) — hit directly, no auth (matches
                         /check-stock; this whole service has none).
+  POST /refresh-apple-cookies
+                        Body: {"url": str (an apple.com/<locale>/shop/...
+                        product page), "pincode": str}. Loads the page in a
+                        real headless-Chromium session, extracts its SKU,
+                        and performs an in-page fetch() of Apple's
+                        fulfillment-messages endpoint (same query params as
+                        the main bot's checkers/apple.py) for `pincode` —
+                        this is the exact request Apple's own pickup-
+                        availability UI would trigger, run from inside the
+                        already-loaded page's JS context so it carries a
+                        genuine browser TLS fingerprint, headers, and
+                        cookies. Returns {"url", "pincode", "cookies":
+                        "name=value; ..." (semicolon-joined, ready to use as
+                        a Cookie header), "user_agent": str,
+                        "pincode_check_confirmed": bool (True only if that
+                        in-page fetch returned HTTP 200 with valid JSON),
+                        "diagnostics": {...}}. Requires header
+                        "X-Internal-Token: <INTERNAL_REFRESH_TOKEN>" only if
+                        that env var is set on this service (unset = no auth,
+                        matching every other endpoint's default here). See
+                        _refresh_apple_cookies's own docstring for the full
+                        reasoning on why this uses an in-page fetch instead
+                        of clicking through Apple's pickup UI widget.
   GET  /health         Unauthenticated: {"ok", "max_concurrent_checks",
-                        "proxy_configured", "supported_stores"}.
+                        "proxy_configured", "supported_stores",
+                        "apple_cookie_refresh_auth_required"}.
 
 Stock-detection logic for iqoo/vivo (check_iqoo_vivo_stock, _OOS_PATTERNS,
 _offer_availability) is PORTED from checkers/iqoo.py and checkers/vivo.py —
@@ -59,9 +95,10 @@ this needs once deployed.
 import json
 import logging
 import os
+import re
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
@@ -78,6 +115,14 @@ logger = logging.getLogger("playwright_scraper")
 # ---------------------------------------------------------------------------
 PORT = int(os.getenv("PORT", "8080"))
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+
+# Optional shared secret for /refresh-apple-cookies only (every other
+# endpoint here stays unauthenticated, by design — see the module docstring
+# and README). Unset means no auth check, matching this service's existing
+# "internal pilot" posture; set it (and the matching
+# PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN on the main bot side) once this handles
+# real session cookies rather than just stock-check results.
+INTERNAL_REFRESH_TOKEN = os.getenv("INTERNAL_REFRESH_TOKEN", "")
 
 # Requirement #7 ("Add resource limits: cap con...") — the message cut off
 # there; taken as "cap concurrent browser instances", since that's the
@@ -536,6 +581,174 @@ def _capture_network_calls(url: str, pincode: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# /refresh-apple-cookies: launch a real headless-Chromium session, load an
+# Apple product page, and trigger the SAME fulfillment-messages request a
+# real visitor's own pickup-availability check performs — from INSIDE the
+# page's own JS context via page.evaluate(fetch(...)), not a separate
+# out-of-band request. Because it runs same-origin from a page that's
+# already loaded and passed apple.com's own anti-bot checks, it carries the
+# real browser's TLS fingerprint, headers, and cookies exactly the way
+# Apple's own frontend JS would — this is the whole point of doing cookie
+# acquisition via Playwright instead of the main bot's plain httpx calls
+# (httpx's TLS fingerprint doesn't match a real browser's, which is part of
+# why a manually-pasted cookie/UA pair was found dying after ~2 hours; see
+# the main bot's checkers/apple.py and config.py for that history).
+#
+# Deliberately does NOT try to click through Apple's pickup-availability UI
+# widget (a "See availability" link + pincode input + submit button) — that
+# DOM structure isn't something this sandbox can verify live, and a
+# selector guess would be fragile. Instead it reproduces exactly what that
+# UI would do once submitted: call fulfillment-messages with the page's own
+# SKU and the given pincode. Same endpoint, same query params
+# (checkers/apple.py's _build_fulfillment_target), same authentication
+# (page-context fetch = real browser Cookie/UA), without depending on
+# unconfirmed CSS selectors.
+# ---------------------------------------------------------------------------
+
+_APPLE_SKU_PATTERN = re.compile(r'"partNumber"\s*:\s*"([A-Z0-9]{5,14}/[A-Z]{1,3})"')
+
+
+def _extract_apple_sku(html: str) -> str | None:
+    m = _APPLE_SKU_PATTERN.search(html)
+    return m.group(1) if m else None
+
+
+def _fulfillment_messages_url(product_url: str, sku: str, pincode: str) -> str | None:
+    """Builds the same fulfillment-messages URL checkers/apple.py's
+    _build_fulfillment_target does, deriving the locale-prefixed /shop/ path
+    from the product URL itself (".../in/shop/buy-iphone/..." -> "/in/shop/
+    fulfillment-messages") rather than hardcoding "/in/", so this works for
+    any Apple storefront locale. Returns None if the product URL doesn't
+    look like an apple.com /shop/ page at all."""
+    parsed = urlparse(product_url)
+    segments = [s for s in parsed.path.split("/") if s]
+    if "shop" not in segments:
+        return None
+    shop_idx = segments.index("shop")
+    locale_prefix = "/".join(segments[:shop_idx])
+    path = f"/{locale_prefix}/shop/fulfillment-messages" if locale_prefix else "/shop/fulfillment-messages"
+    params = {
+        "fae": "true", "location": pincode, "little": "false",
+        "parts.0": sku, "mts.0": "regular", "mts.1": "sticky", "fts": "true",
+    }
+    return f"{parsed.scheme}://{parsed.netloc}{path}?{urlencode(params)}"
+
+
+_FULFILLMENT_FETCH_JS = """async (target) => {
+    const resp = await fetch(target, {
+        credentials: 'include',
+        headers: { 'Accept': '*/*', 'x-skip-redirect': 'true' },
+    });
+    const text = await resp.text();
+    return { status: resp.status, body: text.slice(0, 2000) };
+}"""
+
+
+def _refresh_apple_cookies(url: str, pincode: str) -> dict:
+    """Loads `url`, extracts its SKU, performs an in-page fetch of
+    fulfillment-messages for `pincode` (see module note above), and returns
+    the resulting session:
+      {"cookies": "name=value; name2=value2; ...",
+       "user_agent": <the UA this browser context used>,
+       "pincode_check_confirmed": bool,  # fulfillment-messages returned a
+                                          # 200 with a valid JSON body
+       "diagnostics": {...}}
+    cookies/user_agent are still returned even when pincode_check_confirmed
+    is False (e.g. SKU extraction failed, or the fetch itself errored) —
+    the page load alone still mints real anti-bot/session cookies, which
+    may still be usable; the caller (the main bot) can decide whether an
+    unconfirmed refresh is worth storing. Never raises for anything short
+    of a hard Playwright/browser failure (navigation errors, missing SKU,
+    and fetch failures are all captured in diagnostics instead)."""
+    acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
+    if not acquired:
+        raise RuntimeError(
+            f"too many concurrent checks (max {MAX_CONCURRENT_CHECKS}) — "
+            f"timed out after {SLOT_WAIT_TIMEOUT_SECONDS}s waiting for a free slot"
+        )
+    try:
+        with sync_playwright() as pw:
+            browser, context = _new_browser_and_context(pw)
+            try:
+                page = context.new_page()
+                stats: dict = {}
+                page.route("**/*", _make_resource_blocker(stats))
+
+                diagnostics: dict = {
+                    "goto_status": None,
+                    "goto_error": None,
+                    "sku_extracted": None,
+                    "fulfillment_url": None,
+                    "fulfillment_status": None,
+                    "fulfillment_error": None,
+                }
+
+                try:
+                    main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                    if main_response is not None:
+                        diagnostics["goto_status"] = main_response.status
+                except Exception as exc:
+                    diagnostics["goto_error"] = str(exc)
+                    logger.error(f"[refresh-apple-cookies] page.goto failed for {url}: {exc}")
+
+                html = ""
+                try:
+                    html = page.content()
+                except Exception as exc:
+                    logger.error(f"[refresh-apple-cookies] page.content() failed for {url}: {exc}")
+
+                sku = _extract_apple_sku(html)
+                diagnostics["sku_extracted"] = sku
+
+                pincode_check_confirmed = False
+                if sku:
+                    fulfillment_url = _fulfillment_messages_url(url, sku, pincode)
+                    diagnostics["fulfillment_url"] = fulfillment_url
+                    if fulfillment_url:
+                        try:
+                            result = page.evaluate(_FULFILLMENT_FETCH_JS, fulfillment_url)
+                            status = result.get("status")
+                            diagnostics["fulfillment_status"] = status
+                            if status == 200:
+                                try:
+                                    json.loads(result.get("body", ""))
+                                    pincode_check_confirmed = True
+                                except Exception:
+                                    diagnostics["fulfillment_error"] = "non-JSON response body"
+                            else:
+                                diagnostics["fulfillment_error"] = f"HTTP {status}"
+                        except Exception as exc:
+                            diagnostics["fulfillment_error"] = str(exc)
+                            logger.warning(
+                                f"[refresh-apple-cookies] in-page fulfillment-messages "
+                                f"fetch failed for {url}: {exc}"
+                            )
+                    else:
+                        diagnostics["fulfillment_error"] = "product URL is not an apple.com /shop/ page"
+                else:
+                    diagnostics["fulfillment_error"] = "could not extract SKU/part number from product page"
+
+                cookies_list = context.cookies()
+                cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies_list)
+
+                logger.info(
+                    f"[refresh-apple-cookies] {url}: {len(cookies_list)} cookie(s) captured, "
+                    f"pincode_check_confirmed={pincode_check_confirmed}, diagnostics={diagnostics}"
+                )
+
+                return {
+                    "cookies": cookie_header,
+                    "user_agent": _REALISTIC_USER_AGENT,
+                    "pincode_check_confirmed": pincode_check_confirmed,
+                    "diagnostics": diagnostics,
+                }
+            finally:
+                browser.close()
+    finally:
+        _check_semaphore.release()
+
+
+# ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
 
@@ -574,6 +787,27 @@ def create_app() -> Flask:
 
         return jsonify({"url": url, "pincode": pincode, **result}), 200
 
+    @app.route("/refresh-apple-cookies", methods=["POST"])
+    def refresh_apple_cookies():
+        if INTERNAL_REFRESH_TOKEN:
+            supplied = request.headers.get("X-Internal-Token", "")
+            if supplied != INTERNAL_REFRESH_TOKEN:
+                return jsonify({"error": "unauthorized"}), 401
+
+        data = request.get_json(silent=True) or {}
+        url = (data.get("url") or "").strip()
+        pincode = (data.get("pincode") or "").strip() or DEFAULT_DEBUG_PINCODE
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+
+        try:
+            result = _refresh_apple_cookies(url, pincode)
+        except Exception as exc:
+            logger.error(f"[refresh-apple-cookies] failed for {url}: {exc}")
+            return jsonify({"url": url, "pincode": pincode, "error": str(exc)}), 502
+
+        return jsonify({"url": url, "pincode": pincode, **result}), 200
+
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({
@@ -581,6 +815,7 @@ def create_app() -> Flask:
             "max_concurrent_checks": MAX_CONCURRENT_CHECKS,
             "proxy_configured": _proxy_config() is not None,
             "supported_stores": sorted(CHECKERS),
+            "apple_cookie_refresh_auth_required": bool(INTERNAL_REFRESH_TOKEN),
         })
 
     return app
