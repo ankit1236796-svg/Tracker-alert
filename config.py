@@ -228,34 +228,16 @@ APPLE_PICKUP_STORE_LABELS = {
     "201301": "Apple Noida",
 }
 
-# Pincode -> Apple's own INTERNAL store code ("R-code"), REQUIRED for the
-# fulfillment-messages query. Real production testing (fresh Railway
-# redeploy logs) showed the endpoint now returns HTTP 541 "Page Not Found"
-# for a location=<pincode> request — the ONLY format this codebase has
-# ever used (confirmed via full git history review; there was never a
-# store=-based version to regress from). A real browser-captured request
-# using store=<code> instead succeeded. Most likely cause: Apple changed
-# its fulfillment-messages routing/validation after several new India
-# stores opened in late 2025/early 2026 (Apple Noida, Apple Borivali) —
-# not a regression on our side.
-#
-# These codes are NOT published anywhere — they only appear inside a real
-# fulfillment-messages response for that specific store, so each one has
-# to be captured manually (open the store's real product page in a
-# browser, select it for pickup, and read the store= value from the
-# resulting request), same as R756 (Saket) was. A pincode with no code
-# here is SKIPPED entirely (no request attempted) until one is supplied —
-# see checkers/apple.py's _fetch_official_store_availability /
-# resolve_nearest_official_store. Override via env var, no code change
-# needed once a code is captured.
-APPLE_PICKUP_STORE_CODES = {
-    "110017": os.getenv("APPLE_STORE_CODE_SAKET", "R756").strip() or None,
-    "400051": os.getenv("APPLE_STORE_CODE_BKC", "").strip() or None,
-    "400066": os.getenv("APPLE_STORE_CODE_BORIVALI", "").strip() or None,
-    "560092": os.getenv("APPLE_STORE_CODE_HEBBAL", "").strip() or None,
-    "411001": os.getenv("APPLE_STORE_CODE_KOREGAON_PARK", "").strip() or None,
-    "201301": os.getenv("APPLE_STORE_CODE_NOIDA", "").strip() or None,
-}
+# NOTE on the fulfillment-messages query itself: a location=<pincode>
+# request via this codebase's cookie-based transport (checkers/apple.py's
+# _cookie_auth_fetch) initially 541'd ("Page Not Found"), which was first
+# mis-diagnosed as location= itself being rejected — a store=<code>-per-
+# official-store detour was built (and then reverted) as a result. Real
+# screenshots later confirmed the true cause was a request-header mismatch
+# (wrong Accept/Referer, missing x-skip-redirect), not the query param.
+# With the headers fixed, location=<pincode> works for all 6 pincodes
+# above AND any arbitrary /trackpickup pincode — no per-store internal
+# Apple code needed at all.
 
 # Feature-scoped alert gate — NOT config.UNRELIABLE_SITES, which would also
 # suppress the two EXISTING, already-working Apple signals above (the

@@ -8,7 +8,6 @@ from urllib.parse import urlencode
 import httpx
 from bs4 import BeautifulSoup
 
-from config import APPLE_PICKUP_STORE_CODES
 from .common import fetch_page
 
 logger = logging.getLogger(__name__)
@@ -192,73 +191,17 @@ def _extract_sku(soup: BeautifulSoup, html: str) -> str | None:
     return None
 
 
-# ── Nearest-official-store resolution (replaces a location=<pincode> query
-# entirely — see this section's own module note further below for why) ────
-#
-# Best-effort PIN-code-prefix heuristic mapping an ARBITRARY Indian pincode
-# to the nearest of the 6 fixed official Apple Store pincodes in
-# config.APPLE_PICKUP_STORE_CODES — NOT real geographic distance (no
-# geocoding available), just metro-area PIN-code prefixes with a rough
-# numeric split for Mumbai's two stores. Deliberately conservative: returns
-# None (no nearby official store) for anything outside these 5 metro areas,
-# which is the genuinely correct answer for most of India given Apple has
-# only 6 physical stores here — matches this module's existing "no stores
-# nearby is the common case, don't force a guess" design (see
-# _evaluate_pickup_availability's own docstring).
-_NOIDA_PIN_PREFIX = "201"  # Noida/Ghaziabad, western UP
-_DELHI_PIN_PREFIX = "11"  # Delhi proper
-_MUMBAI_PIN_PREFIX = "400"
-_BENGALURU_PIN_PREFIX = "560"  # only one BLR store — any 560xxx pincode matches
-_PUNE_PIN_PREFIX = "411"  # only one Pune store — any 411xxx pincode matches
-# Mumbai's two stores are split by the pincode's last 3 digits: BKC
-# (400051) is South/Central Mumbai, Borivali (400066) is the northern
-# suburbs — PIN codes in that corridor increase roughly south-to-north, so
-# a numeric split near the midpoint of our two reference pincodes (051 vs
-# 066) is a reasonable approximation, not an authoritative boundary.
-_MUMBAI_SPLIT_THRESHOLD = 60
-
-
-def _nearest_official_store_pincode(pincode: str) -> str | None:
-    if pincode.startswith(_NOIDA_PIN_PREFIX):
-        return "201301"
-    if pincode.startswith(_DELHI_PIN_PREFIX):
-        return "110017"
-    if pincode.startswith(_MUMBAI_PIN_PREFIX):
-        try:
-            last3 = int(pincode[3:6])
-        except (ValueError, IndexError):
-            return None
-        return "400051" if last3 < _MUMBAI_SPLIT_THRESHOLD else "400066"
-    if pincode.startswith(_BENGALURU_PIN_PREFIX):
-        return "560092"
-    if pincode.startswith(_PUNE_PIN_PREFIX):
-        return "411001"
-    return None
-
-
-def resolve_nearest_official_store(pincode: str) -> tuple[str | None, str | None]:
-    """
-    Returns (nearest_official_store_pincode, store_code) for ANY Indian
-    pincode — used by _fetch_pickup_availability (refine_with_pincode +
-    /trackpickup, which take an arbitrary user pincode) to find which of
-    the 6 fixed official Apple Store pincodes to query, since Apple's
-    fulfillment-messages endpoint now requires a specific store=<code>
-    rather than a location=<pincode> search (see this section's module
-    note below).
-
-    If `pincode` IS already one of the 6 official pincodes (the case for
-    check_pickup_at_official_stores/_fetch_official_store_availability),
-    it resolves to itself directly — no heuristic needed. Otherwise falls
-    back to _nearest_official_store_pincode's best-effort metro-area
-    match. Either the nearest pincode or its store_code (or both) can be
-    None: no nearby official store at all, or a nearby store whose code
-    hasn't been captured yet (see config.APPLE_PICKUP_STORE_CODES) —
-    callers treat either case identically (nothing to query).
-    """
-    nearest = pincode if pincode in APPLE_PICKUP_STORE_CODES else _nearest_official_store_pincode(pincode)
-    if not nearest:
-        return None, None
-    return nearest, APPLE_PICKUP_STORE_CODES.get(nearest)
+def _build_fulfillment_target(sku: str, pincode: str) -> str:
+    params = {
+        "fae": "true",
+        "location": pincode,
+        "little": "false",
+        "parts.0": sku,
+        "mts.0": "regular",
+        "mts.1": "sticky",
+        "fts": "true",
+    }
+    return f"{_FULFILLMENT_URL}?{urlencode(params)}"
 
 
 # ── Direct cookie-based fetch (shared by every fulfillment-messages caller
@@ -285,27 +228,23 @@ def resolve_nearest_official_store(pincode: str) -> tuple[str | None, str | None
 # APPLE_COOKIES) rather than captured/managed by this bot itself — the
 # admin refreshes them manually (their own local Chrome cookie-extraction
 # script) when Apple's session expires. Same operational model as
-# checkers/croma.py's CROMA_APIM_KEY, and the exact approach already
-# proven out for the official-store checker below (_fetch_official_store_
-# availability originally had its own near-identical copy of this; the two
-# were unified into this one shared helper once both existed, since the
-# only difference between them was the target URL's param set and log
-# labels — the auth/error-handling logic itself was already duplicated
-# verbatim, so keeping two copies risked exactly the "fixed one, forgot
-# the other" bug this refactor eliminates).
+# checkers/croma.py's CROMA_APIM_KEY.
 #
-# UPDATE: real production testing found the fulfillment-messages endpoint
-# now returns HTTP 541 "Page Not Found" for a location=<pincode> query —
-# the ONLY format this codebase (or this function) has ever used, per a
-# full git-history review; there was never a working store=-based version
-# that regressed. A real browser-captured request using store=<code>
-# instead succeeded. Most likely cause: Apple changed its fulfillment-
-# messages routing/validation after several new India stores opened in
-# late 2025/early 2026 — not a regression on our side. Every fulfillment-
-# messages call in this module now goes through resolve_nearest_official_
-# store + _build_official_store_fulfillment_url (store=<code>) instead of
-# building its own location=<pincode> URL — see that section further
-# below for the param set and why store= replaced location=.
+# HEADER HISTORY (worth keeping — this was mis-diagnosed once already):
+# a location=<pincode> request via this same cookie-based transport
+# initially 541'd ("Page Not Found"). That was first (wrongly) attributed
+# to the location= param itself, and _build_fulfillment_target was
+# temporarily replaced with a store=<code>-per-official-store lookup
+# requiring each of the 6 stores' internal Apple codes to be manually
+# captured. Real screenshots later confirmed the TRUE cause was a header
+# mismatch: this function's Accept/Referer were wrong and x-skip-redirect
+# was missing entirely (now fixed below, matching a real working reference
+# implementation exactly). With the correct headers, location=<pincode>
+# works for all 6 official stores AND any arbitrary /trackpickup pincode —
+# no store-code capture needed at all, so that whole detour (store=<code>,
+# config.APPLE_PICKUP_STORE_CODES, resolve_nearest_official_store) was
+# reverted. Moral: verify header/cookie correctness before concluding a
+# query PARAM is the problem.
 def _apple_user_agent() -> str:
     # Read at call time (mirrors checkers/croma.py's _apim_key() pattern)
     # so a Railway env var change (a manual cookie/UA refresh) takes effect
@@ -404,13 +343,10 @@ async def _fetch_pickup_availability(
     sku: str, pincode: str, product_url: str | None = None,
 ) -> tuple[dict | None, str | None, list[tuple[str, str | None]]]:
     """
-    Calls Apple's fulfillment-messages endpoint directly for the nearest
-    official Apple Store to `pincode` (see resolve_nearest_official_store
-    + _cookie_auth_fetch above — this pincode is arbitrary/user-supplied,
-    unlike the official-store checker's own fixed 6, so it has to be
-    resolved to one of those 6 first; store=<code> is REQUIRED now, a bare
-    location=<pincode> search 541s — see _cookie_auth_fetch's module note).
-    Returns (data, method, diagnostics):
+    Calls Apple's fulfillment-messages endpoint directly via
+    _build_fulfillment_target + _cookie_auth_fetch above (real Cookie/
+    User-Agent headers, no Scrape.do/Zyte). Returns (data, method,
+    diagnostics):
       - method is "direct" on success, None on failure.
       - diagnostics is a single-entry list [("direct", error_or_None)] —
         kept as a list (not a bare tuple) for backward compatibility with
@@ -423,37 +359,15 @@ async def _fetch_pickup_availability(
     Never raises; callers that only need the data can unpack as
     `data, _method, _diag = await ...`, exactly as before.
 
-    Returns (None, None, [...]) with a clear reason when no official store
-    is near `pincode` at all, OR one is near but its store code hasn't
-    been captured yet (config.APPLE_PICKUP_STORE_CODES) — both cases
-    "nothing to query", handled identically. This is expected to be the
-    outcome for MOST pincodes today: only Saket's code (R756) is
-    currently known, so this only succeeds for pincodes resolving near
-    Delhi until more codes are added — no code change needed once they
-    are (see config.py's own note on APPLE_PICKUP_STORE_CODES).
-
     product_url is accepted for backward compatibility with every existing
     call site's signature but is no longer used — the old navigate-first
     approach needed it to establish a page session before triggering the
     in-page fetch; the direct cookie-based approach doesn't navigate
     anywhere, so there's nothing left to pass it to.
     """
-    nearest_pincode, store_code = resolve_nearest_official_store(pincode)
-    if not store_code:
-        reason = (
-            f"no official-store code available near pincode {pincode!r} "
-            + (
-                f"(nearest known official store: {nearest_pincode!r}, code not yet captured)"
-                if nearest_pincode else "(no official Apple Store near this pincode)"
-            )
-        )
-        logger.info(f"[apple][resolve] fulfillment-messages pincode={pincode!r} {reason}")
-        return None, None, [("direct", reason)]
-
-    target = _build_official_store_fulfillment_url(sku, store_code)
+    target = _build_fulfillment_target(sku, pincode)
     data, err = await _cookie_auth_fetch(
-        target, log_tag="resolve",
-        context=f"fulfillment-messages pincode={pincode!r} nearest_store={nearest_pincode!r} store={store_code!r}",
+        target, log_tag="resolve", context=f"fulfillment-messages pincode={pincode!r}",
         timeout=_FULFILLMENT_TIMEOUT,
     )
     diagnostics: list[tuple[str, str | None]] = [("direct", err)]
@@ -740,47 +654,22 @@ async def refine_with_pincode(
 # (the user's own single saved pincode only) or the separate opt-in
 # /trackpickup system (user-chosen pincodes, requires a command to set up).
 #
-# Shares _cookie_auth_fetch/_apple_user_agent/_apple_cookies (defined above,
-# next to _fetch_pickup_availability) for the actual HTTP call — both this
-# and _fetch_pickup_availability hit the exact same Apple endpoint the
-# exact same way (real Cookie/User-Agent headers, no Scrape.do/Zyte, both
-# now using store=<code> — see below). Consequently this checker spends
-# ZERO Scrape.do/Zyte credits and is automatically absent from database.
-# get_zyte_usage_summary's per-site breakdown / admin_handlers.py's
-# /creditusage (that table is only ever written to from inside
-# zyte_client.fetch_page) — no separate credit-tracking exclusion needed.
-#
-# Endpoint/params: originally built with location=<pincode> (as supplied
-# for this task, `location` confirmed via WebSearch at the time) but real
-# production testing found that now 541s — see this file's _cookie_auth_
-# fetch module note above for the full investigation. A real browser-
-# captured request confirmed store=<code> is what actually works today:
-#   fae=true&store=R756&little=false&parts.0=<sku>&mts.0=regular&mts.1=sticky&fts=true
-# — the SAME param set as before, just store=<code> in place of
-# location=<pincode>. Since this checker's pincodes ARE the 6 fixed
-# official stores, resolving a code is a direct dict lookup (config.
-# APPLE_PICKUP_STORE_CODES) — no nearest-store heuristic needed (that's
-# only for _fetch_pickup_availability's arbitrary user pincodes, above).
-# A pincode with no code yet is skipped entirely (see
-# _fetch_official_store_availability) — currently only Saket (R756) is
-# known; the other 5 are skipped until their codes are captured (see
-# config.py's own note on APPLE_PICKUP_STORE_CODES for how).
+# Shares _cookie_auth_fetch/_apple_user_agent/_apple_cookies AND
+# _build_fulfillment_target (all defined above, next to
+# _fetch_pickup_availability) for the actual request — this checker and
+# _fetch_pickup_availability hit the exact same Apple endpoint the exact
+# same way (real Cookie/User-Agent headers, no Scrape.do/Zyte,
+# location=<pincode> — confirmed via real screenshots to work for all 6
+# official-store pincodes once the request headers were fixed; see
+# _cookie_auth_fetch's own module note for that history). Consequently
+# this checker spends ZERO Scrape.do/Zyte credits and is automatically
+# absent from database.get_zyte_usage_summary's per-site breakdown /
+# admin_handlers.py's /creditusage (that table is only ever written to
+# from inside zyte_client.fetch_page) — no separate credit-tracking
+# exclusion needed.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _OFFICIAL_STORE_TIMEOUT = 20.0
-
-
-def _build_official_store_fulfillment_url(sku: str, store_code: str) -> str:
-    params = {
-        "fae": "true",
-        "store": store_code,
-        "little": "false",
-        "parts.0": sku,
-        "mts.0": "regular",
-        "mts.1": "sticky",
-        "fts": "true",
-    }
-    return f"{_FULFILLMENT_URL}?{urlencode(params)}"
 
 
 async def _fetch_official_store_availability(sku: str, pincode: str) -> dict | None:
@@ -789,20 +678,12 @@ async def _fetch_official_store_availability(sku: str, pincode: str) -> dict | N
     for one of the 6 fixed official-store pincodes — see _cookie_auth_fetch
     (shared with _fetch_pickup_availability above) for the actual request/
     auth/error-handling logic. Returns the parsed JSON on success, None on
-    any failure (no store code configured yet, missing env vars, network
-    error, HTTP status, non-JSON body — all logged). Never raises.
+    any failure (missing env vars, network error, HTTP status, non-JSON
+    body — all logged there). Never raises.
     """
-    store_code = APPLE_PICKUP_STORE_CODES.get(pincode)
-    if not store_code:
-        logger.warning(
-            f"[apple][official-stores] pincode={pincode!r} has no Apple store "
-            f"code configured yet (see config.APPLE_PICKUP_STORE_CODES) — skipping."
-        )
-        return None
-
-    target = _build_official_store_fulfillment_url(sku, store_code)
+    target = _build_fulfillment_target(sku, pincode)
     data, _err = await _cookie_auth_fetch(
-        target, log_tag="official-stores", context=f"pincode={pincode!r} store={store_code!r}",
+        target, log_tag="official-stores", context=f"pincode={pincode!r}",
         timeout=_OFFICIAL_STORE_TIMEOUT,
     )
     return data
