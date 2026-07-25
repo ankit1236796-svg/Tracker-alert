@@ -1,17 +1,24 @@
 # playwright_scraper
 
-Standalone pilot: a self-hosted Playwright + Chromium scraper for **iQOO and
-Vivo only**, to test replacing their current Scrape.do `render=true` checks
-(which burn render credits at scale) with a self-hosted equivalent behind an
-optional metered residential proxy.
+Self-hosted Playwright + Chromium service with two independent jobs:
 
-**Not wired into the main bot.** The main bot's existing `checkers/iqoo.py`
-and `checkers/vivo.py` (Scrape.do-based) are completely untouched and remain
-live in production. This service exists purely for you to test standalone —
-hit it directly, compare its results against real stock status, and decide
-whether/how to integrate it later. If this service crashes, gets blocked by
-the target site, or a proxy runs dry, nothing about the main bot changes —
-nothing in the main bot calls this service (yet).
+1. **iQOO/Vivo stock-check pilot** — a self-hosted alternative to their
+   current Scrape.do `render=true` checks (which burn render credits at
+   scale), behind an optional metered residential proxy. **Not wired into
+   the main bot** — `checkers/iqoo.py`/`checkers/vivo.py` (Scrape.do-based)
+   are completely untouched and remain live in production. This part
+   exists purely for you to test standalone — hit `/check-stock` directly,
+   compare its results against real stock status, and decide whether/how
+   to integrate it later. If it crashes, gets blocked, or a proxy runs dry,
+   nothing about the main bot changes.
+2. **Apple cookie auto-refresher — IS wired into the main bot.**
+   `/refresh-apple-cookies` is called on a timer by the main bot's own
+   `bot.py` (`apple_cookie_refresh_loop`, every `APPLE_COOKIE_REFRESH_
+   INTERVAL`, default 75 min) to replace manually-pasted `APPLE_COOKIES`/
+   `APPLE_USER_AGENT` Railway env vars with a periodic real-browser
+   session. See "Apple cookie auto-refresh" below. If this fails or the
+   service is down, the main bot just keeps using whatever Apple session
+   it already has (or the env var fallback) — never fatal.
 
 ## Deploying on Railway
 
@@ -43,6 +50,19 @@ Same pattern as `whatsapp_forwarder/`:
      Webshare (or any HTTP-auth proxy) credentials. **All optional** — with
      `PROXY_HOST`/`PROXY_PORT` unset, requests go out directly, so you can
      test this locally or on Railway before buying a proxy plan.
+   - `INTERNAL_REFRESH_TOKEN` (default unset = no auth) — shared secret
+     required as an `X-Internal-Token` header on `/refresh-apple-cookies`
+     only. Set this (and the matching `PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN`
+     env var on the **main bot's** Railway service) once this handles real
+     session cookies, so a stray public request can't trigger cookie
+     refreshes or read back a session.
+5. On the **main bot's** own Railway service, set `PLAYWRIGHT_SCRAPER_URL`
+   to this service's URL (its public `https://<service>.up.railway.app` or
+   Railway's private-networking address, e.g.
+   `http://playwright-scraper.railway.internal:8080`) to enable the Apple
+   cookie auto-refresher — see "Apple cookie auto-refresh" below. Left
+   unset, the main bot behaves exactly as before (manual `APPLE_COOKIES`/
+   `APPLE_USER_AGENT` env var refresh only).
 
 ## HTTP surface
 
@@ -142,9 +162,84 @@ and still useful for other sites/diagnostics that aren't behind an
 IP-level WAF block like this one.
 
 ```
+POST /refresh-apple-cookies
+Body: {"url": "https://www.apple.com/in/shop/buy-iphone/iphone-17", "pincode": "400051"}
+Header (only if INTERNAL_REFRESH_TOKEN is set): X-Internal-Token: <token>
+Response: {
+  "url": "...", "pincode": "400051",
+  "cookies": "dslang=US-EN; site=USA; s_vi=...; ...",   // semicolon-joined, ready as a Cookie header
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; ...) Chrome/128.0.0.0 Safari/537.36",
+  "pincode_check_confirmed": true,   // fulfillment-messages returned 200 + valid JSON
+  "diagnostics": {
+    "goto_status": 200, "goto_error": null,
+    "sku_extracted": "MG6M4HN/A",
+    "fulfillment_url": "https://www.apple.com/in/shop/fulfillment-messages?...",
+    "fulfillment_status": 200, "fulfillment_error": null
+  }
+}
+```
+See `_refresh_apple_cookies` in `main.py` for the full mechanism. Loads the
+product page, extracts its SKU (same `"partNumber":"..."` pattern
+`checkers/apple.py` uses), then runs `fetch(fulfillment_url, {credentials:
+'include'})` **from inside the page's own JS context** via
+`page.evaluate()` — same-origin (apple.com calling apple.com), so no CORS
+issue, and it carries the real browser's TLS fingerprint/headers/cookies
+exactly as if Apple's own pickup-availability widget had triggered it.
+Deliberately does NOT try to click through that widget's actual DOM (an
+unconfirmed "See availability" link → pincode input → submit sequence) —
+reproducing the underlying request directly is equivalent and doesn't
+depend on guessed CSS selectors that could silently break on a page
+redesign. `cookies`/`user_agent` are still returned even when
+`pincode_check_confirmed` is `false` (e.g. SKU extraction failed) — the
+page load alone still mints real session cookies, which may still be
+usable; the caller decides whether an unconfirmed refresh is worth storing
+(the main bot currently stores it either way — see `bot.py`'s
+`run_apple_cookie_refresh_cycle` — since even an unconfirmed session is
+never worse than the previous one or the env var fallback).
+
+## Apple cookie auto-refresh
+
+Replaces the main bot's old workflow (open DevTools in a real browser,
+manually copy the `Cookie` header + `User-Agent`, paste into the
+`APPLE_COOKIES`/`APPLE_USER_AGENT` Railway env vars, repeat every time the
+session dies) with a fully automated loop:
+
+1. Every `APPLE_COOKIE_REFRESH_INTERVAL` (default 75 min), the main bot's
+   `bot.py` (`apple_cookie_refresh_loop`) calls this service's
+   `/refresh-apple-cookies`.
+2. This service launches a real headless-Chromium session, loads
+   `APPLE_COOKIE_REFRESH_PRODUCT_URL` (default the iPhone 17 buy page), and
+   triggers a genuine fulfillment-messages request for
+   `APPLE_COOKIE_REFRESH_PINCODE` from inside that page — see the endpoint
+   doc above.
+3. On success, the main bot stores the returned cookies + User-Agent in its
+   own SQLite DB (`database.set_apple_session_cookies`) — not an env var,
+   so no Railway redeploy is needed to pick up a refresh.
+4. The main bot's actual per-check requests (`checkers/apple.py`'s
+   `check_pickup_at_official_stores`, `/trackpickup`, `refine_with_
+   pincode`) read from that DB-stored session first
+   (`_resolve_apple_session`), falling back to the `APPLE_COOKIES`/
+   `APPLE_USER_AGENT` env vars only if the DB has never been populated (a
+   fresh deploy before the first successful refresh) or the refresher is
+   failing. Those checks are **unchanged otherwise** — still plain httpx,
+   no Playwright in that hot path, so per-check speed stays ~1s.
+
+Why a real browser mints the cookies but a fast library still uses them:
+`httpx`'s TLS fingerprint doesn't match a real browser's TLS stack, which
+was one of the suspected contributors (alongside request volume/burstiness)
+to a manually-pasted session dying after ~2 hours even under paced,
+sequential request traffic. A genuine Chromium session establishes cookies
+with a real, matching fingerprint at the moment Apple issues them — but
+there's no need to pay Playwright's per-request overhead (~5-30s vs.
+httpx's ~1s) for every stock check just to keep that fingerprint consistent
+on every single request; only the moment of cookie *acquisition* needs a
+real browser, not every use of the resulting cookies afterward.
+
+```
 GET /health
 Response: {"ok": true, "max_concurrent_checks": 2, "proxy_configured": false,
-           "supported_stores": ["iqoo", "vivo"]}
+           "supported_stores": ["iqoo", "vivo"],
+           "apple_cookie_refresh_auth_required": false}
 ```
 
 Examples:
@@ -156,6 +251,11 @@ curl -X POST https://<your-service>.up.railway.app/check-stock \
 curl -X POST https://<your-service>.up.railway.app/debug-network \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.reliancedigital.in/...", "pincode": "110001"}'
+
+curl -X POST https://<your-service>.up.railway.app/refresh-apple-cookies \
+  -H "Content-Type: application/json" \
+  -H "X-Internal-Token: <token, only if INTERNAL_REFRESH_TOKEN is set>" \
+  -d '{"url": "https://www.apple.com/in/shop/buy-iphone/iphone-17", "pincode": "400051"}'
 ```
 
 ## Bandwidth optimization

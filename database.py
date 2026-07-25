@@ -394,6 +394,26 @@ def init_db():
         """)
         conn.commit()
 
+        # Auto-refreshed Apple session (cookies + matching User-Agent), minted
+        # periodically by a real headless-Chromium session in the separate
+        # playwright_scraper service (see checkers/apple.py's
+        # get_apple_session_cookies/set_apple_session_cookies and bot.py's
+        # apple_cookie_refresh_loop) instead of a manually-pasted
+        # APPLE_COOKIES/APPLE_USER_AGENT Railway env var. Single-row table
+        # (id fixed at 1) — there is only ever one "current" Apple session,
+        # never one per user/product. Falls back to the env vars only when
+        # this table has never been populated (fresh deploy, or the
+        # Playwright refresher unavailable/failing) — see checkers/apple.py.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS apple_session_cookies (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                cookies     TEXT    NOT NULL,
+                user_agent  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+
         # Migration: every pre-existing user (found via products/pin_codes) who
         # doesn't yet have a `users` row is switched into the access-control
         # system "as if their trial just ended" — access_until = now, giving
@@ -1146,6 +1166,45 @@ def upsert_apple_official_pickup_status(
                 last_checked = COALESCE(excluded.last_checked, apple_official_pickup_status.last_checked)
             """,
             (url, final_sku, json.dumps(pincode_status), now),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Apple auto-refreshed session cookies (see apple_session_cookies table
+# above) — the Playwright-based replacement for manually-pasted
+# APPLE_COOKIES/APPLE_USER_AGENT env vars. Single row, id=1.
+# ---------------------------------------------------------------------------
+
+def get_apple_session_cookies() -> dict | None:
+    """Returns {'cookies', 'user_agent', 'updated_at'} from the most recent
+    Playwright-based refresh, or None if the refresher has never
+    successfully run yet (checkers/apple.py falls back to the
+    APPLE_COOKIES/APPLE_USER_AGENT env vars in that case)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT cookies, user_agent, updated_at FROM apple_session_cookies WHERE id = 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_apple_session_cookies(cookies: str, user_agent: str) -> None:
+    """Overwrites the single stored Apple session with a freshly-minted
+    one. Called only after a successful Playwright refresh (see bot.py's
+    apple_cookie_refresh_loop) — a failed/timed-out refresh never calls
+    this, so a transient Playwright failure leaves the previous
+    (still-usable) session in place rather than wiping it out."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO apple_session_cookies (id, cookies, user_agent, updated_at)
+            VALUES (1, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                cookies = excluded.cookies,
+                user_agent = excluded.user_agent,
+                updated_at = excluded.updated_at
+            """,
+            (cookies, user_agent),
         )
         conn.commit()
 

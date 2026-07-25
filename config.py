@@ -256,7 +256,12 @@ APPLE_PICKUP_STORE_LABELS = {
 # pattern-sensitive — see checkers/apple.py's check_pickup_at_official_
 # stores for the complementary sequential-with-jitter + shared-connection
 # changes (also part of reducing this endpoint's bot-like footprint).
-APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "900"))  # 15 min default
+# Reverted back to a fast 3-min default now that cookie freshness is handled
+# by the Playwright-based auto-refresher below (real-browser-minted cookies,
+# refreshed every APPLE_COOKIE_REFRESH_INTERVAL) rather than relying on one
+# manually-pasted session surviving hours of use — see APPLE_COOKIE_REFRESH_*
+# below and checkers/apple.py's get_apple_session_cookies-based lookup.
+APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "180"))  # 3 min default
 
 # Feature-scoped alert gate — NOT config.UNRELIABLE_SITES, which would also
 # suppress the two EXISTING, already-working Apple signals above (the
@@ -271,3 +276,47 @@ APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "900"
 APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED = os.getenv(
     "APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED", "false"
 ).strip().lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Apple cookie auto-refresher (bot.py's apple_cookie_refresh_loop) — replaces
+# manual DevTools cookie extraction + a Railway env var update with a
+# periodic real-browser session, run by the separate playwright_scraper
+# Railway service (POST /refresh-apple-cookies), since a genuine Chromium
+# session carries a real, matching TLS fingerprint at the point Apple mints
+# the cookies (httpx's own TLS fingerprint doesn't match a real browser's,
+# which independently contributed to the ~2-hour session-death pattern that
+# APPLE_PICKUP_CHECK_INTERVAL's pacing fix alone couldn't solve). The FAST
+# per-check requests (check_pickup_at_official_stores, /trackpickup,
+# refine_with_pincode) still go through plain httpx as before — Playwright
+# only ever runs in this separate background service, never in that hot
+# path. Refreshed cookies are stored in the main bot's own SQLite DB (see
+# database.get_apple_session_cookies/set_apple_session_cookies) rather than
+# an env var, so no Railway redeploy/env-var edit is needed to pick them up.
+#
+# Left unset by default — checkers/apple.py treats an empty
+# PLAYWRIGHT_SCRAPER_URL as "feature not configured" (mirrors
+# WHATSAPP_FORWARDER_URL's own convention) and the refresh loop simply never
+# runs, so a deploy that hasn't set this up behaves exactly as before:
+# APPLE_COOKIES/APPLE_USER_AGENT env vars, manually refreshed.
+PLAYWRIGHT_SCRAPER_URL = os.getenv("PLAYWRIGHT_SCRAPER_URL", "").rstrip("/")
+# Shared secret sent as the X-Internal-Token header on every refresh
+# request; only enforced on the playwright_scraper side if IT also has this
+# set (see playwright_scraper/main.py) — optional, since that service
+# currently has no auth on any of its other endpoints either.
+PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN = os.getenv("PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN", "")
+# How often the background refresh runs. Real-world testing found Apple's
+# session dying after ~2 hours even under light, paced request volume — this
+# defaults to well inside that window with plenty of margin, not right up
+# against it, since a slow/failed refresh cycle should never risk the stored
+# session going stale before the next attempt.
+APPLE_COOKIE_REFRESH_INTERVAL = int(os.getenv("APPLE_COOKIE_REFRESH_INTERVAL", "4500"))  # 75 min default
+# Product page the refresher navigates to and the pincode it types into that
+# page's pickup-availability check, to trigger a genuine fulfillment-messages
+# request from inside the real browser session (establishing the session in
+# the same way an actual visitor checking pickup availability would, not
+# just a bare page load). Any real apple.com/in product buy page + valid
+# Indian pincode works; these defaults need no override to function.
+APPLE_COOKIE_REFRESH_PRODUCT_URL = os.getenv(
+    "APPLE_COOKIE_REFRESH_PRODUCT_URL", "https://www.apple.com/in/shop/buy-iphone/iphone-17"
+)
+APPLE_COOKIE_REFRESH_PINCODE = os.getenv("APPLE_COOKIE_REFRESH_PINCODE", "400051")

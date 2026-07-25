@@ -246,15 +246,52 @@ def _build_fulfillment_target(sku: str, pincode: str) -> str:
 # config.APPLE_PICKUP_STORE_CODES, resolve_nearest_official_store) was
 # reverted. Moral: verify header/cookie correctness before concluding a
 # query PARAM is the problem.
-def _apple_user_agent() -> str:
-    # Read at call time (mirrors checkers/croma.py's _apim_key() pattern)
-    # so a Railway env var change (a manual cookie/UA refresh) takes effect
-    # without an import-order dependency on this module's own import time.
-    return os.environ.get("APPLE_USER_AGENT", "").strip()
+# UPDATE: cookies/UA are now sourced primarily from the auto-refreshed
+# session in database.apple_session_cookies (a real headless-Chromium
+# session, minted periodically by the separate playwright_scraper service —
+# see bot.py's apple_cookie_refresh_loop and config.py's
+# APPLE_COOKIE_REFRESH_* settings) rather than solely from a manually-pasted
+# APPLE_USER_AGENT/APPLE_COOKIES env var pair. The env vars are kept as a
+# fallback — used only until the refresher has populated the DB for the
+# first time, or if it's unavailable/failing — so a deploy that hasn't set
+# up the Playwright refresher behaves exactly as before.
+def _resolve_apple_session() -> tuple[str, str, str]:
+    """
+    Returns (user_agent, cookies, source) — source is "db" when a valid
+    Playwright-refreshed session was found, else "env". Either user_agent or
+    cookies may be "" if neither source has a usable value (caller already
+    handles that as "not configured", same as before this DB-backed lookup
+    was added).
 
+    The DB read is wrapped in try/except so a database hiccup degrades to
+    the env-var fallback rather than breaking every Apple pickup check —
+    this function must never raise.
+    """
+    try:
+        from database import get_apple_session_cookies
+        row = get_apple_session_cookies()
+    except Exception as exc:
+        logger.warning(f"[apple] could not read auto-refreshed session from DB: {exc}")
+        row = None
 
-def _apple_cookies() -> str:
-    return os.environ.get("APPLE_COOKIES", "").strip()
+    if row:
+        user_agent = (row.get("user_agent") or "").strip()
+        cookies = (row.get("cookies") or "").strip()
+        if user_agent and cookies:
+            return user_agent, cookies, "db"
+
+    # Fallback: manually-pasted Railway env vars (mirrors checkers/croma.py's
+    # _apim_key() pattern — read at call time so an env var change takes
+    # effect without an import-order dependency on this module's import time).
+    user_agent = os.environ.get("APPLE_USER_AGENT", "").strip()
+    cookies = os.environ.get("APPLE_COOKIES", "").strip()
+    if user_agent and cookies:
+        logger.warning(
+            "[apple] no auto-refreshed session in the DB (Playwright refresher "
+            "never ran or is failing) — falling back to the APPLE_USER_AGENT/"
+            "APPLE_COOKIES env vars."
+        )
+    return user_agent, cookies, "env"
 
 
 async def _cookie_auth_fetch(
@@ -296,10 +333,12 @@ async def _cookie_auth_fetch(
     """
     logger.info(f"[apple][{log_tag}] {context} target={target!r}")
 
-    user_agent = _apple_user_agent()
-    cookies = _apple_cookies()
+    user_agent, cookies, _source = _resolve_apple_session()
     if not user_agent or not cookies:
-        reason = "APPLE_USER_AGENT and/or APPLE_COOKIES env var is not set"
+        reason = (
+            "no Apple session available — neither the auto-refreshed DB "
+            "session nor the APPLE_USER_AGENT/APPLE_COOKIES env vars are set"
+        )
         logger.error(
             f"[apple][{log_tag}] {context} {reason} — cannot call Apple's "
             f"fulfillment-messages API directly. Skipping."
@@ -328,12 +367,14 @@ async def _cookie_auth_fetch(
     logger.info(f"[apple][{log_tag}] {context} status={resp.status_code}")
 
     if resp.status_code in (401, 403):
-        reason = f"HTTP {resp.status_code} — APPLE_COOKIES likely expired"
+        reason = f"HTTP {resp.status_code} — Apple session likely expired"
         logger.error(
-            f"[apple][{log_tag}] {context} HTTP {resp.status_code} — "
-            f"APPLE_COOKIES likely expired, refresh needed (re-run your "
-            f"local cookie-extraction script and update the APPLE_COOKIES "
-            f"/ APPLE_USER_AGENT Railway env vars). Skipping."
+            f"[apple][{log_tag}] {context} HTTP {resp.status_code} — Apple "
+            f"session likely expired. If the Playwright auto-refresher "
+            f"(PLAYWRIGHT_SCRAPER_URL) is configured it should self-correct "
+            f"on its next cycle; otherwise re-run your local cookie-"
+            f"extraction script and update the APPLE_COOKIES / "
+            f"APPLE_USER_AGENT Railway env vars. Skipping."
         )
         return None, reason
     if resp.status_code != 200:
@@ -347,8 +388,9 @@ async def _cookie_auth_fetch(
         reason = f"non-JSON response (likely a bot-check/challenge page): {resp.text[:200]!r}"
         logger.error(
             f"[apple][{log_tag}] {context} non-JSON response (likely a "
-            f"bot-check/challenge page) — APPLE_COOKIES likely expired, "
-            f"refresh needed. body={resp.text[:200]!r}"
+            f"bot-check/challenge page) — Apple session likely expired; see "
+            f"the 401/403 log line above for the same self-correction note. "
+            f"body={resp.text[:200]!r}"
         )
         return None, reason
 
@@ -668,7 +710,7 @@ async def refine_with_pincode(
 # (the user's own single saved pincode only) or the separate opt-in
 # /trackpickup system (user-chosen pincodes, requires a command to set up).
 #
-# Shares _cookie_auth_fetch/_apple_user_agent/_apple_cookies AND
+# Shares _cookie_auth_fetch/_resolve_apple_session AND
 # _build_fulfillment_target (all defined above, next to
 # _fetch_pickup_availability) for the actual request — this checker and
 # _fetch_pickup_availability hit the exact same Apple endpoint the exact
