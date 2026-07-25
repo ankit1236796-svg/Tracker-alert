@@ -353,6 +353,16 @@ async def _cookie_auth_fetch(
         "x-skip-redirect": "true",
     }
 
+    # Diagnostic — header NAMES + cookie length only, never the cookie
+    # value itself (a live Apple session shouldn't land in Railway logs).
+    # Added alongside the Playwright refresh's own akamai_markers_present
+    # logging to compare "cookies minted" against "cookies actually sent
+    # on a failing request" without guessing.
+    logger.info(
+        f"[apple][{log_tag}] {context} request_headers={sorted(headers.keys())} "
+        f"cookie_length={len(cookies)} user_agent={user_agent!r}"
+    )
+
     try:
         if client is not None:
             resp = await client.get(target, headers=headers)
@@ -374,12 +384,18 @@ async def _cookie_auth_fetch(
             f"(PLAYWRIGHT_SCRAPER_URL) is configured it should self-correct "
             f"on its next cycle; otherwise re-run your local cookie-"
             f"extraction script and update the APPLE_COOKIES / "
-            f"APPLE_USER_AGENT Railway env vars. Skipping."
+            f"APPLE_USER_AGENT Railway env vars. Skipping. "
+            f"full response (up to 1500 chars): {resp.text[:1500]!r} "
+            f"response_headers={dict(resp.headers)}"
         )
         return None, reason
     if resp.status_code != 200:
         reason = f"HTTP {resp.status_code}: {resp.text[:200]!r}"
-        logger.warning(f"[apple][{log_tag}] {context} {reason}")
+        logger.warning(
+            f"[apple][{log_tag}] {context} {reason} — full response "
+            f"(up to 1500 chars): {resp.text[:1500]!r} "
+            f"response_headers={dict(resp.headers)}"
+        )
         return None, reason
 
     try:
@@ -390,7 +406,8 @@ async def _cookie_auth_fetch(
             f"[apple][{log_tag}] {context} non-JSON response (likely a "
             f"bot-check/challenge page) — Apple session likely expired; see "
             f"the 401/403 log line above for the same self-correction note. "
-            f"body={resp.text[:200]!r}"
+            f"full body (up to 1500 chars): {resp.text[:1500]!r} "
+            f"response_headers={dict(resp.headers)}"
         )
         return None, reason
 
