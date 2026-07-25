@@ -239,6 +239,25 @@ APPLE_PICKUP_STORE_LABELS = {
 # above AND any arbitrary /trackpickup pincode — no per-store internal
 # Apple code needed at all.
 
+# The official-store checker (run_apple_official_pickup_cycle) and
+# /trackpickup (run_pickup_check_cycle) run on THIS separate, longer
+# interval instead of the main CHECK_INTERVAL (see bot.py's
+# stock_checker_loop) — real-world testing found APPLE_COOKIES' session
+# was being invalidated (HTTP 541) after ~2 hours, and request VOLUME was
+# identified as a likely contributing factor: on the old shared 5-minute
+# CHECK_INTERVAL, even a single tracked Apple product generated ~144
+# automated fulfillment-messages requests every 2 hours, arriving in
+# tight parallel bursts (6 pincodes at once, every cycle). Running these
+# on a longer, dedicated interval cuts total request volume roughly 3x at
+# the default values below, without slowing down the main stock-check
+# cadence for every other site/feature. Pickup-availability data going a
+# few extra minutes stale is an acceptable tradeoff for meaningfully
+# fewer automated hits against a cookie session already shown to be
+# pattern-sensitive — see checkers/apple.py's check_pickup_at_official_
+# stores for the complementary sequential-with-jitter + shared-connection
+# changes (also part of reducing this endpoint's bot-like footprint).
+APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "900"))  # 15 min default
+
 # Feature-scoped alert gate — NOT config.UNRELIABLE_SITES, which would also
 # suppress the two EXISTING, already-working Apple signals above (the
 # generic checker + single-pincode refinement). This flag gates ONLY this

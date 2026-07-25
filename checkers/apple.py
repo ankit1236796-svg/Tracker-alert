@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 from urllib.parse import urlencode
 
@@ -258,6 +259,7 @@ def _apple_cookies() -> str:
 
 async def _cookie_auth_fetch(
     target: str, *, log_tag: str, context: str, timeout: float,
+    client: httpx.AsyncClient | None = None,
 ) -> tuple[dict | None, str | None]:
     """
     One direct httpx GET to `target` (an Apple fulfillment-messages URL) —
@@ -282,6 +284,15 @@ async def _cookie_auth_fetch(
     log_tag="resolve", context="fulfillment-messages pincode='400051'") so
     each caller's Railway logs stay grep-able under its own existing
     prefix rather than a generic shared one.
+
+    `client`: an optional pre-built httpx.AsyncClient to reuse instead of
+    opening a fresh TCP+TLS connection for this one call — passed by
+    check_pickup_at_official_stores for its whole batch of pincode
+    requests (a real browser session reuses one connection across many
+    requests; opening N brand-new connections for N near-simultaneous
+    calls is itself a bot signal, independent of request pacing). When
+    None (every other call site, all single one-off requests), a client
+    is created and torn down for just this call, same as before.
     """
     logger.info(f"[apple][{log_tag}] {context} target={target!r}")
 
@@ -304,8 +315,11 @@ async def _cookie_auth_fetch(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        if client is not None:
             resp = await client.get(target, headers=headers)
+        else:
+            async with httpx.AsyncClient(timeout=timeout) as owned_client:
+                resp = await owned_client.get(target, headers=headers)
     except Exception as exc:
         reason = f"request failed: {type(exc).__name__}: {exc}"
         logger.warning(f"[apple][{log_tag}] {context} {reason}", exc_info=True)
@@ -672,7 +686,9 @@ async def refine_with_pincode(
 _OFFICIAL_STORE_TIMEOUT = 20.0
 
 
-async def _fetch_official_store_availability(sku: str, pincode: str) -> dict | None:
+async def _fetch_official_store_availability(
+    sku: str, pincode: str, *, client: httpx.AsyncClient | None = None,
+) -> dict | None:
     """
     One direct httpx GET straight to Apple's fulfillment-messages endpoint
     for one of the 6 fixed official-store pincodes — see _cookie_auth_fetch
@@ -680,31 +696,57 @@ async def _fetch_official_store_availability(sku: str, pincode: str) -> dict | N
     auth/error-handling logic. Returns the parsed JSON on success, None on
     any failure (missing env vars, network error, HTTP status, non-JSON
     body — all logged there). Never raises.
+
+    `client`: optional shared httpx.AsyncClient, passed through to
+    _cookie_auth_fetch — see check_pickup_at_official_stores below, the
+    only caller that passes one (its whole 6-pincode batch reuses a
+    single connection instead of opening a fresh one per pincode).
     """
     target = _build_fulfillment_target(sku, pincode)
     data, _err = await _cookie_auth_fetch(
         target, log_tag="official-stores", context=f"pincode={pincode!r}",
-        timeout=_OFFICIAL_STORE_TIMEOUT,
+        timeout=_OFFICIAL_STORE_TIMEOUT, client=client,
     )
     return data
+
+
+# Randomized delay between consecutive pincode requests within one
+# check_pickup_at_official_stores batch — replaces the old asyncio.gather
+# parallel burst (all 6 pincodes hit at the exact same instant), which is
+# itself a strong bot signal no real browser session produces. Range
+# chosen to look like plausible human inter-request timing without
+# meaningfully slowing the official-store cycle (worst case ~5×5s=25s of
+# added delay per product, well within APPLE_PICKUP_CHECK_INTERVAL).
+_PINCODE_DELAY_MIN_SECONDS = 2.0
+_PINCODE_DELAY_MAX_SECONDS = 5.0
 
 
 async def check_pickup_at_official_stores(sku: str, pincodes: list[str]) -> dict[str, list[dict]]:
     """
     Checks `sku` against every pincode in `pincodes` (config.
-    APPLE_PICKUP_PINCODES in production) concurrently, returning
-    {pincode: [store dicts]} — the SAME shape checkers.apple.
+    APPLE_PICKUP_PINCODES in production) SEQUENTIALLY — NOT concurrently
+    (see _PINCODE_DELAY_MIN/MAX_SECONDS above for why the old
+    asyncio.gather-based parallel burst was replaced) — with a randomized
+    delay between each pincode, reusing ONE httpx.AsyncClient across the
+    whole batch instead of opening a fresh TCP+TLS connection per pincode
+    (see _cookie_auth_fetch's `client` param). Both changes exist to make
+    this endpoint's traffic look less like an automated burst and more
+    like a real session's occasional, connection-reusing requests — part
+    of investigating why APPLE_COOKIES' session was dying after ~2 hours.
+
+    Returns {pincode: [store dicts]} — the SAME shape checkers.apple.
     check_pickup_row/available_stores_for_pickup already use, reused here
     rather than a parallel parsing implementation. A pincode whose request
     failed (see _fetch_official_store_availability) is simply absent from
     the returned dict — the caller treats a missing key as "inconclusive
     this cycle for that pincode", never as a confirmed "not available".
     """
-    async def _one(pincode: str) -> tuple[str, list[dict] | None]:
-        data = await _fetch_official_store_availability(sku, pincode)
-        if data is None:
-            return pincode, None
-        return pincode, available_stores_for_pickup(data, sku)
-
-    results = await asyncio.gather(*[_one(p) for p in pincodes])
-    return {pincode: stores for pincode, stores in results if stores is not None}
+    results: dict[str, list[dict]] = {}
+    async with httpx.AsyncClient(timeout=_OFFICIAL_STORE_TIMEOUT) as client:
+        for i, pincode in enumerate(pincodes):
+            data = await _fetch_official_store_availability(sku, pincode, client=client)
+            if data is not None:
+                results[pincode] = available_stores_for_pickup(data, sku)
+            if i < len(pincodes) - 1:
+                await asyncio.sleep(random.uniform(_PINCODE_DELAY_MIN_SECONDS, _PINCODE_DELAY_MAX_SECONDS))
+    return results
