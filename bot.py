@@ -14,7 +14,7 @@ from access import AccessControlMiddleware, compute_access, STATUS_TRIAL, STATUS
 from admin_handlers import router as admin_router
 from config import (
     BOT_TOKEN, CHECK_INTERVAL, ADMIN_USER_ID, ACCESS_CHECK_INTERVAL, REMINDER_HOURS_BEFORE_EXPIRY,
-    APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
+    APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED, APPLE_PICKUP_CHECK_INTERVAL,
 )
 from database import (
     init_db,
@@ -366,25 +366,35 @@ async def stock_checker_loop(bot: Bot):
     tracking — a separate feature/table, see database.pickup_tracking) and
     run_apple_official_pickup_cycle (the fixed-6-official-store auto-check,
     a further separate feature/table — see database.
-    apple_official_pickup_status) on this SAME interval right after the
-    regular stock check, rather than on their own timers — simplest way to
-    satisfy "the existing check-cycle interval" without extra background loops.
+    apple_official_pickup_status), but on their OWN longer
+    APPLE_PICKUP_CHECK_INTERVAL rather than every CHECK_INTERVAL tick — see
+    config.py's own note on APPLE_PICKUP_CHECK_INTERVAL for why (request-
+    volume reduction, part of extending APPLE_COOKIES' ~2-hour session
+    life). Tracked as a simple "next due" timestamp compared against each
+    loop iteration's cycle_start, rather than a separate background task —
+    same "simplest way to satisfy an interval without extra loops"
+    approach the old shared-interval version used, just no longer tied to
+    the same clock as the main stock check.
     """
     logger.info("Stock checker loop started.")
+    next_apple_pickup_run = time.monotonic()  # due immediately on the first iteration
     while True:
         cycle_start = time.monotonic()
         try:
             await run_stock_check_cycle(bot)
         except Exception as exc:
             logger.error(f"Stock checker loop error: {exc}")
-        try:
-            await run_pickup_check_cycle(bot)
-        except Exception as exc:
-            logger.error(f"Pickup checker cycle error: {exc}")
-        try:
-            await run_apple_official_pickup_cycle(bot)
-        except Exception as exc:
-            logger.error(f"Apple official-store pickup cycle error: {exc}")
+
+        if cycle_start >= next_apple_pickup_run:
+            try:
+                await run_pickup_check_cycle(bot)
+            except Exception as exc:
+                logger.error(f"Pickup checker cycle error: {exc}")
+            try:
+                await run_apple_official_pickup_cycle(bot)
+            except Exception as exc:
+                logger.error(f"Apple official-store pickup cycle error: {exc}")
+            next_apple_pickup_run = cycle_start + APPLE_PICKUP_CHECK_INTERVAL
 
         # Sleep only the remainder of CHECK_INTERVAL, measured from cycle start,
         # so total cycle time ≈ CHECK_INTERVAL instead of checking_time + CHECK_INTERVAL.
