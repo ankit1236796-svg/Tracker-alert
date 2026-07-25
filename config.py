@@ -269,12 +269,17 @@ APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "180"
 # new feature's own notifications: the check still RUNS every cycle either
 # way (so accuracy can be watched via Railway logs / /debugapplestores),
 # but send_pickup_alert is only actually called once this is explicitly
-# turned on — defaults to disabled until manually verified against real
-# store data, per how Croma's own rollout was gated (there, via
+# turned on — mirrors how Croma's own rollout was gated (there, via
 # UNRELIABLE_SITES; here, via a dedicated flag instead, since that
 # mechanism is scoped to a whole SITE, not one feature within a site).
+#
+# Defaults to ENABLED during the current soft-launch/testing phase (real
+# users aren't on the bot yet — only test accounts), so automatic alert
+# behavior can be observed end-to-end rather than only inferred from logs.
+# Flip back to "false" (or unset the env var) before onboarding real users
+# until store-level accuracy has been manually verified against live data.
 APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED = os.getenv(
-    "APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED", "false"
+    "APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED", "true"
 ).strip().lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
