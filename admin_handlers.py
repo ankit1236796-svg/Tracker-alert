@@ -3053,3 +3053,93 @@ async def cmd_debugapplenocookie(message: Message, command: CommandObject):
     _CHUNK_SIZE = 4000
     for i in range(0, len(raw_json), _CHUNK_SIZE):
         await _debug_send(message, raw_json[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
+# /debugapplecookierefresh: manually fires ONE Apple cookie auto-refresh
+# cycle right now (bot.run_apple_cookie_refresh_cycle — the EXACT same
+# function bot.py's apple_cookie_refresh_loop calls on its own
+# APPLE_COOKIE_REFRESH_INTERVAL timer), instead of waiting for that
+# scheduled run — for verifying the Playwright-based refresher end-to-end
+# right after deploying/configuring PLAYWRIGHT_SCRAPER_URL. bot.py is
+# imported LOCALLY inside the handler, not at module level — bot.py itself
+# imports this module's `router`, so a top-level import here would be
+# circular.
+# NOT wired into CHECKER_MAP or any production code path — purely
+# diagnostic. Safe to delete once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_APPLE_COOKIE_REFRESH_ADMIN_ID = 5004721766  # same hardcoded restriction
+# as every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter.
+
+
+@router.message(Command("debugapplecookierefresh"))
+async def cmd_debugapplecookierefresh(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_APPLE_COOKIE_REFRESH_ADMIN_ID:
+        return
+
+    from config import (
+        PLAYWRIGHT_SCRAPER_URL, APPLE_COOKIE_REFRESH_PRODUCT_URL, APPLE_COOKIE_REFRESH_PINCODE,
+    )
+    from database import get_apple_session_cookies
+    import bot as bot_module
+
+    if not PLAYWRIGHT_SCRAPER_URL:
+        await _debug_send(
+            message,
+            "⚠️ PLAYWRIGHT_SCRAPER_URL is not set on this service — the "
+            "auto-refresher is disabled, nothing to trigger.",
+        )
+        return
+
+    before = get_apple_session_cookies()
+    await _debug_send(
+        message,
+        f"🔍 Triggering ONE Apple cookie refresh cycle now (not waiting for "
+        f"the scheduled interval)…\n"
+        f"playwright_scraper: {PLAYWRIGHT_SCRAPER_URL}\n"
+        f"product_url: {APPLE_COOKIE_REFRESH_PRODUCT_URL}\n"
+        f"pincode: {APPLE_COOKIE_REFRESH_PINCODE}\n"
+        f"previous stored session: "
+        f"{('updated_at=' + before['updated_at']) if before else '(none — never refreshed yet)'}",
+    )
+
+    try:
+        success = await bot_module.run_apple_cookie_refresh_cycle()
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ run_apple_cookie_refresh_cycle crashed unexpectedly: {exc}")
+        return
+
+    if not success:
+        await _debug_send(
+            message,
+            "❌ Refresh cycle returned False — check this service's Railway "
+            "logs for the '[apple][cookie-refresh]' warning explaining why "
+            "(playwright_scraper unreachable, non-200, non-JSON, or a "
+            "response missing cookies/user_agent — see playwright_scraper's "
+            "OWN logs too, for the SKU-extraction/fulfillment-fetch "
+            "diagnostics from inside the browser session). The previously "
+            "stored session, if any, is untouched.",
+        )
+        return
+
+    after = get_apple_session_cookies()
+    if not after:
+        await _debug_send(
+            message,
+            "⚠️ Refresh reported success but the DB still has no stored "
+            "session — unexpected, investigate database.py's "
+            "set_apple_session_cookies.",
+        )
+        return
+
+    await _debug_send(
+        message,
+        f"✅ Refresh succeeded — new session stored at {after['updated_at']}.\n"
+        f"cookies: {len(after['cookies'])} chars\n"
+        f"user_agent: {after['user_agent']!r}\n\n"
+        f"Full diagnostics (pincode_check_confirmed, SKU extracted, "
+        f"fulfillment-messages HTTP status, etc.) are in this service's "
+        f"Railway logs under '[apple][cookie-refresh]' and in "
+        f"playwright_scraper's own logs under '[refresh-apple-cookies]'.",
+    )
