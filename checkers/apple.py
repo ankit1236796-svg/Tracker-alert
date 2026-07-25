@@ -359,8 +359,9 @@ async def _cookie_auth_fetch(
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies,
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.apple.com/in/shop/buy-iphone",
+        "Accept": "*/*",
+        "Referer": "https://www.apple.com/in/shop",
+        "x-skip-redirect": "true",
     }
 
     try:
