@@ -56,6 +56,14 @@ Same pattern as `whatsapp_forwarder/`:
      env var on the **main bot's** Railway service) once this handles real
      session cookies, so a stray public request can't trigger cookie
      refreshes or read back a session.
+   - `APPLE_REFRESH_NETWORKIDLE_TIMEOUT_MS` (default `8000`),
+     `APPLE_REFRESH_DWELL_MS` (default `5000`),
+     `APPLE_REFRESH_POST_FETCH_WAIT_MS` (default `2000`) — timing knobs for
+     `/refresh-apple-cookies` only, added after a live refresh's session
+     died in ~9 minutes with Akamai Bot Manager's own marker cookies
+     (`_abck`/`bm_sz`/`ak_bmsc`) completely absent — see "Apple cookie
+     auto-refresh" below for the full story. Tune these if
+     `akamai_markers_present` still comes back all-`false` in the logs.
 5. On the **main bot's** own Railway service, set `PLAYWRIGHT_SCRAPER_URL`
    to this service's URL (its public `https://<service>.up.railway.app` or
    Railway's private-networking address, e.g.
@@ -172,9 +180,12 @@ Response: {
   "pincode_check_confirmed": true,   // fulfillment-messages returned 200 + valid JSON
   "diagnostics": {
     "goto_status": 200, "goto_error": null,
+    "networkidle_timed_out": false, "networkidle_error": null,
     "sku_extracted": "MG6M4HN/A",
     "fulfillment_url": "https://www.apple.com/in/shop/fulfillment-messages?...",
-    "fulfillment_status": 200, "fulfillment_error": null
+    "fulfillment_status": 200, "fulfillment_error": null,
+    "cookie_names": ["_abck", "bm_sz", "dslang", "site", "..."],
+    "akamai_markers_present": {"_abck": true, "bm_sz": true, "ak_bmsc": false}
   }
 }
 ```
@@ -234,6 +245,37 @@ there's no need to pay Playwright's per-request overhead (~5-30s vs.
 httpx's ~1s) for every stock check just to keep that fingerprint consistent
 on every single request; only the moment of cookie *acquisition* needs a
 real browser, not every use of the resulting cookies afterward.
+
+**Update — the initial version of this refresh flow wasn't slow enough.**
+A live run confirmed the session it produced died in ~9 minutes, faster
+than the ~2-hour manually-pasted-cookie pattern it replaced. Diagnostic
+logging (`akamai_markers_present` in `_refresh_apple_cookies`'s
+diagnostics, checking for Akamai Bot Manager's own `_abck`/`bm_sz`/
+`ak_bmsc` marker cookie names) showed all three completely absent — the
+session was never validated by Akamai's own sensor/telemetry JS at all,
+because the original flow captured cookies and closed the browser within
+a fraction of a second of loading the page, with images/fonts/stylesheets
+blocked. The flow now:
+- waits for `networkidle` (bounded, `APPLE_REFRESH_NETWORKIDLE_TIMEOUT_MS`,
+  default 8s — best-effort, a timeout just proceeds anyway, same as
+  `/debug-network`'s own networkidle wait; this is deliberately NOT the
+  `page.goto()`'s own `wait_until`, since a hard networkidle gate risks the
+  navigation itself timing out on a page with any ongoing background
+  activity),
+- dwells for `APPLE_REFRESH_DWELL_MS` (default 5s) BEFORE firing the
+  fulfillment-messages fetch, not just before reading cookies,
+- loads every subresource the real page would (no resource blocking for
+  this flow specifically — `/check-stock` and `/debug-network` are
+  unaffected, still blocked as before),
+- and dwells again for `APPLE_REFRESH_POST_FETCH_WAIT_MS` (default 2s)
+  after the fetch before the browser closes.
+
+This makes a refresh noticeably slower (roughly 15-20s+ versus the
+original ~1-3s) — acceptable since it only runs once per
+`APPLE_COOKIE_REFRESH_INTERVAL` (default 75 min), well within the main
+bot's 90s client timeout for this call. Check `akamai_markers_present` in
+the logs after a refresh to confirm `_abck` (at minimum) now comes back
+`true` before trusting the resulting session.
 
 ```
 GET /health
