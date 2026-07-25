@@ -147,6 +147,21 @@ SIGNAL_WAIT_TIMEOUT_MS = int(os.getenv("SIGNAL_WAIT_TIMEOUT_MS", "8000"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "2"))
 
+# Apple cookie-refresh-specific timing (see _refresh_apple_cookies) — kept
+# as its OWN separate knobs rather than reusing NAV_TIMEOUT_MS/SIGNAL_WAIT_
+# TIMEOUT_MS above (those tune the iQOO/Vivo /check-stock pilot's JSON-LD
+# wait, a different concern). Diagnostic logging confirmed _abck/bm_sz/
+# ak_bmsc (Akamai Bot Manager's own marker cookies) were ALL absent from a
+# refresh that captured cookies immediately after domcontentloaded with no
+# dwell time at all — the session was never validated by Akamai in the
+# first place, which is why it died in ~9 minutes instead of the ~2 hours a
+# manually-copied, actively-used real browser session showed. These three
+# values give Akamai's own sensor/telemetry JS time to run before cookies
+# are captured and the browser is torn down.
+APPLE_REFRESH_NETWORKIDLE_TIMEOUT_MS = int(os.getenv("APPLE_REFRESH_NETWORKIDLE_TIMEOUT_MS", "8000"))
+APPLE_REFRESH_DWELL_MS = int(os.getenv("APPLE_REFRESH_DWELL_MS", "5000"))
+APPLE_REFRESH_POST_FETCH_WAIT_MS = int(os.getenv("APPLE_REFRESH_POST_FETCH_WAIT_MS", "2000"))
+
 # /debug-network: default pincode applied when the caller doesn't specify
 # one — an arbitrary real Indian pincode, not tied to any particular store.
 DEFAULT_DEBUG_PINCODE = os.getenv("DEBUG_NETWORK_DEFAULT_PINCODE", "110001")
@@ -659,7 +674,22 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
     may still be usable; the caller (the main bot) can decide whether an
     unconfirmed refresh is worth storing. Never raises for anything short
     of a hard Playwright/browser failure (navigation errors, missing SKU,
-    and fetch failures are all captured in diagnostics instead)."""
+    and fetch failures are all captured in diagnostics instead).
+
+    Deliberately slower than /check-stock's _render_page: diagnostic
+    logging (see akamai_markers_present below) confirmed an earlier
+    version of this function — which captured cookies immediately after
+    domcontentloaded, blocked images/fonts/stylesheets, and closed the
+    browser right after the fetch — produced a session with NONE of
+    Akamai Bot Manager's own marker cookies (_abck/bm_sz/ak_bmsc) present
+    at all. Akamai never validated the session in the first place, which
+    is almost certainly why it died in ~9 minutes rather than the ~2
+    hours a manually-copied, actively-used real browser session showed.
+    This version gives that validation JS room to actually run: a
+    bounded networkidle wait, a dwell period BEFORE the fulfillment
+    fetch (not just before cookie extraction), no resource blocking (so
+    every subresource the real page would load, loads), and a brief
+    keep-alive after the fetch before the browser is torn down."""
     acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
     if not acquired:
         raise RuntimeError(
@@ -671,12 +701,18 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
             browser, context = _new_browser_and_context(pw)
             try:
                 page = context.new_page()
-                stats: dict = {}
-                page.route("**/*", _make_resource_blocker(stats))
+                # NO resource blocker here (unlike /check-stock and
+                # /debug-network, which still use _make_resource_blocker
+                # unchanged) — every image/font/stylesheet the real page
+                # would load is allowed through, so this page load looks
+                # as close to a real visitor's as possible to Akamai's own
+                # fingerprinting, not a suspiciously partial one.
 
                 diagnostics: dict = {
                     "goto_status": None,
                     "goto_error": None,
+                    "networkidle_timed_out": False,
+                    "networkidle_error": None,
                     "sku_extracted": None,
                     "fulfillment_url": None,
                     "fulfillment_status": None,
@@ -690,6 +726,28 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
                 except Exception as exc:
                     diagnostics["goto_error"] = str(exc)
                     logger.error(f"[refresh-apple-cookies] page.goto failed for {url}: {exc}")
+
+                # Bounded, best-effort — NOT the goto's own wait_until (a
+                # hard networkidle gate risks the goto itself timing out on
+                # a page with ongoing background activity, e.g. an
+                # analytics beacon that never truly goes idle; mirrors the
+                # identical pattern in _capture_network_calls above). A
+                # timeout here just means "proceed with whatever loaded".
+                if diagnostics["goto_error"] is None:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=APPLE_REFRESH_NETWORKIDLE_TIMEOUT_MS)
+                    except PlaywrightTimeoutError:
+                        diagnostics["networkidle_timed_out"] = True
+                        logger.info(f"[refresh-apple-cookies] networkidle wait timed out for {url} — proceeding anyway")
+                    except Exception as exc:
+                        diagnostics["networkidle_error"] = str(exc)
+                        logger.error(f"[refresh-apple-cookies] networkidle wait raised for {url}: {exc}")
+
+                # Dwell BEFORE the fulfillment fetch (not just before cookie
+                # extraction) — the fetch is the ONE request whose resulting
+                # session actually matters, so Akamai's sensor/telemetry JS
+                # needs this time to run before that request, not after it.
+                page.wait_for_timeout(APPLE_REFRESH_DWELL_MS)
 
                 html = ""
                 try:
@@ -727,6 +785,17 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
                         diagnostics["fulfillment_error"] = "product URL is not an apple.com /shop/ page"
                 else:
                     diagnostics["fulfillment_error"] = "could not extract SKU/part number from product page"
+
+                # Keep the context alive a bit longer after the fetch before
+                # snapshotting cookies and closing the browser — any
+                # post-fetch Set-Cookie rotation or sensor callback the page
+                # triggers in response to that request gets a chance to land
+                # instead of being cut off by an immediate browser.close().
+                try:
+                    page.evaluate("() => document.title")
+                except Exception as exc:
+                    logger.warning(f"[refresh-apple-cookies] post-fetch keep-alive evaluate failed for {url}: {exc}")
+                page.wait_for_timeout(APPLE_REFRESH_POST_FETCH_WAIT_MS)
 
                 cookies_list = context.cookies()
                 cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies_list)
