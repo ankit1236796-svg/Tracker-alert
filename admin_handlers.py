@@ -17,8 +17,9 @@ import time
 from calendar import monthrange
 from collections import Counter
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
+import httpx
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -2968,3 +2969,87 @@ async def cmd_debugapplestores(message: Message, command: CommandObject):
         else:
             lines.append(f"❌ {pincode} ({label}): not available")
     await _debug_send(message, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /debugapplenocookie — tests a DIFFERENT Apple endpoint
+# (pickup-message-recommendations, NOT fulfillment-messages) reportedly
+# working with just a generic User-Agent and NO Cookie header at all — the
+# opposite of every other Apple pickup path in this codebase, which all
+# require APPLE_COOKIES via _cookie_auth_fetch. A completely standalone
+# raw httpx call (NOT routed through checkers.apple._cookie_auth_fetch,
+# which would refuse to run without cookies configured) so the real
+# response can be seen exactly as reported, with zero interference from
+# this codebase's existing cookie-based machinery.
+#
+# If this genuinely works, it could eliminate APPLE_COOKIES/
+# APPLE_USER_AGENT management entirely for pickup checks — but that's
+# unverified until a human confirms via a real response, hence this
+# command exists rather than switching production over on a hunch.
+#
+# NOT wired into CHECKER_MAP or any production code path — purely
+# diagnostic. Safe to delete once answered.
+# ---------------------------------------------------------------------------
+_DEBUG_APPLE_NO_COOKIE_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter — this calls Apple's servers directly (no Scrape.do/
+# Zyte, no cookies) for a caller-supplied sku/store_code.
+
+
+@router.message(Command("debugapplenocookie"))
+async def cmd_debugapplenocookie(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_APPLE_NO_COOKIE_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugapplenocookie &lt;sku&gt; &lt;store_code&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: <code>/debugapplenocookie &lt;sku&gt; &lt;store_code&gt;</code>", parse_mode="HTML"
+        )
+        return
+    sku, store_code = parts[0], parts[1]
+
+    params = {
+        "fae": "true",
+        "mts.0": "regular",
+        "mts.1": "compact",
+        "searchNearby": "true",
+        "store": store_code,
+        "product": sku,
+    }
+    target = f"https://www.apple.com/in/shop/pickup-message-recommendations?{urlencode(params)}"
+    await _debug_send(
+        message,
+        f"🔍 Testing pickup-message-recommendations — NO cookies, just a "
+        f"generic User-Agent, for sku={sku!r} store={store_code!r}:\n{target}",
+    )
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(target, headers=headers)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Request failed: {type(exc).__name__}: {exc}")
+        return
+
+    await _debug_send(message, f"Status: {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except Exception:
+        await _debug_send(
+            message,
+            f"⚠️ Non-JSON response body (first 2000 chars):\n{resp.text[:2000]}",
+        )
+        return
+
+    raw_json = json.dumps(data, indent=2)
+    await _debug_send(message, f"✅ Valid JSON response ({len(raw_json)} chars, sending in full):")
+    _CHUNK_SIZE = 4000
+    for i in range(0, len(raw_json), _CHUNK_SIZE):
+        await _debug_send(message, raw_json[i:i + _CHUNK_SIZE])
