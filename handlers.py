@@ -44,11 +44,12 @@ from database import (
     list_pickup_tracking,
     remove_pickup_tracking,
     is_site_locked,
+    get_reliance_article_id_for_url,
 )
 from access import check_can_add_item, compute_access, access_denied_text, REASON_ITEM_LIMIT
 from notifications import send_stock_alert, should_alert_for_price
 from stock_checker import detect_site, check_stock
-from checkers import fetch_page, apple as apple_checker
+from checkers import fetch_page, apple as apple_checker, reliancedigital as reliancedigital_checker
 from translations import t, LANG_LABEL, LANGS
 from config import (
     SUPPORTED_SITES,
@@ -119,6 +120,43 @@ def _auto_name(url: str, site: str) -> str:
     return f"{get_site_label(site)}: {slug}"
 
 
+async def _resolve_reliance_article_id(url: str) -> str | None:
+    """
+    Called right before add_product() for every reliancedigital.in URL
+    (see the three call sites below). Checks whether ANY other row
+    already has an article_id for this exact URL first (reused for free —
+    see database.get_reliance_article_id_for_url's own docstring on why:
+    avoids paying for a second Zyte/Scrape.do fetch when a second user
+    tracks the identical product). Only if that comes back empty does it
+    fetch the live page and extract one
+    (checkers.reliancedigital.fetch_and_extract_article_id).
+
+    Never raises and never blocks the add — returns None on any failure
+    (extraction just didn't work this time; logged clearly here so it's
+    visible in Railway logs, not silently swallowed). The product is
+    still added either way; stock_checker.check_stock() treats a missing
+    article_id as inconclusive rather than crashing or guessing.
+    """
+    existing = get_reliance_article_id_for_url(url)
+    if existing:
+        logger.info(f"[reliancedigital][add] reusing existing article_id={existing!r} for {url!r}")
+        return existing
+
+    article_id, method = await reliancedigital_checker.fetch_and_extract_article_id(url)
+    if not article_id:
+        logger.warning(
+            f"[reliancedigital][add] could not extract an article_id for "
+            f"{url!r} — product will still be added, but automatic stock "
+            f"checks will be skipped (inconclusive) until this is "
+            f"re-extracted. See checkers/reliancedigital.py's extraction "
+            f"methods for what to fix if this keeps happening."
+        )
+        return None
+
+    logger.info(f"[reliancedigital][add] extracted article_id={article_id!r} for {url!r} (method={method})")
+    return article_id
+
+
 def _parse_bulk_lines(text: str) -> list[tuple[str, str]]:
     """
     Parse lines of the form "product name | URL".
@@ -167,7 +205,8 @@ async def _process_bulk(message: Message, entries: list[tuple[str, str]]) -> Non
                 break
             results.append(f"⚠️ {limit_msg} — <b>{name}</b>")
             continue
-        ok, msg = add_product(user_id, name, url, site)
+        reliance_article_id = await _resolve_reliance_article_id(url) if site == "reliancedigital" else None
+        ok, msg = add_product(user_id, name, url, site, reliance_article_id=reliance_article_id)
         if ok:
             results.append(f"✅ <b>{name}</b> [{get_site_label(site)}]")
         else:
@@ -730,7 +769,8 @@ async def receive_link(message: Message, state: FSMContext):
                 results.append(f"⚠️ {limit_msg}: <code>{url[:60]}</code>")
                 continue
             auto_name = _auto_name(url, site)
-            ok, msg = add_product(user_id, auto_name, url, site)
+            reliance_article_id = await _resolve_reliance_article_id(url) if site == "reliancedigital" else None
+            ok, msg = add_product(user_id, auto_name, url, site, reliance_article_id=reliance_article_id)
             if ok:
                 results.append(f"✅ <b>{auto_name}</b> [{get_site_label(site)}]")
             else:
@@ -774,7 +814,8 @@ async def receive_link(message: Message, state: FSMContext):
         await message.answer(t("amazon_target_prompt", lang, name=name), parse_mode="HTML")
         return
 
-    ok, msg = add_product(user_id, name, url, site)
+    reliance_article_id = await _resolve_reliance_article_id(url) if site == "reliancedigital" else None
+    ok, msg = add_product(user_id, name, url, site, reliance_article_id=reliance_article_id)
     await state.clear()
 
     if ok:
