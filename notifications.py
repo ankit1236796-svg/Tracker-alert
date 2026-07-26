@@ -183,6 +183,43 @@ async def send_pickup_alert(
     await _safe_send(bot, user_id, text)
 
 
+async def send_channel_pickup_alert(
+    bot: Bot, chat_id: int, product_name: str, pincode: str, stores: list[dict],
+) -> None:
+    """
+    Channel-forwarding sibling of send_pickup_alert — same message shape
+    (see database.channel_forward_pickup_tracking and checkers/apple.py's
+    check_channel_pickup_row), targeting a channel chat_id instead of a
+    user_id. Same global-lock-only is_site_locked gate as
+    send_channel_stock_alert (no per-user lock concept here — a pickup
+    channel-forward row has no owning user).
+    """
+    if is_site_locked("apple"):
+        logger.info(
+            "[channel-forward][pickup-alert-suppressed] apple is globally "
+            "locked — skipping channel pickup alert."
+        )
+        return
+    lines = []
+    for store in stores:
+        name = html.escape(store.get("store_name") or "(unnamed store)")
+        location = store.get("location")
+        if location:
+            lines.append(f"🏬 <b>{name}</b> — {html.escape(location)}")
+        else:
+            lines.append(f"🏬 <b>{name}</b>")
+    stores_block = "\n".join(lines) if lines else "🏬 (store details unavailable)"
+    text = t(
+        "pickup_alert", "en",
+        name=html.escape(product_name), pincode=pincode, stores_block=stores_block,
+    )
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        logger.info(f"[channel-forward][pickup] alert sent to channel {chat_id} for {product_name!r} pincode={pincode!r}")
+    except Exception as exc:
+        logger.error(f"[channel-forward][pickup] failed to send alert to channel {chat_id}: {exc}")
+
+
 async def _safe_send(bot: Bot, user_id: int, text: str) -> bool:
     """Send a plain HTML message to a user, logging (not raising) on failure —
     e.g. the user blocked the bot. Returns whether it succeeded."""

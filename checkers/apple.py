@@ -682,6 +682,92 @@ async def check_pickup_row(bot, row: dict) -> dict:
     return results
 
 
+async def check_channel_pickup_row(bot, row: dict) -> list[dict]:
+    """
+    Channel-forwarding sibling of check_pickup_row above — same
+    fetch/persist/notify shape, but for ONE database.channel_forward_
+    pickup_tracking row (a single pincode per row, not a per-user list)
+    and forwarding the alert to the registered channel (looked up here
+    via database.get_forward_channel, same as bot.py's own
+    _apply_result_to_channel_forward_row does for the stock side) instead
+    of a user_id. Lives here for the same reason check_pickup_row does: bot.py's
+    background cycle AND admin_handlers.py's on-demand /checkforwarding
+    both need this, and admin_handlers.py can't import bot.py (circular —
+    bot.py imports admin_handlers.router), but both already import
+    checkers.apple.
+
+    SKU is fetched fresh from the product page if not already cached on
+    the row (mirrors bot.py's own _check_apple_official_pickup_group) —
+    channel_forward_pickup_tracking rows are created via /addchannelpickup
+    with the SKU already resolved at add-time, so this is normally a
+    no-op fetch-skip; only relevant if that initial extraction somehow
+    didn't get persisted.
+
+    Returns the current call's available-stores list (empty if none/
+    inconclusive) — used by /checkforwarding to show a live result
+    immediately, same as check_pickup_row's own return value is used by
+    /mypickups.
+    """
+    # Deferred imports — see check_pickup_row's own note above for why.
+    from database import update_channel_forward_pickup_status, is_forwarding_paused, get_forward_channel
+    from notifications import send_channel_pickup_alert
+
+    sku = row.get("sku")
+    if not sku:
+        try:
+            resp = await fetch_page(row["url"], render_js=NEEDS_JS, timeout=30.0, site="apple")
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            sku = _extract_sku(soup, resp.text)
+        except Exception as exc:
+            logger.error(
+                f"[apple][channel-pickup] product page fetch/SKU extraction "
+                f"failed for #{row['id']} url={row['url']!r}: {exc}"
+            )
+            return []
+        if not sku:
+            logger.warning(
+                f"[apple][channel-pickup] could not extract a SKU for "
+                f"#{row['id']} url={row['url']!r} — skipping this cycle"
+            )
+            return []
+
+    try:
+        data, _method, _diag = await _fetch_pickup_availability(sku, row["pincode"], row["url"])
+    except Exception as exc:
+        logger.error(f"[apple][channel-pickup] error checking #{row['id']}: {exc}")
+        return []
+    if data is None:
+        return []  # inconclusive this call — leave prior status untouched
+
+    stores = available_stores_for_pickup(data, sku)
+    now_available = bool(stores)
+    was_available = bool(row.get("available"))
+
+    update_channel_forward_pickup_status(row["id"], now_available, sku=sku)
+
+    if now_available and not was_available:
+        if is_forwarding_paused():
+            logger.info(
+                f"[apple][channel-pickup] #{row['id']} transitioned to "
+                f"available but forwarding is paused — alert suppressed."
+            )
+        else:
+            channel = get_forward_channel()
+            if not channel:
+                logger.warning(
+                    f"[apple][channel-pickup] #{row['id']} transitioned to "
+                    f"available but no channel is registered — alert skipped."
+                )
+            else:
+                try:
+                    await send_channel_pickup_alert(bot, channel["chat_id"], row["name"], row["pincode"], stores)
+                except Exception as exc:
+                    logger.error(f"[apple][channel-pickup] alert failed for #{row['id']}: {exc}")
+
+    return stores
+
+
 async def refine_with_pincode(
     soup: BeautifulSoup, html: str, pincode: str, generic_result: bool, url: str,
 ) -> bool:

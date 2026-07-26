@@ -457,6 +457,49 @@ def init_db():
         """)
         conn.commit()
 
+        # Global on/off switch for channel-forwarding ALERTS specifically —
+        # separate from service_status above (which pauses the entire bot's
+        # background checking). See admin_handlers.py's /forwardingtoggle.
+        # Background checks for channel-forward items keep running either
+        # way (so /listforwarding and /checkforwarding stay accurate) —
+        # only the actual alert-send is gated by this, mirroring
+        # service_status's own single-row/paused/paused_at shape.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forwarding_status (
+                id        INTEGER PRIMARY KEY CHECK (id = 1),
+                paused    INTEGER NOT NULL DEFAULT 0,
+                paused_at TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR IGNORE INTO forwarding_status (id, paused, paused_at) VALUES (1, 0, NULL)"
+        )
+        conn.commit()
+
+        # Apple pickup-availability channel-forwarding — the pickup sibling
+        # of channel_forward_tracking above (see admin_handlers.py's
+        # /addchannelpickup, /stopforwardingpickup, and checkers/apple.py's
+        # check_channel_pickup_row). ONE pincode per row (not a list like
+        # pickup_tracking) — matches /addchannelpickup <url> <pincode>'s own
+        # one-pincode-per-call shape; the same URL can appear multiple times
+        # with different pincodes (UNIQUE is on the pair, not url alone).
+        # sku is cached after first successful extraction, same convention
+        # as apple_official_pickup_status/pickup_tracking.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_forward_pickup_tracking (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT    NOT NULL,
+                url          TEXT    NOT NULL,
+                sku          TEXT,
+                pincode      TEXT    NOT NULL,
+                available    INTEGER NOT NULL DEFAULT 0,
+                last_checked TEXT,
+                created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(url, pincode)
+            )
+        """)
+        conn.commit()
+
         # Auto-refreshed Apple session (cookies + matching User-Agent), minted
         # periodically by a real headless-Chromium session in the separate
         # playwright_scraper service (see checkers/apple.py's
@@ -678,6 +721,118 @@ def update_channel_forward_status(row_id: int, in_stock: bool) -> None:
             "UPDATE channel_forward_tracking SET in_stock = ?, last_checked = ? WHERE id = ?",
             (1 if in_stock else 0, now_ist_str(), row_id),
         )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Channel-forwarding global on/off switch (see forwarding_status table
+# above) — mirrors service_status/get_service_pause_info/set_service_paused
+# exactly, but scoped to just the channel-forward alert send, not the
+# entire bot's background checking.
+# ---------------------------------------------------------------------------
+
+def get_forwarding_pause_info() -> dict:
+    """{'paused': bool, 'paused_at': str | None}."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT paused, paused_at FROM forwarding_status WHERE id = 1").fetchone()
+    if row is None:
+        return {"paused": False, "paused_at": None}
+    return {"paused": bool(row["paused"]), "paused_at": row["paused_at"]}
+
+
+def is_forwarding_paused() -> bool:
+    """Fast-path check for the channel-forward alert-send step (bot.py's
+    _apply_result_to_channel_forward_row and checkers/apple.py's
+    check_channel_pickup_row) — True means skip sending the alert, but the
+    underlying check + status persistence still happens either way."""
+    return get_forwarding_pause_info()["paused"]
+
+
+def set_forwarding_paused(paused: bool) -> dict:
+    paused_at = now_ist_str() if paused else None
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE forwarding_status SET paused = ?, paused_at = ? WHERE id = 1",
+            (1 if paused else 0, paused_at),
+        )
+        conn.commit()
+    return {"paused": paused, "paused_at": paused_at}
+
+
+# ---------------------------------------------------------------------------
+# Apple pickup channel-forwarding (see channel_forward_pickup_tracking
+# table above) — the pickup sibling of the channel_forward_tracking
+# functions above.
+# ---------------------------------------------------------------------------
+
+def add_channel_forward_pickup(
+    name: str, url: str, pincode: str, sku: str | None = None,
+) -> tuple[bool, str]:
+    """Returns (False, ...) on a duplicate (url, pincode) pair — the same
+    product tracked at the same pincode twice is a no-op, not an error the
+    caller needs to distinguish further."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO channel_forward_pickup_tracking (name, url, sku, pincode)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, url, sku, pincode),
+            )
+            conn.commit()
+        return True, "Pickup tracking added to the forward list."
+    except sqlite3.IntegrityError:
+        return False, "This URL + pincode combination is already forwarding to the channel."
+    except Exception as e:
+        logger.error(f"add_channel_forward_pickup error: {e}")
+        return False, "Database error while adding to the pickup forward list."
+
+
+def list_channel_forward_pickup() -> list[dict]:
+    """Every pickup-forward entry, oldest first — stable, index-friendly
+    ordering for admin_handlers.py's /stopforwardingpickup <index>."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM channel_forward_pickup_tracking ORDER BY created_at ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_channel_forward_pickup_by_id(row_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM channel_forward_pickup_tracking WHERE id = ?", (row_id,))
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def remove_channel_forward_pickup_by_url(url: str) -> int:
+    """Removes EVERY entry for this URL regardless of pincode — "stop
+    forwarding pickup alerts for this product" rather than requiring the
+    admin to know which specific pincode(s) to target. Returns how many
+    rows were removed."""
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM channel_forward_pickup_tracking WHERE url = ?", (url,))
+        conn.commit()
+    return cursor.rowcount
+
+
+def update_channel_forward_pickup_status(row_id: int, available: bool, sku: str | None = None) -> None:
+    """sku is only overwritten when a non-None value is passed — mirrors
+    upsert_apple_official_pickup_status's own "None never overwrites a
+    cached value" convention, so a transient re-extraction failure never
+    wipes out a previously-cached sku."""
+    with get_connection() as conn:
+        if sku is not None:
+            conn.execute(
+                "UPDATE channel_forward_pickup_tracking SET available = ?, last_checked = ?, sku = ? WHERE id = ?",
+                (1 if available else 0, now_ist_str(), sku, row_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE channel_forward_pickup_tracking SET available = ?, last_checked = ? WHERE id = ?",
+                (1 if available else 0, now_ist_str(), row_id),
+            )
         conn.commit()
 
 

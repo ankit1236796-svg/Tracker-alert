@@ -32,7 +32,7 @@ from access import compute_access, STATUS_TRIAL, STATUS_ACTIVE, STATUS_EXPIRED_G
 from checkers import (
     fetch_page, fetch_with_502_retry, shopatsc, unicornstore, inventstore, reliancedigital, apple,
     sangeethamobiles, vijaysales, tataneu, iqoo, vivo, croma,
-    CHECKER_MAP,
+    CHECKER_MAP, extract_generic_product_name,
 )
 from config import (
     ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER,
@@ -77,10 +77,19 @@ from database import (
     remove_channel_forward_product,
     list_channel_forward_products,
     get_reliance_article_id_for_url,
+    get_forwarding_pause_info,
+    set_forwarding_paused,
+    is_forwarding_paused,
+    update_channel_forward_status,
+    add_channel_forward_pickup,
+    list_channel_forward_pickup,
+    remove_channel_forward_pickup_by_id,
+    remove_channel_forward_pickup_by_url,
 )
 import whatsapp_client
 import zyte_client
 from states import AdminBulkStates
+from translations import t
 from notifications import (
     send_approval_notice,
     send_rejection_notice,
@@ -88,6 +97,7 @@ from notifications import (
     send_unblock_notice,
     send_plan_cancelled_notice,
     send_items_removed_notice,
+    send_channel_stock_alert,
 )
 
 logger = logging.getLogger(__name__)
@@ -1059,21 +1069,26 @@ async def callback_ps_cancel(call: CallbackQuery, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# Channel-forwarding stock alerts — /setchannel, /addchannel,
-# /stopforwarding, /listforwarding. A SINGLE, global, admin-controlled
-# channel (not per-user, unlike the WhatsApp channel-forwarding feature —
-# see database.forward_channel/channel_forward_tracking for the full
-# reasoning) whose stock alerts are sent by the bot itself directly, no
-# separate service needed — Telegram lets a bot post to any channel it's
-# been added as an admin to, unlike WhatsApp forwarding's own session-based
-# approach. Checked on the same CHECK_INTERVAL cadence as regular tracked
-# products (bot.run_channel_forward_check_cycle).
+# Channel-forwarding stock + pickup alerts — /setchannel, /addchannel,
+# /stopforwarding, /addchannelpickup, /stopforwardingpickup,
+# /forwardingtoggle, /testforwarding, /checkforwarding, /listforwarding. A
+# SINGLE, global, admin-controlled channel (not per-user, unlike the
+# WhatsApp channel-forwarding feature — see database.forward_channel/
+# channel_forward_tracking for the full reasoning) whose alerts are sent by
+# the bot itself directly, no separate service needed — Telegram lets a bot
+# post to any channel it's been added as an admin to, unlike WhatsApp
+# forwarding's own session-based approach. Checked on the same
+# CHECK_INTERVAL cadence as regular tracked products
+# (bot.run_channel_forward_check_cycle).
 # ---------------------------------------------------------------------------
 
 def _channel_auto_name(url: str, site: str) -> str:
-    """Same shape as handlers.py's own _auto_name — kept as a separate,
-    tiny local copy rather than importing across files, so this feature
-    stays fully self-contained within admin_handlers.py."""
+    """Last-resort fallback name (site label + a URL-derived slug) — same
+    shape as handlers.py's own _auto_name, kept as a separate, tiny local
+    copy rather than importing across files, so this feature stays fully
+    self-contained within admin_handlers.py. Used only when neither a
+    custom name nor a live-fetched one is available, so a product never
+    shows up blank."""
     try:
         path = urlparse(url).path.rstrip("/")
         slug = path.split("/")[-1][:40] if path else "product"
@@ -1082,21 +1097,64 @@ def _channel_auto_name(url: str, site: str) -> str:
     return f"{get_site_label(site)}: {slug}"
 
 
-async def _resolve_reliance_article_id_for_channel(url: str) -> str | None:
+async def _fetch_generic_product_name(url: str, site: str) -> str | None:
+    """One-time, best-effort product-name fetch for /addchannel when no
+    custom name was given (any site OTHER than reliancedigital, which
+    reuses its own article_id-extraction fetch instead — see
+    _resolve_reliance_article_id_and_name_for_channel below). Only Apple
+    has any name-extraction logic elsewhere in this codebase
+    (checkers/apple.py's _extract_product_name, scoped to its own
+    pickup-tracking feature) — every other checker only ever returns an
+    in_stock bool, never a name, so this is genuinely new for those
+    sites. Uses render_js=False regardless of the site's normal JS
+    requirement: a page's <title> is almost always present in the raw,
+    non-rendered HTML even on JS-heavy sites, and exact accuracy doesn't
+    matter here the way it does for the real stock signal. Costs one real
+    Zyte/Scrape.do fetch (tracked under site= in /creditusage) — but only
+    ONCE per /addchannel call with no custom name, never on the recurring
+    check. Never raises; returns None on any failure, letting the caller
+    fall back to _channel_auto_name."""
+    try:
+        resp = await fetch_page(url, render_js=False, timeout=30.0, site=site)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        return extract_generic_product_name(soup)
+    except Exception as exc:
+        logger.warning(f"[channel-forward] product-name fetch failed for {url!r}: {exc}")
+        return None
+
+
+async def _resolve_reliance_article_id_and_name_for_channel(
+    url: str, want_name: bool,
+) -> tuple[str | None, str | None]:
     """Same reuse-then-extract logic as handlers.py's own
     _resolve_reliance_article_id (checks database.get_reliance_article_id_
     for_url — which covers BOTH products and channel_forward_tracking —
-    before paying for a fresh Zyte/Scrape.do fetch). Kept as a separate
-    copy rather than a cross-module import so this feature's own log lines
-    stay correctly scoped under admin_handlers, and to avoid adding an
-    admin_handlers.py -> handlers.py import dependency that doesn't exist
-    today."""
+    before paying for a fresh Zyte/Scrape.do fetch), extended to also
+    return a product name extracted from that SAME fetch when
+    `want_name` is True (i.e. no custom name was given) — avoids a
+    SECOND RelianceDigital fetch just for naming, which would likely fail
+    anyway without super_proxy=True (see checkers/reliancedigital.py's
+    fetch_and_extract_article_id for the Akamai WAF block this site
+    needs it for). Returns (article_id, name) — name is None when
+    want_name is False (the caller already has a custom name and doesn't
+    need one) or extraction found nothing.
+
+    Kept as a separate copy rather than a cross-module import to
+    handlers.py so this feature's own log lines stay correctly scoped
+    under admin_handlers, and to avoid adding an admin_handlers.py ->
+    handlers.py import dependency that doesn't exist today."""
     existing = get_reliance_article_id_for_url(url)
     if existing:
         logger.info(f"[channel-forward] reusing existing article_id={existing!r} for {url!r}")
-        return existing
+        # A reused article_id means someone else already paid for the
+        # fetch — no HTML available here to also pull a name from, so
+        # fall through to the generic one-time name fetch if one's wanted.
+        name = await _fetch_generic_product_name(url, "reliancedigital") if want_name else None
+        return existing, name
 
-    article_id, method = await reliancedigital.fetch_and_extract_article_id(url)
+    article_id, method, name = await reliancedigital.fetch_and_extract_article_id(url)
     if not article_id:
         logger.warning(
             f"[channel-forward] could not extract an article_id for {url!r} — "
@@ -1104,9 +1162,62 @@ async def _resolve_reliance_article_id_for_channel(url: str) -> str | None:
             f"automatic checks will be skipped (inconclusive) until this is "
             f"re-extracted."
         )
-        return None
+        return None, (name if want_name else None)
     logger.info(f"[channel-forward] extracted article_id={article_id!r} for {url!r} (method={method})")
-    return article_id
+    return article_id, (name if want_name else None)
+
+
+# ---------------------------------------------------------------------------
+# /forwardingtoggle — global on/off switch for the ALERT SEND only (see
+# database.forwarding_status). Background checks for every forwarded
+# product keep running either way, so /listforwarding and /checkforwarding
+# stay accurate even while paused. Mirrors /pauseservice's own status+
+# inline-toggle-button pattern.
+# ---------------------------------------------------------------------------
+
+def _forwarding_status_text() -> str:
+    info = get_forwarding_pause_info()
+    if info["paused"]:
+        return f"🔴 <b>Channel forwarding: OFF</b> (paused since {info['paused_at']})"
+    return "🟢 <b>Channel forwarding: ON</b>"
+
+
+def _forwarding_menu_keyboard(paused: bool) -> InlineKeyboardMarkup:
+    toggle_button = (
+        InlineKeyboardButton(text="▶️ Turn forwarding ON", callback_data="fwd_resume")
+        if paused else
+        InlineKeyboardButton(text="⏸ Turn forwarding OFF", callback_data="fwd_pause")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[[toggle_button]])
+
+
+@router.message(Command("forwardingtoggle"))
+async def cmd_forwardingtoggle(message: Message):
+    info = get_forwarding_pause_info()
+    await message.answer(
+        _forwarding_status_text(), parse_mode="HTML",
+        reply_markup=_forwarding_menu_keyboard(info["paused"]),
+    )
+
+
+@router.callback_query(F.data == "fwd_pause")
+async def callback_fwd_pause(call: CallbackQuery):
+    set_forwarding_paused(True)
+    await call.message.edit_text(
+        _forwarding_status_text(), parse_mode="HTML",
+        reply_markup=_forwarding_menu_keyboard(True),
+    )
+    await call.answer("Forwarding turned OFF.")
+
+
+@router.callback_query(F.data == "fwd_resume")
+async def callback_fwd_resume(call: CallbackQuery):
+    set_forwarding_paused(False)
+    await call.message.edit_text(
+        _forwarding_status_text(), parse_mode="HTML",
+        reply_markup=_forwarding_menu_keyboard(False),
+    )
+    await call.answer("Forwarding turned ON.")
 
 
 @router.message(Command("setchannel"))
@@ -1173,7 +1284,12 @@ async def cmd_setchannel(message: Message, command: CommandObject):
 @router.message(Command("addchannel"))
 async def cmd_addchannel(message: Message, command: CommandObject):
     if not command.args:
-        await message.answer("Usage: <code>/addchannel &lt;product_url&gt;</code>", parse_mode="HTML")
+        await message.answer(
+            "Usage: <code>/addchannel &lt;product_url&gt; [custom_name]</code>\n"
+            "If no custom name is given, one is auto-fetched from the product "
+            "page (falling back to a generic name if that fails too).",
+            parse_mode="HTML",
+        )
         return
 
     channel = get_forward_channel()
@@ -1186,7 +1302,10 @@ async def cmd_addchannel(message: Message, command: CommandObject):
         )
         return
 
-    url = command.args.strip()
+    parts = command.args.strip().split(maxsplit=1)
+    url = parts[0]
+    custom_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+
     if not url.startswith(("http://", "https://")):
         await message.answer("⚠️ Not a valid URL.")
         return
@@ -1197,15 +1316,30 @@ async def cmd_addchannel(message: Message, command: CommandObject):
         return
 
     reliance_article_id = None
-    if site == "reliancedigital":
-        reliance_article_id = await _resolve_reliance_article_id_for_channel(url)
+    resolved_name = custom_name
 
-    name = _channel_auto_name(url, site)
-    ok, msg = add_channel_forward_product(name, url, site, reliance_article_id=reliance_article_id)
+    if site == "reliancedigital":
+        reliance_article_id, fetched_name = await _resolve_reliance_article_id_and_name_for_channel(
+            url, want_name=(custom_name is None),
+        )
+        if resolved_name is None:
+            resolved_name = fetched_name
+    elif resolved_name is None:
+        resolved_name = await _fetch_generic_product_name(url, site)
+
+    name_source = "custom"
+    if resolved_name is None:
+        resolved_name = _channel_auto_name(url, site)
+        name_source = "fallback"
+    elif custom_name is None:
+        name_source = "auto-fetched"
+
+    ok, msg = add_channel_forward_product(resolved_name, url, site, reliance_article_id=reliance_article_id)
     if ok:
         await message.answer(
-            f"✅ Now forwarding <b>{html.escape(name)}</b> [{get_site_label(site)}] stock "
-            f"alerts to <b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
+            f"✅ Now forwarding <b>{html.escape(resolved_name)}</b> ({name_source}) "
+            f"[{get_site_label(site)}] stock alerts to "
+            f"<b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
             parse_mode="HTML",
         )
     else:
@@ -1226,29 +1360,140 @@ async def cmd_stopforwarding(message: Message, command: CommandObject):
         await message.answer("⚠️ That URL isn't in the forward list.")
 
 
+@router.message(Command("addchannelpickup"))
+async def cmd_addchannelpickup(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; &lt;pincode&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; &lt;pincode&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+    url, pincode = parts[0], parts[1]
+
+    channel = get_forward_channel()
+    if not channel:
+        await message.answer(
+            "⚠️ No forwarding channel registered yet. Run "
+            "<code>/setchannel &lt;channel_id_or_@username&gt;</code> first.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not url.startswith(("http://", "https://")) or stock_checker.detect_site(url) != "apple":
+        await message.answer("⚠️ /addchannelpickup only supports apple.com product URLs.", parse_mode="HTML")
+        return
+
+    await _debug_send(message, f"🔍 Fetching product page to resolve SKU + name: {url}")
+    try:
+        resp = await fetch_page(url, render_js=apple.NEEDS_JS, timeout=30.0, site="apple")
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        await message.answer(f"⚠️ Could not fetch the product page: {exc}")
+        return
+
+    sku = apple._extract_sku(soup, resp.text)
+    if not sku:
+        await message.answer("⚠️ Could not extract a SKU from this page — cannot track pickup availability.")
+        return
+
+    name = apple._extract_product_name(soup) or _channel_auto_name(url, "apple")
+
+    ok, msg = add_channel_forward_pickup(name, url, pincode, sku=sku)
+    if ok:
+        await message.answer(
+            f"✅ Now forwarding pickup alerts for <b>{html.escape(name)}</b> at pincode "
+            f"<code>{html.escape(pincode)}</code> to "
+            f"<b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(f"⚠️ {msg}")
+
+
+@router.message(Command("stopforwardingpickup"))
+async def cmd_stopforwardingpickup(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Usage: <code>/stopforwardingpickup &lt;index_or_url&gt;</code>", parse_mode="HTML")
+        return
+
+    arg = command.args.strip()
+    if arg.isdigit():
+        rows = list_channel_forward_pickup()
+        idx = int(arg)
+        if not (1 <= idx <= len(rows)):
+            await message.answer(
+                f"⚠️ No pickup forward entry at index {idx}. Use /listforwarding "
+                f"to see valid indexes.",
+            )
+            return
+        target = rows[idx - 1]
+        removed = remove_channel_forward_pickup_by_id(target["id"])
+        if removed:
+            await message.answer(
+                f"✅ Stopped forwarding pickup alerts for <b>{html.escape(target['name'])}</b> "
+                f"(pincode {html.escape(target['pincode'])}).",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer("⚠️ Could not remove that entry (already gone?).")
+        return
+
+    count = remove_channel_forward_pickup_by_url(arg)
+    if count:
+        await message.answer(
+            f"✅ Stopped forwarding pickup alerts for {count} entr{'y' if count == 1 else 'ies'} "
+            f"matching that URL.",
+        )
+    else:
+        await message.answer("⚠️ No pickup forward entries match that index or URL.")
+
+
 @router.message(Command("listforwarding"))
 async def cmd_listforwarding(message: Message):
     channel = get_forward_channel()
     rows = list_channel_forward_products()
+    pickup_rows = list_channel_forward_pickup()
 
     if channel:
         header = f"📡 Forwarding to: <b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>"
     else:
         header = "⚠️ No channel registered (checks still run, but alerts can't be sent) — run /setchannel."
+    header += f"\n{_forwarding_status_text()}"
 
-    if not rows:
-        await message.answer(f"{header}\n\n📭 No products are currently forwarding.", parse_mode="HTML")
+    if not rows and not pickup_rows:
+        await message.answer(f"{header}\n\n📭 Nothing is currently forwarding.", parse_mode="HTML")
         return
 
     lines = [header, ""]
-    for row in rows:
-        status = "✅ In stock" if row["in_stock"] else "⬜ Out of stock"
-        last_checked = row["last_checked"] or "never"
-        lines.append(
-            f"{status} — <b>{html.escape(row['name'])}</b> [{get_site_label(row['site'])}]\n"
-            f"<code>{html.escape(row['url'][:70])}</code>\n"
-            f"Last checked: {last_checked}"
-        )
+    if rows:
+        lines.append("📦 <b>Stock alerts</b>")
+        for row in rows:
+            status = "✅ In stock" if row["in_stock"] else "⬜ Out of stock"
+            last_checked = row["last_checked"] or "never"
+            lines.append(
+                f"{status} — <b>{html.escape(row['name'])}</b> [{get_site_label(row['site'])}]\n"
+                f"<code>{html.escape(row['url'][:70])}</code>\n"
+                f"Last checked: {last_checked}"
+            )
+    if pickup_rows:
+        lines.append("🏬 <b>Pickup alerts</b> (index — for /stopforwardingpickup)")
+        for i, row in enumerate(pickup_rows, start=1):
+            status = "✅ Available" if row["available"] else "⬜ Unavailable"
+            last_checked = row["last_checked"] or "never"
+            lines.append(
+                f"{i}. {status} — <b>{html.escape(row['name'])}</b> @ pincode {html.escape(row['pincode'])}\n"
+                f"<code>{html.escape(row['url'][:70])}</code>\n"
+                f"Last checked: {last_checked}"
+            )
 
     _CHUNK_SIZE = 3500
     # Chunked at whole-line boundaries (each entry above is a fully
@@ -1264,6 +1509,127 @@ async def cmd_listforwarding(message: Message):
         chunk_len += len(line) + 2
     if chunk:
         await message.answer("\n\n".join(chunk), parse_mode="HTML")
+
+
+@router.message(Command("testforwarding"))
+async def cmd_testforwarding(message: Message):
+    """Sends a placeholder 'Back in Stock' style message to the registered
+    channel RIGHT NOW, bypassing every gate (UNRELIABLE_SITES, site lock,
+    the /forwardingtoggle switch) — the whole point is verifying the bot
+    can actually post there and that the message renders correctly,
+    independent of whether real alerts are currently allowed through."""
+    channel = get_forward_channel()
+    if not channel:
+        await message.answer(
+            "⚠️ No forwarding channel registered yet. Run "
+            "<code>/setchannel &lt;channel_id_or_@username&gt;</code> first.",
+            parse_mode="HTML",
+        )
+        return
+
+    price_line = t("stock_alert_price_line", "en", price="999")
+    body = t(
+        "stock_alert", "en",
+        name="Test Product (placeholder)", site="Test Store",
+        price_line=price_line, url="https://example.com/test-product",
+    )
+    text = f"🧪 <b>TEST MESSAGE</b> — verifying channel-forwarding connectivity.\n\n{body}"
+    try:
+        await message.bot.send_message(chat_id=channel["chat_id"], text=text, parse_mode="HTML")
+        await message.answer(
+            f"✅ Test message sent to <b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await message.answer(f"⚠️ Failed to send the test message: {exc}")
+
+
+async def _apply_channel_forward_stock_result_now(
+    bot, row: dict, now_in_stock: bool | None, current_price: float | None,
+) -> str:
+    """/checkforwarding's own copy of bot.py's _apply_result_to_channel_
+    forward_row — same persist/transition/alert logic, but ALSO returns a
+    short status line for the admin's immediate reply. Duplicated rather
+    than imported (admin_handlers.py can't import bot.py — circular, bot.py
+    imports admin_handlers.router) — mirrors this codebase's own existing
+    precedent (handlers.py's manual /check duplicates this same shape from
+    bot.py for the identical reason; see its receive_link/callback_check
+    handlers)."""
+    if now_in_stock is None:
+        return f"⚠️ <b>{html.escape(row['name'])}</b> — check inconclusive"
+
+    was_in_stock = bool(row["in_stock"])
+    update_channel_forward_status(row["id"], now_in_stock)
+    price_str = f" @ ₹{current_price:,.0f}" if current_price is not None else ""
+    status = "✅ In stock" if now_in_stock else "⬜ Out of stock"
+
+    if now_in_stock and not was_in_stock:
+        if is_forwarding_paused():
+            status += " (transitioned — alert suppressed, forwarding is OFF)"
+        else:
+            channel = get_forward_channel()
+            if channel:
+                await send_channel_stock_alert(bot, channel["chat_id"], row, price=current_price)
+                status += " (transitioned — alert sent)"
+            else:
+                status += " (transitioned — no channel registered, alert skipped)"
+
+    return f"{status} — <b>{html.escape(row['name'])}</b>{price_str} [{get_site_label(row['site'])}]"
+
+
+@router.message(Command("checkforwarding"))
+async def cmd_checkforwarding(message: Message):
+    """Live, on-demand check of every channel-forwarded product (stock +
+    pickup) RIGHT NOW — doesn't wait for the background cycle. Uses the
+    SAME persist/transition/alert logic as the scheduled cycle (a genuine
+    transition found here fires a real alert, same as /mypickups does for
+    the regular per-user pickup feature), then reports the live result
+    back to the admin either way."""
+    stock_rows = list_channel_forward_products()
+    pickup_rows = list_channel_forward_pickup()
+    if not stock_rows and not pickup_rows:
+        await message.answer("📭 Nothing is currently set to forward.")
+        return
+
+    await message.answer(
+        f"🔍 Checking {len(stock_rows)} stock item(s) and {len(pickup_rows)} "
+        f"pickup item(s) now…"
+    )
+
+    lines: list[str] = []
+    for row in stock_rows:
+        try:
+            now_in_stock, current_price = await stock_checker.check_stock(
+                row["url"], row["site"], pincode=None, caller="manual",
+            )
+        except Exception as exc:
+            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> — check failed: {exc}")
+            continue
+        try:
+            lines.append(await _apply_channel_forward_stock_result_now(message.bot, row, now_in_stock, current_price))
+        except Exception as exc:
+            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> — error applying result: {exc}")
+
+    for row in pickup_rows:
+        try:
+            stores = await apple.check_channel_pickup_row(message.bot, row)
+        except Exception as exc:
+            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check failed: {exc}")
+            continue
+        status = "✅ Available" if stores else "⬜ Unavailable"
+        lines.append(f"{status} — <b>{html.escape(row['name'])}</b> @ pincode {html.escape(row['pincode'])} (pickup)")
+
+    _CHUNK_SIZE = 3500
+    chunk: list[str] = []
+    chunk_len = 0
+    for line in lines:
+        if chunk_len + len(line) + 1 > _CHUNK_SIZE and chunk:
+            await message.answer("\n".join(chunk), parse_mode="HTML")
+            chunk, chunk_len = [], 0
+        chunk.append(line)
+        chunk_len += len(line) + 1
+    if chunk:
+        await message.answer("\n".join(chunk), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------

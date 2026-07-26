@@ -25,7 +25,7 @@ import re
 import httpx
 from bs4 import BeautifulSoup
 
-from .common import fetch_page
+from .common import fetch_page, extract_generic_product_name
 
 logger = logging.getLogger(__name__)
 
@@ -274,11 +274,19 @@ def extract_article_id(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     return None, None
 
 
-async def fetch_and_extract_article_id(url: str) -> tuple[str | None, str | None]:
+async def fetch_and_extract_article_id(url: str) -> tuple[str | None, str | None, str | None]:
     """
     One-time, /add-time fetch of `url` + extract_article_id() above.
-    Returns (article_id, method) — (None, None) on any failure. Never
-    raises.
+    Returns (article_id, method, name) — (None, None, None) on any
+    failure. Never raises. `name` is a best-effort product display name
+    (checkers.common.extract_generic_product_name — JSON-LD "name" then
+    <title>) extracted from this SAME fetch, so the channel-forwarding
+    feature's /addchannel auto-naming (admin_handlers.py) doesn't need a
+    second RelianceDigital fetch just for a name — this site already
+    needs super_proxy=True to get past its WAF block (see below), so a
+    separate plain naming-only fetch would likely just fail anyway.
+    handlers.py's regular /add flow ignores `name` (it always has its own
+    user-supplied name already).
 
     Goes through checkers.common.fetch_page with super_proxy=True — NOT a
     plain/direct request. RelianceDigital blocks Railway's outbound IP at
@@ -305,30 +313,31 @@ async def fetch_and_extract_article_id(url: str) -> tuple[str | None, str | None
         resp = await fetch_page(url, render_js=False, super_proxy=True, timeout=60.0, site="reliancedigital")
     except Exception as exc:
         logger.warning(f"[reliancedigital][extract] fetch failed for {url!r}: {type(exc).__name__}: {exc}")
-        return None, None
+        return None, None, None
 
     if resp.status_code != 200:
         logger.warning(
             f"[reliancedigital][extract] HTTP {resp.status_code} for {url!r} — "
             f"cannot extract article_id from a non-200 response"
         )
-        return None, None
+        return None, None, None
 
     try:
         soup = BeautifulSoup(resp.text, "html.parser")
         article_id, method = extract_article_id(soup)
+        name = extract_generic_product_name(soup)
     except Exception as exc:
         logger.warning(f"[reliancedigital][extract] parsing failed for {url!r}: {type(exc).__name__}: {exc}")
-        return None, None
+        return None, None, None
 
     if article_id:
-        logger.info(f"[reliancedigital][extract] {url!r} → article_id={article_id!r} (method={method})")
+        logger.info(f"[reliancedigital][extract] {url!r} → article_id={article_id!r} (method={method}, name={name!r})")
     else:
         logger.warning(
             f"[reliancedigital][extract] could not extract an article_id from {url!r} "
             f"via either method (Item Code spec field or og:image regex)"
         )
-    return article_id, method
+    return article_id, method, name
 
 
 _INVENTORY_URL = "https://www.reliancedigital.in/ext/raven-api/inventory/multi/articles-v2"
