@@ -69,6 +69,21 @@ def init_db():
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # Migration: RelianceDigital's internal inventory-API "article_id",
+        # auto-extracted from the live product page once at /add time (see
+        # checkers/reliancedigital.py's fetch_and_extract_article_id and
+        # handlers.py's _resolve_reliance_article_id) rather than scraped on
+        # every check cycle. NULL means extraction failed or hasn't run for
+        # this row (e.g. every non-reliancedigital product, or one added
+        # before this migration) — stock_checker.check_stock() treats a
+        # missing article_id as inconclusive (returns None), same as
+        # checkers/croma.py does for a missing itemID.
+        try:
+            conn.execute("ALTER TABLE products ADD COLUMN reliance_article_id TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_products_user_id ON products(user_id)
         """)
@@ -486,12 +501,16 @@ def add_product(
     url: str,
     site: str,
     target_price: float | None = None,
+    reliance_article_id: str | None = None,
 ) -> tuple[bool, str]:
     try:
         with get_connection() as conn:
             conn.execute(
-                "INSERT INTO products (user_id, name, url, site, target_price) VALUES (?, ?, ?, ?, ?)",
-                (user_id, name, url, site, target_price),
+                """
+                INSERT INTO products (user_id, name, url, site, target_price, reliance_article_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, name, url, site, target_price, reliance_article_id),
             )
             conn.commit()
         return True, "Product added successfully."
@@ -500,6 +519,28 @@ def add_product(
     except Exception as e:
         logger.error(f"add_product error: {e}")
         return False, "Database error while adding product."
+
+
+def get_reliance_article_id_for_url(url: str) -> str | None:
+    """
+    Returns the article_id already extracted for this EXACT url string by
+    ANY user's row (not just the caller's own), or None if no row has one
+    yet. Lets a second/third user tracking the identical RelianceDigital
+    URL reuse the first extraction instead of paying for another Zyte/
+    Scrape.do fetch — mirrors apple_official_pickup_status's own
+    cross-user dedup reasoning (checking the same thing twice for two
+    different users produces no additional information, only cost).
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT reliance_article_id FROM products
+            WHERE url = ? AND reliance_article_id IS NOT NULL
+            LIMIT 1
+            """,
+            (url,),
+        ).fetchone()
+    return row["reliance_article_id"] if row else None
 
 
 def list_products(user_id: int) -> list[dict]:

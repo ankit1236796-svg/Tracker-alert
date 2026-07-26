@@ -1642,6 +1642,89 @@ async def cmd_debugreliance2(message: Message, command: CommandObject):
 
 
 # ---------------------------------------------------------------------------
+# /debugreliancedigital: end-to-end test of the article_id migration —
+# fetches the live page (super_proxy=True, same as fetch_and_extract_
+# article_id's production path), extracts article_id via both methods
+# (reporting WHICH one succeeded), then calls the new inventory-API
+# checker with that article_id + the given pincode. Mirrors /debugcroma's
+# structure. Does NOT touch the DB (no add_product/get_reliance_article_
+# id_for_url reuse) — always does a fresh extraction, so this can be
+# re-run repeatedly to compare against real site changes without needing
+# a tracked product. NOT wired into CHECKER_MAP or any production code
+# path — purely diagnostic. Safe to delete once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_RELIANCEDIGITAL_ADMIN_ID = 5004721766  # same hardcoded restriction
+# as every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter — this fetches an arbitrary caller-supplied URL via
+# Scrape.do (spends credits) and calls RelianceDigital's inventory API.
+
+
+@router.message(Command("debugreliancedigital"))
+async def cmd_debugreliancedigital(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_RELIANCEDIGITAL_ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugreliancedigital &lt;url&gt; &lt;pincode&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: <code>/debugreliancedigital &lt;url&gt; &lt;pincode&gt;</code>", parse_mode="HTML"
+        )
+        return
+    url, pincode = parts[0], parts[1]
+
+    await _debug_send(
+        message,
+        f"🔍 Fetching (super_proxy=True — required to get past RelianceDigital's "
+        f"Akamai WAF block on Railway's outbound IP, see /debugreliance): {url}",
+    )
+    try:
+        article_id, method = await reliancedigital.fetch_and_extract_article_id(url)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ fetch_and_extract_article_id crashed unexpectedly: {exc}")
+        return
+
+    if not article_id:
+        await _debug_send(
+            message,
+            "⚠️ Could not extract an article_id via either method (Item Code "
+            "specifications row, or the og:image 9-digit regex fallback) — "
+            "see checkers/reliancedigital.py's extract_article_id (both are "
+            "BEST GUESSES, not verified against a real page from this "
+            "sandbox). Paste the real page structure back so it can be "
+            "corrected.",
+        )
+        return
+    await _debug_send(message, f"✅ Extracted article_id: {article_id!r} (method={method!r})")
+
+    await _debug_send(message, f"🔍 Calling RelianceDigital's inventory API for article_id={article_id!r} pincode={pincode!r}…")
+    try:
+        result = await reliancedigital.check_via_api(article_id, pincode)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ check_via_api crashed unexpectedly: {exc}")
+        return
+
+    if result is None:
+        await _debug_send(
+            message,
+            "⚠️ Inconclusive (None) — the API call failed, returned a "
+            "non-200/non-JSON response, or returned an error.type not yet "
+            "recognized as a confirmed OOS signal. See Railway logs for "
+            "the exact reason.",
+        )
+        return
+
+    await _debug_send(
+        message,
+        f"✅ Result: {'IN STOCK' if result else 'OUT OF STOCK'} for article_id={article_id!r} pincode={pincode!r}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # TEMPORARY debug command for tuning checkers/shopatsc.py's three-tier
 # Scrape.do escalation (render=false, then render=true, then super=true —
 # the .js Shopify JSON endpoint's "available" field was confirmed

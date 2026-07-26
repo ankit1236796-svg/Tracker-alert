@@ -17,6 +17,8 @@ from checkers import (
 from checkers import apple as apple_checker
 from checkers import shopatsc as shopatsc_checker
 from checkers import croma as croma_checker
+from checkers import reliancedigital as reliancedigital_checker
+from database import get_reliance_article_id_for_url
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +230,16 @@ _JS_SITES = {
 # special-cased near the top of check_stock() too, but doesn't fetch/
 # render a page at ALL anymore: it calls Croma's own free inventory API
 # directly. See checkers.croma.check_via_api.
+#
+# RelianceDigital: same story as Croma, migrated after it. Its
+# render=false membership note above (line ~217) describes the OLD
+# page-scraping checker's tier, which the recurring check no longer uses
+# at all — special-cased near the top of check_stock() to call
+# checkers.reliancedigital.check_via_api directly instead. That render=
+# false fetch still happens exactly ONCE per product, at /add time, to
+# extract article_id (checkers.reliancedigital.fetch_and_extract_article_id)
+# — see that function's own docstring for why THAT one fetch uses
+# super_proxy=True (an Akamai WAF block confirmed for this site).
 
 # OnePlus renders incompletely under a plain render=true (confirmed via the
 # /debugoneplus admin command — the page's JS/XHR activity hadn't settled
@@ -433,6 +445,38 @@ async def check_stock(
             return None, None
         logger.info(
             f"[croma] {url} → "
+            f"{'IN STOCK' if result else ('OUT OF STOCK' if result is False else 'INCONCLUSIVE')}"
+        )
+        return result, None
+
+    if site == "reliancedigital":
+        # Sole signal: RelianceDigital's own internal inventory API (free,
+        # no Zyte/Scrape.do credits spent on the recurring check — see
+        # checkers.reliancedigital.check_via_api's module docstring).
+        # Requires an article_id that was auto-extracted at /add time
+        # (checkers.reliancedigital.fetch_and_extract_article_id) —
+        # looked up here by URL (not re-derived from it, unlike Croma's
+        # itemID, since RelianceDigital's article_id isn't embedded in
+        # the URL at all) so ANY user's successful extraction for this
+        # exact URL is reused. Missing article_id -> inconclusive (None),
+        # same convention as Croma's missing-itemID case — NOT a fallback
+        # to the old page-scraping check() (see that module's own note on
+        # why this is an open question, not decided here).
+        article_id = get_reliance_article_id_for_url(url)
+        if not article_id:
+            logger.warning(
+                f"[reliancedigital] no article_id available for {url!r} — "
+                f"extraction may have failed at /add time or hasn't run "
+                f"yet for this product. Skipping this check cycle."
+            )
+            return None, None
+        try:
+            result = await reliancedigital_checker.check_via_api(article_id, pincode)
+        except Exception as exc:
+            logger.error(f"[reliancedigital] check_via_api failed: {exc}")
+            return None, None
+        logger.info(
+            f"[reliancedigital] {url} → "
             f"{'IN STOCK' if result else ('OUT OF STOCK' if result is False else 'INCONCLUSIVE')}"
         )
         return result, None
