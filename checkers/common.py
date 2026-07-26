@@ -394,3 +394,35 @@ def generic_marketplace_check(
 
     logger.info(f"[{site_label}] no conclusive signal → defaulting OUT OF STOCK (False)")
     return False
+
+
+# ---------------------------------------------------------------------------
+# Generic product-name extraction — used by the channel-forwarding feature's
+# /addchannel auto-naming (admin_handlers.py) when no custom name was
+# given. Only checkers/apple.py had a name extractor before this
+# (_extract_product_name, for its separate pickup-tracking feature) — no
+# other checker returns a name at all (check_stock() itself only ever
+# returns (in_stock, price), never a name). Same JSON-LD-then-<title>
+# heuristic as Apple's own version, kept as a separate site-agnostic copy
+# here rather than importing checkers/apple.py's (which is scoped to a
+# different feature) — this one is meant to work across every site.
+# ---------------------------------------------------------------------------
+
+def extract_generic_product_name(soup) -> str | None:
+    """Best-effort product display name from an already-fetched page: tries
+    JSON-LD's "name" field first, then the page <title> tag. Returns None
+    if neither is found — callers should fall back to a URL-derived name
+    in that case, never show a blank name."""
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if isinstance(item, dict) and item.get("name"):
+                return str(item["name"]).strip()
+
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+
+    return None

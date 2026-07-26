@@ -142,7 +142,7 @@ async def _resolve_reliance_article_id(url: str) -> str | None:
         logger.info(f"[reliancedigital][add] reusing existing article_id={existing!r} for {url!r}")
         return existing
 
-    article_id, method = await reliancedigital_checker.fetch_and_extract_article_id(url)
+    article_id, method, _name = await reliancedigital_checker.fetch_and_extract_article_id(url)
     if not article_id:
         logger.warning(
             f"[reliancedigital][add] could not extract an article_id for "

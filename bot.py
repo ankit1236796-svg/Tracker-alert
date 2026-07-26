@@ -36,6 +36,8 @@ from database import (
     get_forward_channel,
     list_channel_forward_products,
     update_channel_forward_status,
+    is_forwarding_paused,
+    list_channel_forward_pickup,
 )
 from handlers import router
 from notifications import (
@@ -223,6 +225,12 @@ async def _apply_result_to_channel_forward_row(
     was_in_stock = bool(row["in_stock"])
     update_channel_forward_status(row["id"], now_in_stock)
     if now_in_stock and not was_in_stock:
+        if is_forwarding_paused():
+            logger.info(
+                f"[channel-forward] #{row['id']} transitioned to in-stock but "
+                f"forwarding is paused (/forwardingtoggle) — alert suppressed."
+            )
+            return
         channel = get_forward_channel()
         if not channel:
             logger.warning(
@@ -235,29 +243,36 @@ async def _apply_result_to_channel_forward_row(
 
 async def run_channel_forward_check_cycle(bot: Bot) -> dict:
     """
-    One check pass across every channel_forward_tracking row. No cross-row
-    dedup (unlike run_stock_check_cycle) — this list is admin-curated and
+    One check pass across every channel_forward_tracking row (stock) AND
+    every channel_forward_pickup_tracking row (Apple pickup — see
+    checkers.apple.check_channel_pickup_row) — both share this same
+    cadence/gating, so one function covers both. No cross-row dedup
+    (unlike run_stock_check_cycle) — this list is admin-curated and
     expected to be small, so there's no meaningful redundant-fetch cost to
     save. Shares the same is_service_paused() global gate as the regular
     stock checker (a global pause should stop ALL automated checking, not
-    just per-user tracking).
+    just per-user tracking) — separate from is_forwarding_paused(), which
+    only suppresses the ALERT send, not the check itself (see
+    _apply_result_to_channel_forward_row / check_channel_pickup_row),
+    keeping /listforwarding and /checkforwarding accurate even while
+    forwarding is toggled off.
 
-    pincode is always None here — channel_forward_tracking rows have no
-    owning user, so there's no per-user pincode to resolve. Sites whose
-    checker requires one (Apple, Croma, RelianceDigital, quick-commerce)
-    will come back inconclusive (None) via check_stock's own existing
-    "no pincode -> None" handling for those sites — this is a known,
-    accepted limitation of the current channel-forwarding feature, not a
-    bug; a future version could add a configurable forward-pincode if
-    that's needed.
+    pincode is always None for the stock-side rows — channel_forward_
+    tracking rows have no owning user, so there's no per-user pincode to
+    resolve. Sites whose checker requires one (Apple, Croma,
+    RelianceDigital, quick-commerce) will come back inconclusive (None)
+    via check_stock's own existing "no pincode -> None" handling for
+    those sites — a known, accepted limitation of the current
+    channel-forwarding feature, not a bug; a future version could add a
+    configurable forward-pincode if that's needed. Pickup rows are
+    unaffected — they carry their own explicit pincode per row.
     """
     if is_service_paused():
         logger.info("[channel-forward] service globally paused — skipping this check cycle entirely")
-        return {"tracked": 0, "paused": True}
+        return {"tracked": 0, "pickup_tracked": 0, "paused": True}
 
     rows = list_channel_forward_products()
-    if not rows:
-        return {"tracked": 0}
+    pickup_rows = list_channel_forward_pickup()
 
     sem = asyncio.Semaphore(10)
 
@@ -275,8 +290,18 @@ async def run_channel_forward_check_cycle(bot: Bot) -> dict:
             except Exception as exc:
                 logger.error(f"[channel-forward] error applying result to #{row['id']}: {exc}")
 
-    await asyncio.gather(*[_check_row(row) for row in rows])
-    return {"tracked": len(rows)}
+    async def _check_pickup_row(row: dict) -> None:
+        async with sem:
+            try:
+                await apple_checker.check_channel_pickup_row(bot, row)
+            except Exception as exc:
+                logger.error(f"[channel-forward][pickup] error checking #{row['id']}: {exc}")
+
+    await asyncio.gather(
+        *[_check_row(row) for row in rows],
+        *[_check_pickup_row(row) for row in pickup_rows],
+    )
+    return {"tracked": len(rows), "pickup_tracked": len(pickup_rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +772,12 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="setchannel",     description="[admin] Register the channel for forwarded stock alerts"),
         BotCommand(command="addchannel",     description="[admin] Forward a product's stock alerts to the channel"),
         BotCommand(command="stopforwarding", description="[admin] Stop forwarding a product to the channel"),
-        BotCommand(command="listforwarding", description="[admin] List products forwarding to the channel"),
+        BotCommand(command="addchannelpickup",     description="[admin] Forward Apple pickup alerts to the channel"),
+        BotCommand(command="stopforwardingpickup", description="[admin] Stop forwarding a pickup item to the channel"),
+        BotCommand(command="listforwarding", description="[admin] List everything forwarding to the channel"),
+        BotCommand(command="forwardingtoggle", description="[admin] Turn channel forwarding on/off"),
+        BotCommand(command="testforwarding",   description="[admin] Send a test message to the channel"),
+        BotCommand(command="checkforwarding",  description="[admin] Check every forwarded item right now"),
     ]
     # Scoped ONLY to the admin's own chat — regular users never see these in
     # their Telegram "/" menu, on top of being functionally unreachable to
