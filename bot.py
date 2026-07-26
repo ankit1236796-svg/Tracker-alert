@@ -33,6 +33,9 @@ from database import (
     get_apple_official_pickup_status,
     upsert_apple_official_pickup_status,
     set_apple_session_cookies,
+    get_forward_channel,
+    list_channel_forward_products,
+    update_channel_forward_status,
 )
 from handlers import router
 from notifications import (
@@ -41,6 +44,7 @@ from notifications import (
     send_expiry_reminder,
     send_data_purged_notice,
     send_pickup_alert,
+    send_channel_stock_alert,
 )
 from stock_checker import check_stock
 from checkers import apple as apple_checker, fetch_page
@@ -189,6 +193,90 @@ async def run_stock_check_cycle(bot: Bot) -> dict:
 
     await asyncio.gather(*[_check_group(rows) for rows in groups.values()])
     return {"products": len(products), "groups": len(groups), "saved": saved}
+
+
+# ---------------------------------------------------------------------------
+# Channel-forwarding stock alerts (separate feature/table from the regular
+# per-user products table above — see database.forward_channel /
+# channel_forward_tracking and admin_handlers.py's /setchannel, /addchannel,
+# /stopforwarding, /listforwarding). Runs on the SAME CHECK_INTERVAL cadence
+# as run_stock_check_cycle (called right after it in stock_checker_loop
+# below), per the feature's own requirement that these get checked as often
+# as regular tracked items — unlike the Apple pickup group further down,
+# which deliberately runs on its own longer interval.
+# ---------------------------------------------------------------------------
+
+async def _apply_result_to_channel_forward_row(
+    bot: Bot, row: dict, now_in_stock: bool | None, current_price: float | None
+) -> None:
+    """
+    Same transition-detection shape as _apply_result_to_row above (was_in_
+    stock -> now_in_stock, alert only on a genuine OOS->InStock flip), but
+    persists to channel_forward_tracking and alerts the single registered
+    channel instead of a product owner. No target_price gate — that's an
+    Amazon-per-user concept (products.target_price); this table has no
+    such column, and nothing here would set one.
+    """
+    if now_in_stock is None:
+        logger.info(f"[channel-forward] #{row['id']} check inconclusive — skipping status update")
+        return
+    was_in_stock = bool(row["in_stock"])
+    update_channel_forward_status(row["id"], now_in_stock)
+    if now_in_stock and not was_in_stock:
+        channel = get_forward_channel()
+        if not channel:
+            logger.warning(
+                f"[channel-forward] #{row['id']} transitioned to in-stock but no "
+                f"channel is registered (run /setchannel) — alert skipped."
+            )
+            return
+        await send_channel_stock_alert(bot, channel["chat_id"], row, price=current_price)
+
+
+async def run_channel_forward_check_cycle(bot: Bot) -> dict:
+    """
+    One check pass across every channel_forward_tracking row. No cross-row
+    dedup (unlike run_stock_check_cycle) — this list is admin-curated and
+    expected to be small, so there's no meaningful redundant-fetch cost to
+    save. Shares the same is_service_paused() global gate as the regular
+    stock checker (a global pause should stop ALL automated checking, not
+    just per-user tracking).
+
+    pincode is always None here — channel_forward_tracking rows have no
+    owning user, so there's no per-user pincode to resolve. Sites whose
+    checker requires one (Apple, Croma, RelianceDigital, quick-commerce)
+    will come back inconclusive (None) via check_stock's own existing
+    "no pincode -> None" handling for those sites — this is a known,
+    accepted limitation of the current channel-forwarding feature, not a
+    bug; a future version could add a configurable forward-pincode if
+    that's needed.
+    """
+    if is_service_paused():
+        logger.info("[channel-forward] service globally paused — skipping this check cycle entirely")
+        return {"tracked": 0, "paused": True}
+
+    rows = list_channel_forward_products()
+    if not rows:
+        return {"tracked": 0}
+
+    sem = asyncio.Semaphore(10)
+
+    async def _check_row(row: dict) -> None:
+        async with sem:
+            try:
+                now_in_stock, current_price = await check_stock(
+                    row["url"], row["site"], pincode=None, caller="background"
+                )
+            except Exception as exc:
+                logger.error(f"[channel-forward] error checking #{row['id']} url={row['url']!r}: {exc}")
+                return
+            try:
+                await _apply_result_to_channel_forward_row(bot, row, now_in_stock, current_price)
+            except Exception as exc:
+                logger.error(f"[channel-forward] error applying result to #{row['id']}: {exc}")
+
+    await asyncio.gather(*[_check_row(row) for row in rows])
+    return {"tracked": len(rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +454,13 @@ async def stock_checker_loop(bot: Bot):
     Sends an alert when a product transitions from out-of-stock → in-stock.
     For Amazon items with a target_price, only alerts when price ≤ target.
 
+    Also runs run_channel_forward_check_cycle EVERY iteration (same
+    CHECK_INTERVAL cadence as the regular stock check, per that feature's
+    own requirement — see database.forward_channel/channel_forward_
+    tracking and admin_handlers.py's /addchannel) — a separate,
+    admin-curated list whose alerts go to a single registered Telegram
+    channel instead of individual users.
+
     Also runs run_pickup_check_cycle (Apple Store pickup-availability
     tracking — a separate feature/table, see database.pickup_tracking) and
     run_apple_official_pickup_cycle (the fixed-6-official-store auto-check,
@@ -388,6 +483,11 @@ async def stock_checker_loop(bot: Bot):
             await run_stock_check_cycle(bot)
         except Exception as exc:
             logger.error(f"Stock checker loop error: {exc}")
+
+        try:
+            await run_channel_forward_check_cycle(bot)
+        except Exception as exc:
+            logger.error(f"Channel-forward checker cycle error: {exc}")
 
         if cycle_start >= next_apple_pickup_run:
             try:
@@ -644,6 +744,10 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="creditusage",    description="[admin] Zyte API credit usage per store (this month / all)"),
         BotCommand(command="pauseservice",   description="[admin] Pause/resume background stock checking"),
         BotCommand(command="resumeservice",  description="[admin] Resume background stock checking"),
+        BotCommand(command="setchannel",     description="[admin] Register the channel for forwarded stock alerts"),
+        BotCommand(command="addchannel",     description="[admin] Forward a product's stock alerts to the channel"),
+        BotCommand(command="stopforwarding", description="[admin] Stop forwarding a product to the channel"),
+        BotCommand(command="listforwarding", description="[admin] List products forwarding to the channel"),
     ]
     # Scoped ONLY to the admin's own chat — regular users never see these in
     # their Telegram "/" menu, on top of being functionally unreachable to

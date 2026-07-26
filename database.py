@@ -409,6 +409,54 @@ def init_db():
         """)
         conn.commit()
 
+        # ── Channel-forwarding stock alerts (single global admin-controlled
+        # channel — see admin_handlers.py's /setchannel, /addchannel,
+        # /stopforwarding, /listforwarding, and bot.run_channel_forward_
+        # check_cycle). Deliberately NOT per-user (unlike whatsapp_channels
+        # above) — this is an operator-run announcement feed, not a
+        # consumer-facing feature, so there is only ever ONE registered
+        # channel for the whole bot (id fixed at 1) and only the admin can
+        # manage it (every admin_handlers.py command is already gated to
+        # ADMIN_USER_ID at the router level).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forward_channel (
+                id            INTEGER PRIMARY KEY CHECK (id = 1),
+                chat_id       INTEGER NOT NULL,
+                chat_title    TEXT,
+                chat_username TEXT,
+                registered_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+
+        # Products set to forward their stock alerts to the single
+        # forward_channel above, checked on the same CHECK_INTERVAL cadence
+        # as the regular products table (see bot.run_channel_forward_check_
+        # cycle) but otherwise fully independent of it — a SEPARATE table
+        # (not a flag on products) since these aren't owned by any
+        # individual user and their alerts route to the channel only, never
+        # to a user's own chat. UNIQUE(url): the same product is only ever
+        # forwarded once, regardless of how many times /addchannel is run
+        # for it. reliance_article_id mirrors products.reliance_article_id
+        # (see checkers/reliancedigital.py's migration) — RelianceDigital
+        # products added here need the exact same one-time extraction;
+        # database.get_reliance_article_id_for_url checks BOTH tables so a
+        # product already tracked by a regular user (or vice versa) never
+        # pays for a second extraction fetch.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_forward_tracking (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                 TEXT    NOT NULL,
+                url                  TEXT    NOT NULL UNIQUE,
+                site                 TEXT    NOT NULL,
+                in_stock             INTEGER NOT NULL DEFAULT 0,
+                last_checked         TEXT,
+                reliance_article_id  TEXT,
+                created_at           TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+
         # Auto-refreshed Apple session (cookies + matching User-Agent), minted
         # periodically by a real headless-Chromium session in the separate
         # playwright_scraper service (see checkers/apple.py's
@@ -524,23 +572,113 @@ def add_product(
 def get_reliance_article_id_for_url(url: str) -> str | None:
     """
     Returns the article_id already extracted for this EXACT url string by
-    ANY user's row (not just the caller's own), or None if no row has one
-    yet. Lets a second/third user tracking the identical RelianceDigital
-    URL reuse the first extraction instead of paying for another Zyte/
-    Scrape.do fetch — mirrors apple_official_pickup_status's own
-    cross-user dedup reasoning (checking the same thing twice for two
-    different users produces no additional information, only cost).
+    ANY user's row in `products` OR any row in `channel_forward_tracking`
+    (see that table's own comment for why the latter needs this too — a
+    product added only via /addchannel has no products row at all), or
+    None if neither has one yet. Lets a second/third user tracking the
+    identical RelianceDigital URL — or the channel-forward feature tracking
+    the same URL a regular user already has — reuse the first extraction
+    instead of paying for another Zyte/Scrape.do fetch — mirrors
+    apple_official_pickup_status's own cross-user dedup reasoning (checking
+    the same thing twice produces no additional information, only cost).
     """
     with get_connection() as conn:
         row = conn.execute(
             """
             SELECT reliance_article_id FROM products
             WHERE url = ? AND reliance_article_id IS NOT NULL
+            UNION
+            SELECT reliance_article_id FROM channel_forward_tracking
+            WHERE url = ? AND reliance_article_id IS NOT NULL
             LIMIT 1
             """,
-            (url,),
+            (url, url),
         ).fetchone()
     return row["reliance_article_id"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Channel-forwarding stock alerts (see forward_channel / channel_forward_
+# tracking tables above) — single global admin-controlled channel + the
+# list of products whose alerts forward there.
+# ---------------------------------------------------------------------------
+
+def set_forward_channel(chat_id: int, chat_title: str | None, chat_username: str | None) -> None:
+    """Registers (or replaces) the single forwarding channel. Re-running
+    /setchannel with a different chat simply overwrites the previous one —
+    there is only ever one at a time."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO forward_channel (id, chat_id, chat_title, chat_username, registered_at)
+            VALUES (1, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                chat_title = excluded.chat_title,
+                chat_username = excluded.chat_username,
+                registered_at = excluded.registered_at
+            """,
+            (chat_id, chat_title, chat_username),
+        )
+        conn.commit()
+
+
+def get_forward_channel() -> dict | None:
+    """The registered forwarding channel, or None if /setchannel has never
+    been run (or /addchannel etc. should treat forwarding as unconfigured)."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM forward_channel WHERE id = 1").fetchone()
+    return dict(row) if row else None
+
+
+def add_channel_forward_product(
+    name: str, url: str, site: str, reliance_article_id: str | None = None,
+) -> tuple[bool, str]:
+    """Adds one product to the channel-forward list. Returns (False, ...)
+    on a duplicate URL (UNIQUE constraint) — mirrors add_product's own
+    IntegrityError handling."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO channel_forward_tracking (name, url, site, reliance_article_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, url, site, reliance_article_id),
+            )
+            conn.commit()
+        return True, "Product added to the forward list."
+    except sqlite3.IntegrityError:
+        return False, "This URL is already forwarding to the channel."
+    except Exception as e:
+        logger.error(f"add_channel_forward_product error: {e}")
+        return False, "Database error while adding to the forward list."
+
+
+def remove_channel_forward_product(url: str) -> bool:
+    """Returns False if that URL wasn't in the forward list at all."""
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM channel_forward_tracking WHERE url = ?", (url,))
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def list_channel_forward_products() -> list[dict]:
+    """Every product currently forwarding, most recently added first."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM channel_forward_tracking ORDER BY created_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_channel_forward_status(row_id: int, in_stock: bool) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE channel_forward_tracking SET in_stock = ?, last_checked = ? WHERE id = ?",
+            (1 if in_stock else 0, now_ist_str(), row_id),
+        )
+        conn.commit()
 
 
 def list_products(user_id: int) -> list[dict]:
