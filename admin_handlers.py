@@ -10,6 +10,7 @@ register_admin_commands in bot.py).
 """
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -70,6 +71,12 @@ from database import (
     set_service_paused,
     list_paused_user_ids,
     set_users_checks_paused,
+    set_forward_channel,
+    get_forward_channel,
+    add_channel_forward_product,
+    remove_channel_forward_product,
+    list_channel_forward_products,
+    get_reliance_article_id_for_url,
 )
 import whatsapp_client
 import zyte_client
@@ -1049,6 +1056,214 @@ async def callback_ps_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("❌ Cancelled.")
     await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Channel-forwarding stock alerts — /setchannel, /addchannel,
+# /stopforwarding, /listforwarding. A SINGLE, global, admin-controlled
+# channel (not per-user, unlike the WhatsApp channel-forwarding feature —
+# see database.forward_channel/channel_forward_tracking for the full
+# reasoning) whose stock alerts are sent by the bot itself directly, no
+# separate service needed — Telegram lets a bot post to any channel it's
+# been added as an admin to, unlike WhatsApp forwarding's own session-based
+# approach. Checked on the same CHECK_INTERVAL cadence as regular tracked
+# products (bot.run_channel_forward_check_cycle).
+# ---------------------------------------------------------------------------
+
+def _channel_auto_name(url: str, site: str) -> str:
+    """Same shape as handlers.py's own _auto_name — kept as a separate,
+    tiny local copy rather than importing across files, so this feature
+    stays fully self-contained within admin_handlers.py."""
+    try:
+        path = urlparse(url).path.rstrip("/")
+        slug = path.split("/")[-1][:40] if path else "product"
+    except Exception:
+        slug = "product"
+    return f"{get_site_label(site)}: {slug}"
+
+
+async def _resolve_reliance_article_id_for_channel(url: str) -> str | None:
+    """Same reuse-then-extract logic as handlers.py's own
+    _resolve_reliance_article_id (checks database.get_reliance_article_id_
+    for_url — which covers BOTH products and channel_forward_tracking —
+    before paying for a fresh Zyte/Scrape.do fetch). Kept as a separate
+    copy rather than a cross-module import so this feature's own log lines
+    stay correctly scoped under admin_handlers, and to avoid adding an
+    admin_handlers.py -> handlers.py import dependency that doesn't exist
+    today."""
+    existing = get_reliance_article_id_for_url(url)
+    if existing:
+        logger.info(f"[channel-forward] reusing existing article_id={existing!r} for {url!r}")
+        return existing
+
+    article_id, method = await reliancedigital.fetch_and_extract_article_id(url)
+    if not article_id:
+        logger.warning(
+            f"[channel-forward] could not extract an article_id for {url!r} — "
+            f"the product will still be added to the forward list, but "
+            f"automatic checks will be skipped (inconclusive) until this is "
+            f"re-extracted."
+        )
+        return None
+    logger.info(f"[channel-forward] extracted article_id={article_id!r} for {url!r} (method={method})")
+    return article_id
+
+
+@router.message(Command("setchannel"))
+async def cmd_setchannel(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/setchannel &lt;channel_id_or_@username&gt;</code>\n"
+            "The bot must already be an admin in that channel — add it via "
+            "the channel's own Administrators settings first, then run this.",
+            parse_mode="HTML",
+        )
+        return
+
+    identifier = command.args.strip()
+    chat_ref: str | int
+    if identifier.startswith("@"):
+        chat_ref = identifier
+    else:
+        try:
+            chat_ref = int(identifier)
+        except ValueError:
+            await message.answer(
+                "⚠️ Invalid channel identifier — use a numeric chat id (e.g. "
+                "<code>-1001234567890</code>) or <code>@channelusername</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+    try:
+        chat = await message.bot.get_chat(chat_ref)
+    except Exception as exc:
+        await message.answer(
+            f"⚠️ Could not find that chat: {exc}\n"
+            f"Make sure the bot has been added to the channel first (even as "
+            f"a regular member) so it can see it."
+        )
+        return
+
+    try:
+        member = await message.bot.get_chat_member(chat.id, message.bot.id)
+    except Exception as exc:
+        await message.answer(f"⚠️ Could not check the bot's membership in that chat: {exc}")
+        return
+
+    if member.status not in ("administrator", "creator"):
+        await message.answer(
+            f"⚠️ The bot is a member of <b>{html.escape(chat.title or str(chat.id))}</b> "
+            f"but is NOT an admin there (status: {member.status!r}). Add it as an "
+            f"admin via the channel's own Administrators settings, then run "
+            f"/setchannel again.",
+            parse_mode="HTML",
+        )
+        return
+
+    set_forward_channel(chat.id, chat.title, getattr(chat, "username", None))
+    await message.answer(
+        f"✅ Forwarding channel set: <b>{html.escape(chat.title or str(chat.id))}</b> "
+        f"(<code>{chat.id}</code>).\nUse <code>/addchannel &lt;url&gt;</code> to start "
+        f"forwarding a product's stock alerts here.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("addchannel"))
+async def cmd_addchannel(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Usage: <code>/addchannel &lt;product_url&gt;</code>", parse_mode="HTML")
+        return
+
+    channel = get_forward_channel()
+    if not channel:
+        await message.answer(
+            "⚠️ No forwarding channel registered yet. Run "
+            "<code>/setchannel &lt;channel_id_or_@username&gt;</code> first "
+            "(the bot must already be an admin in that channel).",
+            parse_mode="HTML",
+        )
+        return
+
+    url = command.args.strip()
+    if not url.startswith(("http://", "https://")):
+        await message.answer("⚠️ Not a valid URL.")
+        return
+
+    site = stock_checker.detect_site(url)
+    if site is None:
+        await message.answer(f"⚠️ Unsupported site: <code>{html.escape(url[:60])}</code>", parse_mode="HTML")
+        return
+
+    reliance_article_id = None
+    if site == "reliancedigital":
+        reliance_article_id = await _resolve_reliance_article_id_for_channel(url)
+
+    name = _channel_auto_name(url, site)
+    ok, msg = add_channel_forward_product(name, url, site, reliance_article_id=reliance_article_id)
+    if ok:
+        await message.answer(
+            f"✅ Now forwarding <b>{html.escape(name)}</b> [{get_site_label(site)}] stock "
+            f"alerts to <b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(f"⚠️ {msg}")
+
+
+@router.message(Command("stopforwarding"))
+async def cmd_stopforwarding(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Usage: <code>/stopforwarding &lt;product_url&gt;</code>", parse_mode="HTML")
+        return
+
+    url = command.args.strip()
+    removed = remove_channel_forward_product(url)
+    if removed:
+        await message.answer(f"✅ Stopped forwarding: <code>{html.escape(url[:80])}</code>", parse_mode="HTML")
+    else:
+        await message.answer("⚠️ That URL isn't in the forward list.")
+
+
+@router.message(Command("listforwarding"))
+async def cmd_listforwarding(message: Message):
+    channel = get_forward_channel()
+    rows = list_channel_forward_products()
+
+    if channel:
+        header = f"📡 Forwarding to: <b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>"
+    else:
+        header = "⚠️ No channel registered (checks still run, but alerts can't be sent) — run /setchannel."
+
+    if not rows:
+        await message.answer(f"{header}\n\n📭 No products are currently forwarding.", parse_mode="HTML")
+        return
+
+    lines = [header, ""]
+    for row in rows:
+        status = "✅ In stock" if row["in_stock"] else "⬜ Out of stock"
+        last_checked = row["last_checked"] or "never"
+        lines.append(
+            f"{status} — <b>{html.escape(row['name'])}</b> [{get_site_label(row['site'])}]\n"
+            f"<code>{html.escape(row['url'][:70])}</code>\n"
+            f"Last checked: {last_checked}"
+        )
+
+    _CHUNK_SIZE = 3500
+    # Chunked at whole-line boundaries (each entry above is a fully
+    # self-contained HTML unit) rather than a raw character offset, so a
+    # long list can never split an unclosed <b>/<code> tag across messages.
+    chunk: list[str] = []
+    chunk_len = 0
+    for line in lines:
+        if chunk_len + len(line) + 2 > _CHUNK_SIZE and chunk:
+            await message.answer("\n\n".join(chunk), parse_mode="HTML")
+            chunk, chunk_len = [], 0
+        chunk.append(line)
+        chunk_len += len(line) + 2
+    if chunk:
+        await message.answer("\n\n".join(chunk), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------

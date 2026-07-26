@@ -101,6 +101,49 @@ async def send_stock_alert(bot: Bot, product: dict, price: float | None = None):
     )
 
 
+async def send_channel_stock_alert(bot: Bot, chat_id: int, row: dict, price: float | None = None) -> None:
+    """
+    The channel-forwarding sibling of send_stock_alert (see database.
+    forward_channel / channel_forward_tracking, and bot.
+    run_channel_forward_check_cycle) — sends an in-stock notification to
+    the single registered channel instead of an individual user's chat.
+    Same message format (product name, price, Buy Now link) and the same
+    UNRELIABLE_SITES/global-site-lock gates as send_stock_alert. No
+    target_price gate, no per-user site lock, no WhatsApp forward — none
+    of those apply here, since a channel_forward_tracking row has no
+    owning user_id at all (is_site_locked's user_id is simply omitted,
+    checking the global lock only).
+    """
+    if row["site"] in UNRELIABLE_SITES:
+        logger.warning(
+            f"[alert-suppressed] site={row['site']!r} is in UNRELIABLE_SITES — "
+            f"skipping channel-forward alert for {row['url']!r}."
+        )
+        return
+    if is_site_locked(row["site"]):
+        logger.info(
+            f"[alert-suppressed] site={row['site']!r} is globally locked — "
+            f"skipping channel-forward alert for {row['url']!r}."
+        )
+        return
+    price_line = ""
+    if price is not None:
+        price_line = t("stock_alert_price_line", "en", price=f"{price:,.0f}")
+    alert_url = await get_affiliate_url(row["url"], row["site"])
+    text = t(
+        "stock_alert", "en",
+        name=row["name"], site=get_site_label(row["site"]),
+        price_line=price_line, url=alert_url,
+    )
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=False,
+        )
+        logger.info(f"[channel-forward] alert sent to channel {chat_id} for {row['url']!r}")
+    except Exception as exc:
+        logger.error(f"[channel-forward] failed to send alert to channel {chat_id}: {exc}")
+
+
 async def send_pickup_alert(
     bot: Bot, user_id: int, product_name: str, pincode: str, stores: list[dict],
 ) -> None:
