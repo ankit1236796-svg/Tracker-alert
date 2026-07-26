@@ -17,7 +17,7 @@ from config import (
     BOT_TOKEN, CHECK_INTERVAL, ADMIN_USER_ID, ACCESS_CHECK_INTERVAL, REMINDER_HOURS_BEFORE_EXPIRY,
     APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED, APPLE_PICKUP_CHECK_INTERVAL,
     PLAYWRIGHT_SCRAPER_URL, PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN, APPLE_COOKIE_REFRESH_INTERVAL,
-    APPLE_COOKIE_REFRESH_PRODUCT_URL, APPLE_COOKIE_REFRESH_PINCODE,
+    APPLE_COOKIE_REFRESH_PRODUCT_URL, APPLE_COOKIE_REFRESH_PINCODE, CROMA_CHECK_INTERVAL,
 )
 from database import (
     init_db,
@@ -127,6 +127,10 @@ async def run_stock_check_cycle(bot: Bot) -> dict:
     Extracted from stock_checker_loop so a single cycle is directly testable
     (mirrors run_access_maintenance_cycle). Returns a small stats dict.
 
+    Croma products are excluded from this cycle entirely — see
+    run_croma_check_cycle below, which checks them on its own
+    CROMA_CHECK_INTERVAL cadence instead.
+
     Pause/Resume Service: if the GLOBAL switch is on (is_service_paused()),
     returns immediately — no get_all_products() call, no grouping, no
     provider (Scrape.do/Zyte) requests at all, the efficient "essentially a
@@ -141,7 +145,12 @@ async def run_stock_check_cycle(bot: Bot) -> dict:
         logger.info("[bot] service globally paused — skipping this check cycle entirely")
         return {"products": 0, "groups": 0, "saved": 0, "paused": True}
 
-    products = get_all_products()
+    # Croma products are excluded here — they run on their own dedicated
+    # CROMA_CHECK_INTERVAL cadence instead (see run_croma_check_cycle below
+    # and stock_checker_loop's next_croma_run gate), mirroring the Apple
+    # pickup group's own separate-interval pattern. Every other site's
+    # grouping/checking below is completely unaffected by this filter.
+    products = [p for p in get_all_products() if p["site"] != "croma"]
     paused_user_ids = set(list_paused_user_ids())
     if paused_user_ids:
         before_count = len(products)
@@ -192,6 +201,89 @@ async def run_stock_check_cycle(bot: Bot) -> dict:
                     await _apply_result_to_row(bot, product, now_in_stock, current_price)
                 except Exception as exc:
                     logger.error(f"Error applying result to product #{product['id']}: {exc}")
+
+    await asyncio.gather(*[_check_group(rows) for rows in groups.values()])
+    return {"products": len(products), "groups": len(groups), "saved": saved}
+
+
+# ---------------------------------------------------------------------------
+# Croma-only check cycle — runs on its own CROMA_CHECK_INTERVAL cadence
+# (see stock_checker_loop's next_croma_run gate) instead of the shared
+# CHECK_INTERVAL, mirroring the existing Apple-pickup-group pattern
+# (APPLE_PICKUP_CHECK_INTERVAL/next_apple_pickup_run) for isolating one
+# site/feature onto its own timing without touching every other site's
+# cadence. Croma products are excluded from run_stock_check_cycle above
+# (see its own docstring) so they're checked exactly once per cycle, via
+# this function only.
+# ---------------------------------------------------------------------------
+
+async def run_croma_check_cycle(bot: Bot) -> dict:
+    """
+    Croma-only sibling of run_stock_check_cycle above — identical
+    cross-user dedup + apply-result logic (product_group_key grouping,
+    _apply_result_to_row for the status update/alert), just filtered to
+    site == "croma" and run on its own clock. Duplicated rather than
+    sharing code with run_stock_check_cycle so that function's own
+    behavior for every other site stays completely untouched — mirrors
+    this codebase's existing precedent of small, deliberate duplication
+    over refactoring shared logic (e.g. handlers.py's manual /check flow
+    duplicating this same shape from bot.py, for the same "don't risk the
+    shared path" reasoning). Returns a small stats dict, same shape as
+    run_stock_check_cycle's own.
+    """
+    if is_service_paused():
+        logger.info("[croma] service globally paused — skipping this check cycle entirely")
+        return {"products": 0, "groups": 0, "saved": 0, "paused": True}
+
+    products = [p for p in get_all_products() if p["site"] == "croma"]
+    paused_user_ids = set(list_paused_user_ids())
+    if paused_user_ids:
+        before_count = len(products)
+        products = [p for p in products if p["user_id"] not in paused_user_ids]
+        logger.info(
+            f"[croma] excluding {before_count - len(products)} product(s) belonging to "
+            f"{len(paused_user_ids)} individually-paused user(s) this cycle"
+        )
+
+    pincode_by_user: dict[int, str | None] = {}
+
+    def _pincode_for(user_id: int) -> str | None:
+        if user_id not in pincode_by_user:
+            pincode_by_user[user_id] = get_user_primary_pincode(user_id)
+        return pincode_by_user[user_id]
+
+    groups: dict[str, list[dict]] = {}
+    for product in products:
+        pincode = _pincode_for(product["user_id"])
+        product["_pincode"] = pincode
+        key = product_group_key(product["site"], product["url"], pincode)
+        groups.setdefault(key, []).append(product)
+
+    saved = len(products) - len(groups)
+    logger.info(
+        f"[croma] checking {len(products)} product(s) in {len(groups)} deduplicated "
+        f"group(s) — {saved} redundant check(s) avoided this cycle."
+    )
+
+    sem = asyncio.Semaphore(10)
+
+    async def _check_group(rows: list[dict]) -> None:
+        async with sem:
+            rep = rows[0]  # representative — every row here is the same product
+            try:
+                now_in_stock, current_price = await check_stock(
+                    rep["url"], rep["site"], pincode=rep["_pincode"], caller="background"
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[croma] error checking group url={rep['url']!r} ({len(rows)} row(s)): {exc}"
+                )
+                return
+            for product in rows:
+                try:
+                    await _apply_result_to_row(bot, product, now_in_stock, current_price)
+                except Exception as exc:
+                    logger.error(f"[croma] error applying result to product #{product['id']}: {exc}")
 
     await asyncio.gather(*[_check_group(rows) for rows in groups.values()])
     return {"products": len(products), "groups": len(groups), "saved": saved}
@@ -486,6 +578,11 @@ async def stock_checker_loop(bot: Bot):
     admin-curated list whose alerts go to a single registered Telegram
     channel instead of individual users.
 
+    Also runs run_croma_check_cycle (Croma products only — excluded from
+    run_stock_check_cycle above) on its OWN CROMA_CHECK_INTERVAL cadence,
+    via the same "next due" timestamp pattern as next_apple_pickup_run
+    below — every other site's timing here is unaffected.
+
     Also runs run_pickup_check_cycle (Apple Store pickup-availability
     tracking — a separate feature/table, see database.pickup_tracking) and
     run_apple_official_pickup_cycle (the fixed-6-official-store auto-check,
@@ -502,6 +599,7 @@ async def stock_checker_loop(bot: Bot):
     """
     logger.info("Stock checker loop started.")
     next_apple_pickup_run = time.monotonic()  # due immediately on the first iteration
+    next_croma_run = time.monotonic()  # due immediately on the first iteration
     while True:
         cycle_start = time.monotonic()
         try:
@@ -513,6 +611,13 @@ async def stock_checker_loop(bot: Bot):
             await run_channel_forward_check_cycle(bot)
         except Exception as exc:
             logger.error(f"Channel-forward checker cycle error: {exc}")
+
+        if cycle_start >= next_croma_run:
+            try:
+                await run_croma_check_cycle(bot)
+            except Exception as exc:
+                logger.error(f"Croma checker cycle error: {exc}")
+            next_croma_run = cycle_start + CROMA_CHECK_INTERVAL
 
         if cycle_start >= next_apple_pickup_run:
             try:

@@ -263,6 +263,17 @@ APPLE_PICKUP_STORE_LABELS = {
 # below and checkers/apple.py's get_apple_session_cookies-based lookup.
 APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "180"))  # 3 min default
 
+# Croma's own dedicated check interval — same "isolate one site onto its own
+# cadence" pattern as APPLE_PICKUP_CHECK_INTERVAL above (a next_croma_run
+# timestamp gate in bot.py's stock_checker_loop, checked alongside
+# next_apple_pickup_run). Croma's checker (checkers.croma.check_via_api)
+# spends zero Zyte/Scrape.do credits — it calls Croma's own free inventory
+# API directly — so running it more often than the shared CHECK_INTERVAL
+# costs nothing extra in scraping-provider terms; this just lets Croma's
+# stock data refresh faster than every other site without changing
+# CHECK_INTERVAL itself.
+CROMA_CHECK_INTERVAL = int(os.getenv("CROMA_CHECK_INTERVAL", "180"))  # 3 min default
+
 # Feature-scoped alert gate — NOT config.UNRELIABLE_SITES, which would also
 # suppress the two EXISTING, already-working Apple signals above (the
 # generic checker + single-pincode refinement). This flag gates ONLY this
