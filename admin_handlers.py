@@ -4029,3 +4029,81 @@ async def cmd_debugapplecookierefresh(message: Message, command: CommandObject):
         f"Railway logs under '[apple][cookie-refresh]' and in "
         f"playwright_scraper's own logs under '[refresh-apple-cookies]'.",
     )
+
+
+# ---------------------------------------------------------------------------
+# /debugdom: Telegram wrapper for playwright_scraper's /debug-dom endpoint
+# (see that service's own module note + _capture_dom_elements) — built for
+# the 2026-07-27 Apple pickup-widget selector discovery, so an admin can
+# trigger DOM-structure discovery straight from Telegram (e.g. from a
+# phone, no curl/Postman access needed) instead of hitting the endpoint
+# directly. Purely a POST-and-format-the-response wrapper; all the actual
+# browser/DOM work happens in playwright_scraper — mirrors
+# /debugpickupraw's own "thin wrapper around a raw testing capability"
+# shape. NOT wired into any production code path — purely diagnostic,
+# safe to delete alongside /debug-dom once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_DOM_ADMIN_ID = 5004721766  # same hardcoded restriction as every
+# other /debug* command above, on top of the router's own ADMIN_USER_ID
+# filter.
+
+
+@router.message(Command("debugdom"))
+async def cmd_debugdom(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_DOM_ADMIN_ID:
+        return
+
+    from config import PLAYWRIGHT_SCRAPER_URL
+
+    if not command.args:
+        await message.answer("Usage: <code>/debugdom &lt;apple_url&gt;</code>", parse_mode="HTML")
+        return
+    url = command.args.strip()
+
+    if not PLAYWRIGHT_SCRAPER_URL:
+        await _debug_send(message, "⚠️ PLAYWRIGHT_SCRAPER_URL is not set on this service — nothing to call.")
+        return
+
+    await _debug_send(
+        message,
+        f"🔍 Loading {url} in a real browser and scanning its DOM for "
+        f"pickup/fulfillment/store/zip/pincode-related elements (playwright_scraper: "
+        f"{PLAYWRIGHT_SCRAPER_URL})…",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(f"{PLAYWRIGHT_SCRAPER_URL}/debug-dom", json={"url": url})
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Request to playwright_scraper failed: {exc}")
+        return
+
+    if resp.status_code != 200:
+        await _debug_send(message, f"⚠️ playwright_scraper returned HTTP {resp.status_code}: {resp.text[:500]!r}")
+        return
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Non-JSON response from playwright_scraper: {exc}")
+        return
+
+    await _debug_send(
+        message,
+        f"Page title: {data.get('page_title')!r}\n"
+        f"diagnostics: {data.get('diagnostics')}",
+    )
+
+    _CHUNK_SIZE = 3500
+    for label, key in (
+        ("data_autom_elements", "data_autom_elements"),
+        ("pincode_like_inputs", "pincode_like_inputs"),
+        ("pickup_related_buttons", "pickup_related_buttons"),
+    ):
+        items = data.get(key) or []
+        if not items:
+            await _debug_send(message, f"{label}: 0 found")
+            continue
+        text = f"{label} ({len(items)}):\n{json.dumps(items, indent=2)}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
