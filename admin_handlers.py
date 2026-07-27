@@ -1362,21 +1362,19 @@ async def cmd_stopforwarding(message: Message, command: CommandObject):
 
 @router.message(Command("addchannelpickup"))
 async def cmd_addchannelpickup(message: Message, command: CommandObject):
+    usage = (
+        "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; "
+        "&lt;pincode1&gt; [pincode2] ... [pincode6]</code>"
+    )
     if not command.args:
-        await message.answer(
-            "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; &lt;pincode&gt;</code>",
-            parse_mode="HTML",
-        )
+        await message.answer(usage, parse_mode="HTML")
         return
 
     parts = command.args.strip().split()
     if len(parts) < 2:
-        await message.answer(
-            "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; &lt;pincode&gt;</code>",
-            parse_mode="HTML",
-        )
+        await message.answer(usage, parse_mode="HTML")
         return
-    url, pincode = parts[0], parts[1]
+    url, pincodes = parts[0], parts[1:]
 
     channel = get_forward_channel()
     if not channel:
@@ -1390,6 +1388,11 @@ async def cmd_addchannelpickup(message: Message, command: CommandObject):
     if not url.startswith(("http://", "https://")) or stock_checker.detect_site(url) != "apple":
         await message.answer("⚠️ /addchannelpickup only supports apple.com product URLs.", parse_mode="HTML")
         return
+
+    for pincode in pincodes:
+        if not pincode.isdigit() or len(pincode) != 6:
+            await message.answer(f"⚠️ Invalid pincode: <code>{html.escape(pincode)}</code> (must be 6 digits).", parse_mode="HTML")
+            return
 
     await _debug_send(message, f"🔍 Fetching product page to resolve SKU + name: {url}")
     try:
@@ -1407,11 +1410,11 @@ async def cmd_addchannelpickup(message: Message, command: CommandObject):
 
     name = apple._extract_product_name(soup) or _channel_auto_name(url, "apple")
 
-    ok, msg = add_channel_forward_pickup(name, url, pincode, sku=sku)
+    ok, msg = add_channel_forward_pickup(name, url, pincodes, sku=sku)
     if ok:
         await message.answer(
-            f"✅ Now forwarding pickup alerts for <b>{html.escape(name)}</b> at pincode "
-            f"<code>{html.escape(pincode)}</code> to "
+            f"✅ Now forwarding pickup alerts for <b>{html.escape(name)}</b> at pincodes "
+            f"<code>{html.escape(', '.join(pincodes))}</code> to "
             f"<b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
             parse_mode="HTML",
         )
@@ -1440,7 +1443,7 @@ async def cmd_stopforwardingpickup(message: Message, command: CommandObject):
         if removed:
             await message.answer(
                 f"✅ Stopped forwarding pickup alerts for <b>{html.escape(target['name'])}</b> "
-                f"(pincode {html.escape(target['pincode'])}).",
+                f"(pincodes {html.escape(', '.join(target['pincodes']))}).",
                 parse_mode="HTML",
             )
         else:
@@ -1487,10 +1490,15 @@ async def cmd_listforwarding(message: Message):
     if pickup_rows:
         lines.append("🏬 <b>Pickup alerts</b> (index — for /stopforwardingpickup)")
         for i, row in enumerate(pickup_rows, start=1):
-            status = "✅ Available" if row["available"] else "⬜ Unavailable"
+            pincode_status = row["pincode_status"]
+            pincode_lines = "\n".join(
+                f"  {'✅' if pincode_status.get(p) else '⬜'} {html.escape(p)}"
+                for p in row["pincodes"]
+            )
             last_checked = row["last_checked"] or "never"
             lines.append(
-                f"{i}. {status} — <b>{html.escape(row['name'])}</b> @ pincode {html.escape(row['pincode'])}\n"
+                f"{i}. <b>{html.escape(row['name'])}</b>\n"
+                f"{pincode_lines}\n"
                 f"<code>{html.escape(row['url'][:70])}</code>\n"
                 f"Last checked: {last_checked}"
             )
@@ -1612,12 +1620,18 @@ async def cmd_checkforwarding(message: Message):
 
     for row in pickup_rows:
         try:
-            stores = await apple.check_channel_pickup_row(message.bot, row)
+            results = await apple.check_channel_pickup_row(message.bot, row)
         except Exception as exc:
             lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check failed: {exc}")
             continue
-        status = "✅ Available" if stores else "⬜ Unavailable"
-        lines.append(f"{status} — <b>{html.escape(row['name'])}</b> @ pincode {html.escape(row['pincode'])} (pickup)")
+        if not results:
+            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check inconclusive")
+            continue
+        pincode_lines = "\n".join(
+            f"  {'✅' if stores else '⬜'} {html.escape(p)}"
+            for p, stores in results.items()
+        )
+        lines.append(f"<b>{html.escape(row['name'])}</b> (pickup)\n{pincode_lines}")
 
     _CHUNK_SIZE = 3500
     chunk: list[str] = []

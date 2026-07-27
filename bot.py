@@ -357,7 +357,7 @@ async def run_channel_forward_check_cycle(bot: Bot) -> dict:
     those sites — a known, accepted limitation of the current
     channel-forwarding feature, not a bug; a future version could add a
     configurable forward-pincode if that's needed. Pickup rows are
-    unaffected — they carry their own explicit pincode per row.
+    unaffected — they carry their own list of pincodes per row.
     """
     if is_service_paused():
         logger.info("[channel-forward] service globally paused — skipping this check cycle entirely")
