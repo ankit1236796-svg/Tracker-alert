@@ -58,25 +58,34 @@ HTTP surface:
   POST /debug-dom       Body: {"url": str, "click_text": str (optional)}.
                         _capture_network_calls' sibling for DOM STRUCTURE
                         discovery instead of network traffic (see
-                        _capture_dom_elements) — loads the page, waits for
-                        it to settle, then returns every element whose
-                        data-autom/text/attributes mention pickup,
-                        fulfillment, store, zip, pincode, or location, plus
-                        the full outerHTML of any pickUpDetails element(s).
-                        When click_text is given, also clicks the first
-                        element containing that text (case-insensitive)
-                        after the initial capture, waits for any resulting
-                        modal/overlay to settle, and re-runs the same
-                        extraction — returned as "after_click" — so a
-                        pincode input hidden behind a "Check availability"
-                        trigger becomes visible without guessing at the
-                        modal's own selectors first. Returns {"url",
+                        _capture_dom_elements) — loads the page, EXPLICITLY
+                        waits for pickUpDetails to appear (observed
+                        rendering inconsistently run-to-run — present
+                        twice on one capture, absent on the next identical
+                        URL — so a fixed dwell alone isn't reliable; see
+                        diagnostics.pickup_details_wait_timed_out), then
+                        returns every element whose data-autom/text/
+                        attributes mention pickup, fulfillment, store, zip,
+                        pincode, or location, plus the full outerHTML of
+                        any pickUpDetails element(s) AND every plausibly-
+                        clickable descendant within it (button/link/
+                        role=button/tabindex/onclick/cursor:pointer),
+                        regardless of exact text — its real trigger text
+                        may vary by state. When click_text is given, also
+                        clicks the first element containing that text
+                        (case-insensitive) after the initial capture, waits
+                        for any resulting modal/overlay to settle, and
+                        re-runs the same extraction — returned as
+                        "after_click" — so a pincode input hidden behind a
+                        click trigger becomes visible without guessing at
+                        the modal's own selectors first. Returns {"url",
                         "page_title", "data_autom_elements",
                         "pincode_like_inputs", "pickup_related_buttons",
-                        "pickup_details_html", "after_click", "diagnostics"
-                        (includes "click_result" when click_text was
-                        given)}. Built for the 2026-07-27 Apple pickup-
-                        widget selector discovery (see checkers/apple.py's
+                        "pickup_details_html", "pickup_details_clickables",
+                        "after_click", "diagnostics" (includes
+                        "click_result" when click_text was given)}. Built
+                        for the 2026-07-27 Apple pickup-widget selector
+                        discovery (see checkers/apple.py's
                         investigation notes) — no auth, same as every
                         other endpoint here.
   POST /refresh-apple-cookies
@@ -756,11 +765,46 @@ _DOM_CAPTURE_JS = """() => {
     // renders pickup status into (data-autom="pickUpDetails"), so its
     // exact clickable structure (the "Check availability" trigger, most
     // likely) can be inspected directly instead of guessed at.
-    const pickupDetailsHtml = Array.from(document.querySelectorAll('[data-autom="pickUpDetails"]'))
-        .map(el => {
-            const html = el.outerHTML || '';
-            return html.length > 4000 ? html.slice(0, 4000) + '...(truncated)' : html;
-        });
+    const pickupDetailsElements = Array.from(document.querySelectorAll('[data-autom="pickUpDetails"]'));
+    const pickupDetailsHtml = pickupDetailsElements.map(el => {
+        const html = el.outerHTML || '';
+        return html.length > 4000 ? html.slice(0, 4000) + '...(truncated)' : html;
+    });
+
+    // Every plausibly-clickable descendant WITHIN pickUpDetails specifically
+    // — added same day a click_text="Check availability" attempt timed out
+    // with no matching visible text, and pickUpDetails wasn't even present
+    // that run (see the module note on pickUpDetailsWaitResult below): its
+    // exact clickable trigger text may vary by state (no-location vs.
+    // already-has-a-location, an error state, etc.), so this reports EVERY
+    // candidate (button, link, role=button, tabindex, onclick handler, or
+    // cursor:pointer styling) regardless of exact text, rather than
+    // requiring a guess at the right one up front.
+    function isClickable(el) {
+        if (['BUTTON', 'A'].includes(el.tagName)) return true;
+        if (el.getAttribute('role') === 'button') return true;
+        if (el.hasAttribute('tabindex')) return true;
+        if (el.hasAttribute('onclick')) return true;
+        try {
+            return window.getComputedStyle(el).cursor === 'pointer';
+        } catch (e) {
+            return false;
+        }
+    }
+    const pickupDetailsClickables = [];
+    for (const container of pickupDetailsElements) {
+        for (const el of container.querySelectorAll('*')) {
+            if (!isClickable(el)) continue;
+            pickupDetailsClickables.push({
+                tag: el.tagName.toLowerCase(),
+                data_autom: el.getAttribute('data-autom'),
+                text: truncate(el.textContent || '', 100),
+                aria_label: el.getAttribute('aria-label'),
+                aria_disabled: el.getAttribute('aria-disabled'),
+                id: el.id || null,
+            });
+        }
+    }
 
     return {
         page_title: document.title,
@@ -768,6 +812,7 @@ _DOM_CAPTURE_JS = """() => {
         pincode_like_inputs: pincodeLikeInputs,
         pickup_related_buttons: pickupRelatedButtons,
         pickup_details_html: pickupDetailsHtml,
+        pickup_details_clickables: pickupDetailsClickables.slice(0, 40),
     };
 }"""
 
@@ -822,6 +867,7 @@ def _capture_dom_elements(url: str, click_text: str | None = None) -> dict:
                     "networkidle_error": None,
                     "extract_error": None,
                     "click_result": None,
+                    "pickup_details_wait_timed_out": None,
                 }
 
                 try:
@@ -848,15 +894,46 @@ def _capture_dom_elements(url: str, click_text: str | None = None) -> dict:
                         diagnostics["networkidle_error"] = str(exc)
                         logger.error(f"[debug-dom] networkidle wait raised for {url}: {exc}")
 
+                    # pickUpDetails has been observed rendering
+                    # INCONSISTENTLY run-to-run on the identical URL
+                    # (present twice in one capture, entirely absent in
+                    # another) — a fixed dwell alone isn't a reliable
+                    # enough signal that it's actually rendered by the
+                    # time the DOM gets scanned, since it appears to
+                    # populate asynchronously/lazily rather than being
+                    # present at networkidle. Wait explicitly for the
+                    # selector itself (generous timeout — this may be
+                    # tied to the same variable Akamai-scoring behavior
+                    # seen elsewhere in this investigation, not pure
+                    # rendering speed), falling back to "whatever's
+                    # there" if it never appears rather than blocking
+                    # indefinitely — matches this file's existing
+                    # "capture the failure mode, don't hide it"
+                    # philosophy (see networkidle_timed_out above).
+                    try:
+                        page.wait_for_selector('[data-autom="pickUpDetails"]', timeout=10000)
+                        diagnostics["pickup_details_wait_timed_out"] = False
+                    except PlaywrightTimeoutError:
+                        diagnostics["pickup_details_wait_timed_out"] = True
+                        logger.info(
+                            f"[debug-dom] pickUpDetails never appeared within 10s for "
+                            f"{url} — proceeding with whatever's rendered"
+                        )
+                    except Exception as exc:
+                        diagnostics["pickup_details_wait_timed_out"] = True
+                        logger.warning(f"[debug-dom] pickUpDetails wait raised for {url}: {exc}")
+
                 # Same dwell as the reference implementation that inspired
-                # this whole investigation used (3s) — enough for the page's
-                # own JS to finish rendering pickup-availability state.
+                # this whole investigation used (3s) — even once
+                # pickUpDetails' own container appears, giving its inner
+                # content (status text, click targets) a little more time
+                # to finish rendering.
                 page.wait_for_timeout(3000)
 
                 result = {
                     "page_title": None, "data_autom_elements": [],
                     "pincode_like_inputs": [], "pickup_related_buttons": [],
-                    "pickup_details_html": [],
+                    "pickup_details_html": [], "pickup_details_clickables": [],
                 }
                 try:
                     result = page.evaluate(_DOM_CAPTURE_JS)
