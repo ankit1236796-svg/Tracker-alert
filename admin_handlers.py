@@ -3170,6 +3170,103 @@ async def cmd_debugpickup(message: Message, command: CommandObject):
 
 
 # ---------------------------------------------------------------------------
+# TEMPORARY diagnostic command — isolates whether the Playwright-harvested
+# DB session's COOKIES specifically are the reason fulfillment-messages
+# 541s, independent of every other variable (SKU, pincode, params, headers,
+# User-Agent, Referer) — all of which were individually tested and matched
+# to a real working browser capture in a prior round of this investigation,
+# yet still failed identically. Lets an admin paste a real browser's own
+# captured cookie string and replay it through the EXACT SAME
+# _cookie_auth_fetch header-construction logic /debugpickup and every
+# production caller use (via the new cookie_override param — see its
+# docstring), so cookies are the ONLY thing that differs from a normal
+# call. A success here would prove the cookies (not headers/params/replay
+# logic) are the root cause; a failure here — using a cookie string known
+# to work in a real browser — would rule cookies out too and point
+# elsewhere entirely.
+#
+# Safe to delete once this investigation concludes, alongside
+# _cookie_auth_fetch's cookie_override param.
+# ---------------------------------------------------------------------------
+_DEBUG_PICKUP_RAW_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter — this command additionally accepts a raw,
+# admin-pasted Apple session cookie string as a command argument.
+
+
+@router.message(Command("debugpickupraw"))
+async def cmd_debugpickupraw(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_PICKUP_RAW_ADMIN_ID:
+        return
+    usage = (
+        "Usage: <code>/debugpickupraw &lt;apple_url&gt; &lt;pincode&gt; &lt;cookie_string&gt;</code>\n"
+        "cookie_string is a real browser's full raw Cookie header value "
+        "(name1=value1; name2=value2; ...), pasted verbatim — this bypasses "
+        "the DB/env session entirely for this one call only."
+    )
+    if not command.args:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    parts = command.args.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(usage, parse_mode="HTML")
+        return
+    url, pincode, cookie_string = parts
+
+    await _debug_send(message, f"🔍 Fetching product page (render={apple.NEEDS_JS}) to extract SKU: {url}")
+    try:
+        resp = await fetch_page(url, render_js=apple.NEEDS_JS, timeout=30.0)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Product page fetch failed: {exc}")
+        return
+
+    soup = BeautifulSoup(html, "html.parser")
+    sku = apple._extract_sku(soup, html)
+    if not sku:
+        await _debug_send(message, "⚠️ Could not extract a SKU/part number from this page.")
+        return
+    await _debug_send(message, f"✅ Extracted SKU: {sku!r}")
+
+    target = apple._build_fulfillment_target(sku, pincode)
+    await _debug_send(
+        message,
+        f"🔍 Calling fulfillment-messages with your MANUALLY-PASTED cookie string "
+        f"(cookie_length={len(cookie_string)}) — every other header (User-Agent, "
+        f"Referer, sec-ch-ua*, etc.) is identical to a normal /debugpickup call, "
+        f"only the cookies differ:\n{target}",
+    )
+
+    data, err = await apple._cookie_auth_fetch(
+        target, log_tag="debug-raw", context=f"RAW OVERRIDE fulfillment-messages pincode={pincode!r}",
+        timeout=apple._FULFILLMENT_TIMEOUT, referer=url, cookie_override=cookie_string,
+    )
+
+    if data is None:
+        await _debug_send(
+            message,
+            f"⚠️ Still failed with your manually-pasted cookies: {err}\n\n"
+            f"This points AWAY from the cookies as the sole cause — a cookie "
+            f"string you confirmed works in a real browser also failed here.",
+        )
+        return
+
+    await _debug_send(
+        message,
+        "✅ Succeeded with your manually-pasted cookies — this confirms the "
+        "Playwright-harvested DB session's cookies specifically are the "
+        "problem, not headers/params/replay logic.",
+    )
+    raw_json = json.dumps(data, indent=2)
+    await _debug_send(message, f"Raw JSON response ({len(raw_json)} chars):")
+    _CHUNK_SIZE = 4000
+    for i in range(0, len(raw_json), _CHUNK_SIZE):
+        await _debug_send(message, raw_json[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
 # /debugzyte — verify a single fetch through the active scraping provider
 # (checkers.fetch_page / config.SCRAPING_PROVIDER) before trusting the Zyte
 # API switchover for the live check cycle. Built specifically for the

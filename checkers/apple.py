@@ -351,7 +351,8 @@ _SEC_CH_UA = '"Not;A=Brand";v="8", "Chromium";v="150", "Microsoft Edge";v="150"'
 
 async def _cookie_auth_fetch(
     target: str, *, log_tag: str, context: str, timeout: float,
-    referer: str | None = None, client: httpx.AsyncClient | None = None,
+    referer: str | None = None, cookie_override: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> tuple[dict | None, str | None]:
     """
     One direct httpx GET to `target` (an Apple fulfillment-messages URL) —
@@ -391,10 +392,29 @@ async def _cookie_auth_fetch(
     calls is itself a bot signal, independent of request pacing). When
     None (every other call site, all single one-off requests), a client
     is created and torn down for just this call, same as before.
+
+    `cookie_override`: TEMPORARY diagnostic hook (see admin_handlers.py's
+    /debugpickupraw) — when given, replaces the DB/env-resolved cookies
+    entirely, while every other header (User-Agent, Referer, sec-ch-ua*,
+    etc.) stays exactly what production would send. Exists to isolate
+    "are the Playwright-harvested cookies themselves the problem" as a
+    single variable, independent of headers/params/replay logic (all of
+    which were individually confirmed correct against a real working
+    browser capture but still 541'd) — see checkers/apple.py's PARAM SET
+    / HEADER HISTORY notes above for the investigation this came out of.
+    Safe to remove alongside /debugpickupraw once that's resolved. None
+    (every production call site) keeps today's exact behavior unchanged.
     """
     logger.info(f"[apple][{log_tag}] {context} target={target!r}")
 
-    user_agent, cookies, _source = _resolve_apple_session()
+    user_agent, resolved_cookies, _source = _resolve_apple_session()
+    cookies = cookie_override if cookie_override is not None else resolved_cookies
+    if cookie_override is not None:
+        logger.info(
+            f"[apple][{log_tag}] {context} using a manually-supplied cookie "
+            f"OVERRIDE (/debugpickupraw) — NOT the DB/env session, "
+            f"cookie_length={len(cookie_override)}"
+        )
     if not user_agent or not cookies:
         reason = (
             "no Apple session available — neither the auto-refreshed DB "
@@ -432,12 +452,16 @@ async def _cookie_auth_fetch(
 
     # Diagnostic — header NAMES + cookie length only, never the cookie
     # value itself (a live Apple session shouldn't land in Railway logs).
-    # Added alongside the Playwright refresh's own akamai_markers_present
+    # Referer IS logged in full (unlike cookies) — it's never sensitive,
+    # and its value was previously invisible in logs entirely, which
+    # stalled an earlier round of this exact investigation. Added
+    # alongside the Playwright refresh's own akamai_markers_present
     # logging to compare "cookies minted" against "cookies actually sent
     # on a failing request" without guessing.
     logger.info(
         f"[apple][{log_tag}] {context} request_headers={sorted(headers.keys())} "
-        f"cookie_length={len(cookies)} user_agent={user_agent!r}"
+        f"cookie_length={len(cookies)} user_agent={user_agent!r} "
+        f"referer={headers['Referer']!r}"
     )
 
     try:
