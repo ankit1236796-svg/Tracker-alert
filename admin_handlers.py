@@ -3196,23 +3196,64 @@ _DEBUG_PICKUP_RAW_ADMIN_ID = 5004721766  # same hardcoded restriction as
 
 @router.message(Command("debugpickupraw"))
 async def cmd_debugpickupraw(message: Message, command: CommandObject):
+    """
+    Cookie string comes from either of two places:
+      1. Inline as a 3rd command argument — fine for short cookie jars, but
+         Telegram truncates message TEXT at 4096 chars, and a real Apple
+         session's Cookie header can get close to that.
+      2. REPLY to a message with a .txt (or any text) file attached,
+         containing just the cookie string, with a 2-arg command
+         (<apple_url> <pincode>, no inline cookie string). File uploads
+         have no realistic size concern here — Telegram's bot API allows
+         up to 20MB — so this sidesteps the message-length limit entirely
+         rather than requiring careful character-counting before every
+         send.
+    """
     if message.from_user.id != _DEBUG_PICKUP_RAW_ADMIN_ID:
         return
     usage = (
         "Usage: <code>/debugpickupraw &lt;apple_url&gt; &lt;pincode&gt; &lt;cookie_string&gt;</code>\n"
         "cookie_string is a real browser's full raw Cookie header value "
         "(name1=value1; name2=value2; ...), pasted verbatim — this bypasses "
-        "the DB/env session entirely for this one call only."
+        "the DB/env session entirely for this one call only.\n\n"
+        "Cookie string too long to safely fit in one Telegram message? "
+        "Instead attach it as a .txt file and REPLY to that message with "
+        "<code>/debugpickupraw &lt;apple_url&gt; &lt;pincode&gt;</code> "
+        "(2 args, no inline cookie string) — the file's contents are used "
+        "as the cookie string instead."
     )
     if not command.args:
         await message.answer(usage, parse_mode="HTML")
         return
 
     parts = command.args.strip().split(maxsplit=2)
-    if len(parts) < 3:
+    if len(parts) < 2:
         await message.answer(usage, parse_mode="HTML")
         return
-    url, pincode, cookie_string = parts
+    url, pincode = parts[0], parts[1]
+
+    if len(parts) >= 3:
+        cookie_string = parts[2]
+    else:
+        document = message.reply_to_message.document if message.reply_to_message else None
+        if document is None:
+            await _debug_send(
+                message,
+                "⚠️ No inline cookie string given (3rd argument) and no file found in "
+                "the replied-to message. Either paste the cookie string as a 3rd "
+                "argument, or reply to a message with a .txt file attached.",
+            )
+            return
+        try:
+            buffer = await message.bot.download(document)
+            cookie_string = buffer.read().decode("utf-8").replace("\r", "").replace("\n", "").strip()
+        except Exception as exc:
+            await _debug_send(message, f"⚠️ Could not download/read the attached file: {exc}")
+            return
+        if not cookie_string:
+            await _debug_send(message, "⚠️ The attached file is empty.")
+            return
+        await _debug_send(message, f"✅ Read cookie string from attached file ({len(cookie_string)} chars).")
 
     await _debug_send(message, f"🔍 Fetching product page (render={apple.NEEDS_JS}) to extract SKU: {url}")
     try:
