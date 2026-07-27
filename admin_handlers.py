@@ -4055,10 +4055,19 @@ async def cmd_debugdom(message: Message, command: CommandObject):
 
     from config import PLAYWRIGHT_SCRAPER_URL
 
+    usage = (
+        "Usage: <code>/debugdom &lt;apple_url&gt; [click_text]</code>\n"
+        "click_text (optional) — e.g. <code>/debugdom &lt;url&gt; Check availability</code> "
+        "— clicks the first element containing that text after the initial "
+        "scan and re-scans, for pincode inputs hidden behind a modal/overlay."
+    )
     if not command.args:
-        await message.answer("Usage: <code>/debugdom &lt;apple_url&gt;</code>", parse_mode="HTML")
+        await message.answer(usage, parse_mode="HTML")
         return
-    url = command.args.strip()
+
+    parts = command.args.strip().split(maxsplit=1)
+    url = parts[0]
+    click_text = parts[1] if len(parts) > 1 else None
 
     if not PLAYWRIGHT_SCRAPER_URL:
         await _debug_send(message, "⚠️ PLAYWRIGHT_SCRAPER_URL is not set on this service — nothing to call.")
@@ -4067,13 +4076,18 @@ async def cmd_debugdom(message: Message, command: CommandObject):
     await _debug_send(
         message,
         f"🔍 Loading {url} in a real browser and scanning its DOM for "
-        f"pickup/fulfillment/store/zip/pincode-related elements (playwright_scraper: "
-        f"{PLAYWRIGHT_SCRAPER_URL})…",
+        f"pickup/fulfillment/store/zip/pincode-related elements"
+        + (f", then clicking text {click_text!r} and re-scanning" if click_text else "")
+        + f" (playwright_scraper: {PLAYWRIGHT_SCRAPER_URL})…",
     )
+
+    body = {"url": url}
+    if click_text:
+        body["click_text"] = click_text
 
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(f"{PLAYWRIGHT_SCRAPER_URL}/debug-dom", json={"url": url})
+            resp = await client.post(f"{PLAYWRIGHT_SCRAPER_URL}/debug-dom", json=body)
     except Exception as exc:
         await _debug_send(message, f"⚠️ Request to playwright_scraper failed: {exc}")
         return
@@ -4095,15 +4109,38 @@ async def cmd_debugdom(message: Message, command: CommandObject):
     )
 
     _CHUNK_SIZE = 3500
+
+    def _send_category(label: str, items: list) -> list:
+        # Returns the messages queued, for testability — see callers below.
+        if not items:
+            return [f"{label}: 0 found"]
+        text = f"{label} ({len(items)}):\n{json.dumps(items, indent=2)}"
+        return [text[i:i + _CHUNK_SIZE] for i in range(0, len(text), _CHUNK_SIZE)]
+
     for label, key in (
         ("data_autom_elements", "data_autom_elements"),
         ("pincode_like_inputs", "pincode_like_inputs"),
         ("pickup_related_buttons", "pickup_related_buttons"),
+        ("pickup_details_html", "pickup_details_html"),
     ):
-        items = data.get(key) or []
-        if not items:
-            await _debug_send(message, f"{label}: 0 found")
-            continue
-        text = f"{label} ({len(items)}):\n{json.dumps(items, indent=2)}"
-        for i in range(0, len(text), _CHUNK_SIZE):
-            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+        for chunk in _send_category(label, data.get(key) or []):
+            await _debug_send(message, chunk)
+
+    after_click = data.get("after_click")
+    if click_text:
+        if after_click is None:
+            await _debug_send(
+                message,
+                f"⚠️ after_click is empty — click likely failed or found nothing. "
+                f"Check diagnostics.click_result above for the exact reason.",
+            )
+        else:
+            await _debug_send(message, f"— after clicking {click_text!r} —")
+            for label, key in (
+                ("after_click.data_autom_elements", "data_autom_elements"),
+                ("after_click.pincode_like_inputs", "pincode_like_inputs"),
+                ("after_click.pickup_related_buttons", "pickup_related_buttons"),
+                ("after_click.pickup_details_html", "pickup_details_html"),
+            ):
+                for chunk in _send_category(label, after_click.get(key) or []):
+                    await _debug_send(message, chunk)
