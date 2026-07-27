@@ -682,13 +682,14 @@ async def check_pickup_row(bot, row: dict) -> dict:
     return results
 
 
-async def check_channel_pickup_row(bot, row: dict) -> list[dict]:
+async def check_channel_pickup_row(bot, row: dict) -> dict:
     """
     Channel-forwarding sibling of check_pickup_row above — same
     fetch/persist/notify shape, but for ONE database.channel_forward_
-    pickup_tracking row (a single pincode per row, not a per-user list)
-    and forwarding the alert to the registered channel (looked up here
-    via database.get_forward_channel, same as bot.py's own
+    pickup_tracking row (now a pincodes LIST + pincode_status dict per
+    row, mirroring pickup_tracking's own shape exactly) and forwarding
+    alerts to the registered channel (looked up here via
+    database.get_forward_channel, same as bot.py's own
     _apply_result_to_channel_forward_row does for the stock side) instead
     of a user_id. Lives here for the same reason check_pickup_row does: bot.py's
     background cycle AND admin_handlers.py's on-demand /checkforwarding
@@ -703,10 +704,21 @@ async def check_channel_pickup_row(bot, row: dict) -> list[dict]:
     no-op fetch-skip; only relevant if that initial extraction somehow
     didn't get persisted.
 
-    Returns the current call's available-stores list (empty if none/
-    inconclusive) — used by /checkforwarding to show a live result
-    immediately, same as check_pickup_row's own return value is used by
-    /mypickups.
+    Sequential across pincodes WITHIN this row, same reasoning as
+    check_pickup_row's own docstring (avoids a lost-update race on this
+    row's single persisted pincode_status dict).
+
+    Returns {pincode: [store dicts]} for every pincode actually checked
+    this call — used by /checkforwarding to show a live per-pincode
+    result immediately, same as check_pickup_row's own return value is
+    used by /mypickups. A pincode whose API call fails this round is
+    absent from the returned dict and left untouched in the persisted
+    status, mirroring check_pickup_row's own inconclusive-result handling.
+
+    Status + last_checked are persisted unconditionally at the end of
+    every call (unlike check_pickup_row, which only writes `if changed`)
+    so /listforwarding's last-checked display stays accurate even on
+    cycles with no transitions.
     """
     # Deferred imports — see check_pickup_row's own note above for why.
     from database import update_channel_forward_pickup_status, is_forwarding_paused, get_forward_channel
@@ -724,48 +736,62 @@ async def check_channel_pickup_row(bot, row: dict) -> list[dict]:
                 f"[apple][channel-pickup] product page fetch/SKU extraction "
                 f"failed for #{row['id']} url={row['url']!r}: {exc}"
             )
-            return []
+            return {}
         if not sku:
             logger.warning(
                 f"[apple][channel-pickup] could not extract a SKU for "
                 f"#{row['id']} url={row['url']!r} — skipping this cycle"
             )
-            return []
+            return {}
 
-    try:
-        data, _method, _diag = await _fetch_pickup_availability(sku, row["pincode"], row["url"])
-    except Exception as exc:
-        logger.error(f"[apple][channel-pickup] error checking #{row['id']}: {exc}")
-        return []
-    if data is None:
-        return []  # inconclusive this call — leave prior status untouched
-
-    stores = available_stores_for_pickup(data, sku)
-    now_available = bool(stores)
-    was_available = bool(row.get("available"))
-
-    update_channel_forward_pickup_status(row["id"], now_available, sku=sku)
-
-    if now_available and not was_available:
-        if is_forwarding_paused():
-            logger.info(
-                f"[apple][channel-pickup] #{row['id']} transitioned to "
-                f"available but forwarding is paused — alert suppressed."
+    status = dict(row.get("pincode_status") or {})
+    results: dict[str, list[dict]] = {}
+    channel = None
+    for pincode in row.get("pincodes") or []:
+        try:
+            data, _method, _diag = await _fetch_pickup_availability(sku, pincode, row["url"])
+        except Exception as exc:
+            logger.error(
+                f"[apple][channel-pickup] error checking #{row['id']} pincode={pincode!r}: {exc}"
             )
-        else:
-            channel = get_forward_channel()
-            if not channel:
-                logger.warning(
-                    f"[apple][channel-pickup] #{row['id']} transitioned to "
-                    f"available but no channel is registered — alert skipped."
+            continue
+        if data is None:
+            continue  # inconclusive this call — leave prior status untouched
+
+        stores = available_stores_for_pickup(data, sku)
+        results[pincode] = stores
+        now_available = bool(stores)
+        was_available = bool(status.get(pincode, False))
+        status[pincode] = now_available
+
+        if now_available and not was_available:
+            if is_forwarding_paused():
+                logger.info(
+                    f"[apple][channel-pickup] #{row['id']} pincode={pincode!r} "
+                    f"transitioned to available but forwarding is paused — "
+                    f"alert suppressed."
                 )
             else:
-                try:
-                    await send_channel_pickup_alert(bot, channel["chat_id"], row["name"], row["pincode"], stores)
-                except Exception as exc:
-                    logger.error(f"[apple][channel-pickup] alert failed for #{row['id']}: {exc}")
+                if channel is None:
+                    channel = get_forward_channel() or {}
+                if not channel:
+                    logger.warning(
+                        f"[apple][channel-pickup] #{row['id']} pincode={pincode!r} "
+                        f"transitioned to available but no channel is "
+                        f"registered — alert skipped."
+                    )
+                else:
+                    try:
+                        await send_channel_pickup_alert(bot, channel["chat_id"], row["name"], pincode, stores)
+                    except Exception as exc:
+                        logger.error(
+                            f"[apple][channel-pickup] alert failed for #{row['id']} "
+                            f"pincode={pincode!r}: {exc}"
+                        )
 
-    return stores
+    update_channel_forward_pickup_status(row["id"], status, sku=sku)
+
+    return results
 
 
 async def refine_with_pincode(

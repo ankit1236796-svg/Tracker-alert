@@ -479,26 +479,79 @@ def init_db():
         # Apple pickup-availability channel-forwarding — the pickup sibling
         # of channel_forward_tracking above (see admin_handlers.py's
         # /addchannelpickup, /stopforwardingpickup, and checkers/apple.py's
-        # check_channel_pickup_row). ONE pincode per row (not a list like
-        # pickup_tracking) — matches /addchannelpickup <url> <pincode>'s own
-        # one-pincode-per-call shape; the same URL can appear multiple times
-        # with different pincodes (UNIQUE is on the pair, not url alone).
-        # sku is cached after first successful extraction, same convention
-        # as apple_official_pickup_status/pickup_tracking.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS channel_forward_pickup_tracking (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                name         TEXT    NOT NULL,
-                url          TEXT    NOT NULL,
-                sku          TEXT,
-                pincode      TEXT    NOT NULL,
-                available    INTEGER NOT NULL DEFAULT 0,
-                last_checked TEXT,
-                created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(url, pincode)
-            )
-        """)
-        conn.commit()
+        # check_channel_pickup_row). ONE ROW PER URL, carrying a list of
+        # pincodes + a per-pincode status dict — mirrors pickup_tracking's
+        # own shape exactly (pincodes/pincode_status columns, same JSON
+        # encoding), so /addchannelpickup can track multiple pincodes per
+        # product the same way /trackpickup already does for per-user
+        # tracking. sku is cached after first successful extraction, same
+        # convention as apple_official_pickup_status/pickup_tracking.
+        #
+        # Migration: this table originally shipped as ONE ROW PER PINCODE
+        # (columns: pincode TEXT, available INTEGER, UNIQUE(url, pincode)).
+        # Detect that old shape and fold any existing rows into the new
+        # one-row-per-url shape (grouping by url, merging each row's single
+        # pincode into the new pincode_status dict) rather than silently
+        # dropping data on deploy.
+        existing_pickup_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(channel_forward_pickup_tracking)")
+        }
+        if "pincode" in existing_pickup_cols:
+            old_rows = conn.execute("SELECT * FROM channel_forward_pickup_tracking").fetchall()
+            migrated: dict[str, dict] = {}
+            for old_row in old_rows:
+                d = dict(old_row)
+                entry = migrated.setdefault(d["url"], {
+                    "name": d["name"], "sku": d["sku"], "pincode_status": {}, "last_checked": None,
+                })
+                entry["pincode_status"][d["pincode"]] = bool(d["available"])
+                if d["sku"]:
+                    entry["sku"] = d["sku"]
+                if d["last_checked"] and (entry["last_checked"] is None or d["last_checked"] > entry["last_checked"]):
+                    entry["last_checked"] = d["last_checked"]
+            conn.execute("DROP TABLE channel_forward_pickup_tracking")
+            conn.commit()
+            conn.execute("""
+                CREATE TABLE channel_forward_pickup_tracking (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name           TEXT    NOT NULL,
+                    url            TEXT    NOT NULL UNIQUE,
+                    sku            TEXT,
+                    pincodes       TEXT    NOT NULL,
+                    pincode_status TEXT    NOT NULL DEFAULT '{}',
+                    last_checked   TEXT,
+                    created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.commit()
+            for url, entry in migrated.items():
+                conn.execute(
+                    """
+                    INSERT INTO channel_forward_pickup_tracking
+                        (name, url, sku, pincodes, pincode_status, last_checked)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entry["name"], url, entry["sku"],
+                        json.dumps(list(entry["pincode_status"].keys())),
+                        json.dumps(entry["pincode_status"]), entry["last_checked"],
+                    ),
+                )
+            conn.commit()
+        else:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS channel_forward_pickup_tracking (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name           TEXT    NOT NULL,
+                    url            TEXT    NOT NULL UNIQUE,
+                    sku            TEXT,
+                    pincodes       TEXT    NOT NULL,
+                    pincode_status TEXT    NOT NULL DEFAULT '{}',
+                    last_checked   TEXT,
+                    created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.commit()
 
         # Auto-refreshed Apple session (cookies + matching User-Agent), minted
         # periodically by a real headless-Chromium session in the separate
@@ -765,25 +818,41 @@ def set_forwarding_paused(paused: bool) -> dict:
 # functions above.
 # ---------------------------------------------------------------------------
 
+def _row_to_channel_pickup_dict(row: sqlite3.Row) -> dict:
+    """Parses the JSON-encoded pincodes/pincode_status columns into real
+    Python objects — mirrors _row_to_pickup_dict's own decoding, since this
+    table now shares pickup_tracking's pincodes/pincode_status shape."""
+    d = dict(row)
+    try:
+        d["pincodes"] = json.loads(d["pincodes"])
+    except (TypeError, ValueError):
+        d["pincodes"] = []
+    try:
+        d["pincode_status"] = json.loads(d["pincode_status"])
+    except (TypeError, ValueError):
+        d["pincode_status"] = {}
+    return d
+
+
 def add_channel_forward_pickup(
-    name: str, url: str, pincode: str, sku: str | None = None,
+    name: str, url: str, pincodes: list[str], sku: str | None = None,
 ) -> tuple[bool, str]:
-    """Returns (False, ...) on a duplicate (url, pincode) pair — the same
-    product tracked at the same pincode twice is a no-op, not an error the
-    caller needs to distinguish further."""
+    """Returns (False, ...) on a duplicate url — the same product is only
+    ever forwarded once (UNIQUE(url)), mirroring channel_forward_tracking's
+    own url-uniqueness for regular stock forwarding."""
     try:
         with get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO channel_forward_pickup_tracking (name, url, sku, pincode)
+                INSERT INTO channel_forward_pickup_tracking (name, url, sku, pincodes)
                 VALUES (?, ?, ?, ?)
                 """,
-                (name, url, sku, pincode),
+                (name, url, sku, json.dumps(pincodes)),
             )
             conn.commit()
         return True, "Pickup tracking added to the forward list."
     except sqlite3.IntegrityError:
-        return False, "This URL + pincode combination is already forwarding to the channel."
+        return False, "This URL is already forwarding pickup alerts to the channel."
     except Exception as e:
         logger.error(f"add_channel_forward_pickup error: {e}")
         return False, "Database error while adding to the pickup forward list."
@@ -796,7 +865,7 @@ def list_channel_forward_pickup() -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM channel_forward_pickup_tracking ORDER BY created_at ASC"
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_row_to_channel_pickup_dict(r) for r in rows]
 
 
 def remove_channel_forward_pickup_by_id(row_id: int) -> bool:
@@ -807,31 +876,35 @@ def remove_channel_forward_pickup_by_id(row_id: int) -> bool:
 
 
 def remove_channel_forward_pickup_by_url(url: str) -> int:
-    """Removes EVERY entry for this URL regardless of pincode — "stop
-    forwarding pickup alerts for this product" rather than requiring the
-    admin to know which specific pincode(s) to target. Returns how many
-    rows were removed."""
+    """Removes the entry for this URL (all of its tracked pincodes at
+    once) — "stop forwarding pickup alerts for this product" rather than
+    requiring the admin to know which specific pincode(s) to target.
+    Returns how many rows were removed (0 or 1, since url is UNIQUE)."""
     with get_connection() as conn:
         cursor = conn.execute("DELETE FROM channel_forward_pickup_tracking WHERE url = ?", (url,))
         conn.commit()
     return cursor.rowcount
 
 
-def update_channel_forward_pickup_status(row_id: int, available: bool, sku: str | None = None) -> None:
-    """sku is only overwritten when a non-None value is passed — mirrors
+def update_channel_forward_pickup_status(row_id: int, pincode_status: dict, sku: str | None = None) -> None:
+    """Persists the full per-pincode status dict and refreshes
+    last_checked on every check (unconditionally, unlike pickup_tracking's
+    update_pickup_status which callers only invoke `if changed`) so
+    /listforwarding always shows an accurate last-checked time. sku is
+    only overwritten when a non-None value is passed — mirrors
     upsert_apple_official_pickup_status's own "None never overwrites a
     cached value" convention, so a transient re-extraction failure never
     wipes out a previously-cached sku."""
     with get_connection() as conn:
         if sku is not None:
             conn.execute(
-                "UPDATE channel_forward_pickup_tracking SET available = ?, last_checked = ?, sku = ? WHERE id = ?",
-                (1 if available else 0, now_ist_str(), sku, row_id),
+                "UPDATE channel_forward_pickup_tracking SET pincode_status = ?, last_checked = ?, sku = ? WHERE id = ?",
+                (json.dumps(pincode_status), now_ist_str(), sku, row_id),
             )
         else:
             conn.execute(
-                "UPDATE channel_forward_pickup_tracking SET available = ?, last_checked = ? WHERE id = ?",
-                (1 if available else 0, now_ist_str(), row_id),
+                "UPDATE channel_forward_pickup_tracking SET pincode_status = ?, last_checked = ? WHERE id = ?",
+                (json.dumps(pincode_status), now_ist_str(), row_id),
             )
         conn.commit()
 
