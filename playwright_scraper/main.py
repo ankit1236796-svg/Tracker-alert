@@ -214,6 +214,20 @@ _REALISTIC_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
+# Apple-specific override, used ONLY by _refresh_apple_cookies below — NOT
+# _REALISTIC_USER_AGENT above, which every OTHER browser this service
+# launches still uses unchanged (RelianceDigital/BigBasket/Zepto/Blinkit
+# checks, /check-stock, /debug-network). Copied byte-for-byte from a real,
+# confirmed-working Apple fulfillment-messages request captured via Chrome
+# DevTools (2026-07-27) — kept in sync with checkers/apple.py's own
+# _SEC_CH_UA constant, since a real browser's User-Agent and its
+# sec-ch-ua Client Hints headers must describe the same browser or the
+# mismatch is itself a detectable inconsistency. See checkers/apple.py's
+# "PARAM SET / HEADER HISTORY, PART 2" note for the full story.
+_APPLE_REALISTIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
+)
 _STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 window.chrome = window.chrome || { runtime: {} };
@@ -230,15 +244,17 @@ if (originalQuery) {
 """
 
 
-def _new_browser_and_context(pw):
+def _new_browser_and_context(pw, user_agent: str = _REALISTIC_USER_AGENT):
     """Launch a browser + context with the anti-detection measures above —
-    shared by _render_page (/check-stock) and _capture_network_calls
-    (/debug-network) so both get the same defenses, not just whichever
-    endpoint happened to be under investigation when this was added."""
+    shared by _render_page (/check-stock), _capture_network_calls
+    (/debug-network), and _refresh_apple_cookies (with its own
+    _APPLE_REALISTIC_USER_AGENT override) so all three get the same
+    defenses, not just whichever endpoint happened to be under
+    investigation when this was added."""
     browser = pw.chromium.launch(headless=HEADLESS, proxy=_proxy_config())
     context = browser.new_context(
         viewport={"width": 1280, "height": 800},
-        user_agent=_REALISTIC_USER_AGENT,
+        user_agent=user_agent,
         locale="en-US",
     )
     context.add_init_script(_STEALTH_INIT_SCRIPT)
@@ -707,7 +723,7 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
         )
     try:
         with sync_playwright() as pw:
-            browser, context = _new_browser_and_context(pw)
+            browser, context = _new_browser_and_context(pw, user_agent=_APPLE_REALISTIC_USER_AGENT)
             try:
                 page = context.new_page()
                 # NO resource blocker here (unlike /check-stock and
@@ -835,7 +851,7 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
 
                 return {
                     "cookies": cookie_header,
-                    "user_agent": _REALISTIC_USER_AGENT,
+                    "user_agent": _APPLE_REALISTIC_USER_AGENT,
                     "pincode_check_confirmed": pincode_check_confirmed,
                     "diagnostics": diagnostics,
                 }

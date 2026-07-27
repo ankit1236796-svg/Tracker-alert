@@ -317,11 +317,36 @@ def _resolve_apple_session() -> tuple[str, str, str]:
 # module's old hardcoded generic "https://www.apple.com/in/shop", and it
 # carried the standard Fetch-metadata/Client-Hints headers a real same-
 # origin `fetch()` call sends (sec-fetch-*, sec-ch-ua*, cache-control,
-# pragma, priority) that a plain httpx GET never adds on its own. Both are
-# applied below now: `referer` defaults to the real tracked product URL
-# (threaded through from every caller below) instead of a generic page, and
-# the extra headers are added unconditionally.
-_SEC_CH_UA = '"Not)A;Brand";v="99", "Google Chrome";v="128", "Chromium";v="128"'
+# pragma, priority, accept-language) that a plain httpx GET never adds on
+# its own. Both are applied below now: `referer` defaults to the real
+# tracked product URL (threaded through from every caller below) instead
+# of a generic page, and the extra headers are added unconditionally.
+#
+# UPDATE (same day, second capture): the FULL cURL (not just a header-name
+# summary) showed two things the first pass got wrong/incomplete —
+#   1. sec-ch-ua* below is copied byte-for-byte from that capture rather
+#      than inferred from a generic Chrome/128 guess: the real working
+#      session was Edge 150 (UA "...Chrome/150.0.0.0 Safari/537.36
+#      Edg/150.0.0.0"), not Chrome 128. Kept in sync with
+#      playwright_scraper's own _REALISTIC_USER_AGENT, which now sends
+#      that exact UA string too — sec-ch-ua and User-Agent must describe
+#      the SAME browser or the mismatch is itself a detectable
+#      inconsistency (arguably worse than omitting sec-ch-ua entirely).
+#   2. The real capture also included a header this module has never
+#      sent: `x-aos-ui-fetch-call-1: <opaque token>` (looks like a
+#      per-page-load correlation id Apple's own frontend JS attaches to
+#      its fetch() calls). Deliberately NOT added here — its generation
+#      algorithm is unknown, and a wrong-but-present value could read as
+#      more suspicious than a missing one. If /debugpickup still fails
+#      with the headers below, this header is the next thing to
+#      investigate — not something to guess at blindly.
+#   3. Also worth noting: the real capture did NOT include
+#      `x-skip-redirect` at all, even though the Jul 25 fix treated it as
+#      essential. Left in place below since there's no evidence it's
+#      actively harmful (an extra header a WAF doesn't check for rarely
+#      causes rejection, unlike a genuinely missing required one) — but
+#      flagging it here in case it turns out to matter later.
+_SEC_CH_UA = '"Not;A=Brand";v="8", "Chromium";v="150", "Microsoft Edge";v="150"'
 
 
 async def _cookie_auth_fetch(
@@ -385,16 +410,15 @@ async def _cookie_auth_fetch(
         "User-Agent": user_agent,
         "Cookie": cookies,
         "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9,en-IN;q=0.8",
         "Referer": referer or "https://www.apple.com/in/shop",
         "x-skip-redirect": "true",
         # Fetch-metadata + Client Hints headers a real same-origin
         # fetch() call sends automatically — a plain httpx GET doesn't add
-        # any of these on its own. sec-ch-ua* below matches the Chrome
-        # version/platform in `user_agent` (Chrome 128 on Windows, see
-        # playwright_scraper's _REALISTIC_USER_AGENT) — these are standard
-        # Client Hints values for that browser/OS combination, not scraped
-        # from a specific captured request, so double-check against a
-        # fresh capture if Apple's edge starts treating this differently.
+        # any of these on its own. sec-ch-ua* below is copied byte-for-byte
+        # from a real working-request capture (Edge 150 on Windows, see
+        # playwright_scraper's _REALISTIC_USER_AGENT — kept in sync so
+        # User-Agent and sec-ch-ua never describe two different browsers).
         "sec-ch-ua": _SEC_CH_UA,
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
