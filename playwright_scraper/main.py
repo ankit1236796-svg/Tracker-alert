@@ -720,6 +720,40 @@ _FULFILLMENT_FETCH_JS = """async (target) => {
 }"""
 
 
+def _abck_diagnostics(cookies_list: list[dict]) -> dict:
+    """
+    2026-07-27 — _abck's raw VALUE (not just its name/presence, unlike
+    every other cookie in the jar — see _refresh_apple_cookies' own
+    cookie_names diagnostic) is surfaced here specifically. Safe to:
+    _abck is Akamai Bot Manager's own anti-bot sensor/telemetry marker,
+    not an account/session credential — it grants no access to anything
+    on apple.com by itself, unlike the real session cookies (dssid2,
+    as_atb, mbox, etc.) that make up the rest of this jar, which stay
+    name-only for exactly that reason.
+
+    Motivation: akamai_markers_present only proves the cookie EXISTS, not
+    that Akamai actually validated the session behind it — a cookie can
+    be present but still reflect an unvalidated/rejected state. Community
+    reverse-engineering of Akamai's _abck format (not officially
+    published by Akamai, not verified against Apple's specific
+    configuration — treat as a lead to check, not a confirmed fact)
+    commonly describes it as roughly
+    "<sensor_uid>~<validation_flag>~<payload>~<flag>~<flag>", with the
+    SECOND field (right after the first "~") reportedly "-1" when the
+    sensor's data hasn't been accepted/validated yet, vs. a different
+    value once it has. Returned split on "~" so that field is directly
+    visible per refresh cycle instead of guessing from presence alone.
+
+    Returns {"abck_value_raw": str|None, "abck_segments": list[str]|None}
+    — both None if no _abck cookie was captured at all this cycle.
+    """
+    abck_cookie = next((c for c in cookies_list if c["name"] == "_abck"), None)
+    return {
+        "abck_value_raw": abck_cookie["value"] if abck_cookie else None,
+        "abck_segments": abck_cookie["value"].split("~") if abck_cookie else None,
+    }
+
+
 def _refresh_apple_cookies(url: str, pincode: str) -> dict:
     """Loads `url`, extracts its SKU, performs an in-page fetch of
     fulfillment-messages for `pincode` (see module note above), and returns
@@ -889,6 +923,31 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
                     name: (name in diagnostics["cookie_names"])
                     for name in ("_abck", "bm_sz", "ak_bmsc")
                 }
+
+                # 2026-07-27 — _abck's raw VALUE (not just its name/presence,
+                # unlike every other cookie above — see cookie_names) is
+                # logged here specifically. Safe to: _abck is Akamai Bot
+                # Manager's own anti-bot sensor/telemetry marker, not an
+                # account/session credential — it grants no access to
+                # anything on apple.com by itself, unlike the real session
+                # cookies (dssid2, as_atb, mbox, etc.) that make up the rest
+                # of this jar, which stay name-only for exactly that reason.
+                #
+                # Motivation: akamai_markers_present above only proves the
+                # cookie EXISTS, not that Akamai actually validated the
+                # session behind it — a cookie can be present but still
+                # reflect an unvalidated/rejected state. Community reverse-
+                # engineering of Akamai's _abck format (not officially
+                # published by Akamai, not verified against Apple's specific
+                # configuration — treat as a lead to check, not a confirmed
+                # fact) commonly describes it as roughly
+                # "<sensor_uid>~<validation_flag>~<payload>~<flag>~<flag>",
+                # with the SECOND field (right after the first "~")
+                # reportedly "-1" when the sensor's data hasn't been
+                # accepted/validated yet, vs. a different value once it has.
+                # Logged split on "~" so that field is directly visible per
+                # refresh cycle instead of guessing from presence alone.
+                diagnostics.update(_abck_diagnostics(cookies_list))
 
                 logger.info(
                     f"[refresh-apple-cookies] {url}: {len(cookies_list)} cookie(s) captured, "
