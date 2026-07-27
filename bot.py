@@ -542,7 +542,7 @@ async def _check_apple_official_pickup_group(bot: Bot, url: str, rows: list[dict
             return
 
     try:
-        results = await apple_checker.check_pickup_at_official_stores(sku, APPLE_PICKUP_PINCODES)
+        results = await apple_checker.check_pickup_at_official_stores(sku, APPLE_PICKUP_PINCODES, product_url=url)
     except Exception as exc:
         logger.error(f"[apple][official-stores] check failed for {url!r} sku={sku!r}: {exc}")
         return
