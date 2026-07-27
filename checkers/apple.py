@@ -346,7 +346,33 @@ def _resolve_apple_session() -> tuple[str, str, str]:
 #      actively harmful (an extra header a WAF doesn't check for rarely
 #      causes rejection, unlike a genuinely missing required one) — but
 #      flagging it here in case it turns out to matter later.
-_SEC_CH_UA = '"Not;A=Brand";v="8", "Chromium";v="150", "Microsoft Edge";v="150"'
+#
+# UPDATE (same day, third pass): the "150" above was itself found to be a
+# growing lie — playwright_scraper's Docker image (the actual engine
+# behind whatever User-Agent gets stored and later replayed here) had
+# sat pinned at Chromium 129 since this service was built, while the
+# User-Agent string claimed a MUCH newer "150". sec-ch-ua below is no
+# longer a hardcoded constant — see _sec_ch_ua_for, which derives the
+# version from whatever User-Agent is ACTUALLY being sent for a given
+# call, so it can never drift out of sync with reality again (whether
+# that's the DB session's dynamically-versioned UA, or the APPLE_USER_AGENT
+# env var fallback, whatever an admin happened to paste there).
+_CHROME_VERSION_PATTERN = re.compile(r"Chrome/(\d+)")
+
+
+def _sec_ch_ua_for(user_agent: str) -> str:
+    """Derives a sec-ch-ua value from whatever Chrome/Edge major version
+    is actually present in `user_agent`, rather than a hardcoded string —
+    see the module note above this function for why a hardcoded version
+    silently went stale once already. Falls back to a fixed, plausible
+    major version only if `user_agent` doesn't contain a parseable
+    "Chrome/<N>" at all (e.g. an admin-pasted APPLE_USER_AGENT env var in
+    some unexpected format) — better than sending an obviously-nonsensical
+    number no matter what's actually running."""
+    m = _CHROME_VERSION_PATTERN.search(user_agent)
+    major = m.group(1) if m else "128"
+    browser_name = "Microsoft Edge" if "Edg/" in user_agent else "Google Chrome"
+    return f'"Not;A=Brand";v="8", "Chromium";v="{major}", "{browser_name}";v="{major}"'
 
 
 async def _cookie_auth_fetch(
@@ -435,11 +461,12 @@ async def _cookie_auth_fetch(
         "x-skip-redirect": "true",
         # Fetch-metadata + Client Hints headers a real same-origin
         # fetch() call sends automatically — a plain httpx GET doesn't add
-        # any of these on its own. sec-ch-ua* below is copied byte-for-byte
-        # from a real working-request capture (Edge 150 on Windows, see
-        # playwright_scraper's _REALISTIC_USER_AGENT — kept in sync so
-        # User-Agent and sec-ch-ua never describe two different browsers).
-        "sec-ch-ua": _SEC_CH_UA,
+        # any of these on its own. sec-ch-ua below is DERIVED from
+        # `user_agent` (see _sec_ch_ua_for's own note on why a hardcoded
+        # version went stale once already) — always describes the same
+        # browser as the User-Agent header above, whatever that happens
+        # to be this call.
+        "sec-ch-ua": _sec_ch_ua_for(user_agent),
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
         "sec-fetch-dest": "empty",

@@ -336,3 +336,28 @@ APPLE_COOKIE_REFRESH_PRODUCT_URL = os.getenv(
     "APPLE_COOKIE_REFRESH_PRODUCT_URL", "https://www.apple.com/in/shop/buy-iphone/iphone-17"
 )
 APPLE_COOKIE_REFRESH_PINCODE = os.getenv("APPLE_COOKIE_REFRESH_PINCODE", "400051")
+# Retry-before-storing safety net (2026-07-27) — a refresh's own in-page
+# validation (pincode_check_confirmed) turned out to be genuinely
+# probabilistic, not deterministic: some cycles produce an
+# Akamai-cleared session, others don't, even back-to-back. Rather than
+# storing whatever the FIRST attempt produced regardless, bot.py's
+# run_apple_cookie_refresh_cycle now retries up to this many total
+# attempts, stopping early the moment one confirms — only falling back to
+# storing an unconfirmed session (today's original behavior) if every
+# attempt comes back unconfirmed. 3 total (1 + 2 retries) balances
+# meaningfully improving the odds against each attempt already costing
+# ~15-30s (full browser launch + dwell + fetch) and this cycle needing to
+# comfortably finish within APPLE_COOKIE_REFRESH_INTERVAL.
+APPLE_COOKIE_REFRESH_MAX_ATTEMPTS = int(os.getenv("APPLE_COOKIE_REFRESH_MAX_ATTEMPTS", "3"))
+# Randomized delay BETWEEN retry attempts (not just relying on each
+# attempt's own dwell time) — repeated rapid page loads from the same
+# IP/session in a tight burst is itself a bot signal (see
+# checkers.apple.check_pickup_at_official_stores's own pincode-delay
+# reasoning, applied here for the same reason), so retrying too
+# aggressively could make Akamai's assessment WORSE, not better.
+APPLE_COOKIE_REFRESH_RETRY_DELAY_MIN_SECONDS = float(
+    os.getenv("APPLE_COOKIE_REFRESH_RETRY_DELAY_MIN_SECONDS", "5")
+)
+APPLE_COOKIE_REFRESH_RETRY_DELAY_MAX_SECONDS = float(
+    os.getenv("APPLE_COOKIE_REFRESH_RETRY_DELAY_MAX_SECONDS", "12")
+)
