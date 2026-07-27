@@ -92,6 +92,7 @@ Scrape.do's render=true — see README.md for the live-verification steps
 this needs once deployed.
 """
 
+import importlib.metadata
 import json
 import logging
 import os
@@ -769,6 +770,16 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
                 # fingerprinting, not a suspiciously partial one.
 
                 diagnostics: dict = {
+                    # The REAL, ground-truth bundled Chromium version this
+                    # specific refresh actually ran on — added 2026-07-27
+                    # alongside the Docker image version bump + dynamic
+                    # User-Agent derivation (see _apple_user_agent_for's own
+                    # note) so every future refresh's diagnostics directly
+                    # confirm what engine minted THIS session, right next to
+                    # akamai_markers_present/pincode_check_confirmed in the
+                    # same log line — no need to separately verify a deploy
+                    # landed or parse a version out of a UA string by hand.
+                    "chromium_version": browser.version,
                     "goto_status": None,
                     "goto_error": None,
                     "networkidle_timed_out": False,
@@ -963,12 +974,29 @@ def create_app() -> Flask:
 
     @app.route("/health", methods=["GET"])
     def health():
+        # playwright_version: the installed pip package version (cheap —
+        # reads package metadata, no browser launch) — added 2026-07-27 to
+        # make a Railway deploy's actual version directly verifiable via a
+        # single GET instead of having to infer it from log lines. Kept in
+        # lockstep with the Dockerfile's base image tag (see requirements.txt
+        # — the two are pinned together deliberately), so this is strong
+        # evidence of whether a Docker-image version bump actually deployed,
+        # without needing the heavier confirmation of an actual browser
+        # launch (see /refresh-apple-cookies's own chromium_version in its
+        # diagnostics for that — the real, ground-truth bundled engine
+        # version, from a browser that's already being launched anyway for
+        # that endpoint's real work).
+        try:
+            playwright_version = importlib.metadata.version("playwright")
+        except Exception:
+            playwright_version = None
         return jsonify({
             "ok": True,
             "max_concurrent_checks": MAX_CONCURRENT_CHECKS,
             "proxy_configured": _proxy_config() is not None,
             "supported_stores": sorted(CHECKERS),
             "apple_cookie_refresh_auth_required": bool(INTERNAL_REFRESH_TOKEN),
+            "playwright_version": playwright_version,
         })
 
     return app
