@@ -4146,3 +4146,98 @@ async def cmd_debugdom(message: Message, command: CommandObject):
             ):
                 for chunk in _send_category(label, after_click.get(key) or []):
                     await _debug_send(message, chunk)
+
+
+# ---------------------------------------------------------------------------
+# /debugpickupflow: Telegram wrapper for playwright_scraper's
+# /debug-pickup-flow endpoint (see that service's own module note +
+# _capture_pickup_flow) — /debugdom's more targeted successor, running the
+# FULL confirmed pincode-check interaction (click "Check availability" ->
+# fill zipCode -> click Continue -> wait for results -> dump the overlay's
+# markup) end-to-end, the last piece needed before a real checker function
+# gets built against confirmed structure. NOT wired into any production
+# code path — purely diagnostic, safe to delete alongside
+# /debug-pickup-flow once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_PICKUP_FLOW_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter.
+
+
+@router.message(Command("debugpickupflow"))
+async def cmd_debugpickupflow(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_PICKUP_FLOW_ADMIN_ID:
+        return
+
+    from config import PLAYWRIGHT_SCRAPER_URL
+
+    if not command.args:
+        await message.answer("Usage: <code>/debugpickupflow &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/debugpickupflow &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        return
+    url, pincode = parts[0], parts[1]
+
+    if not PLAYWRIGHT_SCRAPER_URL:
+        await _debug_send(message, "⚠️ PLAYWRIGHT_SCRAPER_URL is not set on this service — nothing to call.")
+        return
+
+    await _debug_send(
+        message,
+        f"🔍 Running the full pickup-check flow on {url} for pincode {pincode}: "
+        f"click \"Check availability\" → fill zipCode → click Continue → "
+        f"wait for results (playwright_scraper: {PLAYWRIGHT_SCRAPER_URL})…",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                f"{PLAYWRIGHT_SCRAPER_URL}/debug-pickup-flow", json={"url": url, "pincode": pincode},
+            )
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Request to playwright_scraper failed: {exc}")
+        return
+
+    if resp.status_code != 200:
+        await _debug_send(message, f"⚠️ playwright_scraper returned HTTP {resp.status_code}: {resp.text[:500]!r}")
+        return
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Non-JSON response from playwright_scraper: {exc}")
+        return
+
+    await _debug_send(
+        message,
+        f"Page title: {data.get('page_title')!r}\n"
+        f"diagnostics: {data.get('diagnostics')}",
+    )
+
+    _CHUNK_SIZE = 3500
+    overlay_html = data.get("overlay_html")
+    if overlay_html:
+        text = f"overlay_html ({len(overlay_html)} chars):\n{overlay_html}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+    else:
+        await _debug_send(
+            message,
+            "⚠️ overlay_html is empty — the overlay never appeared or the flow "
+            "failed before reaching it. Check diagnostics above for which step failed.",
+        )
+
+    for label, key in (
+        ("pickup_details_clickables", "pickup_details_clickables"),
+        ("pincode_like_inputs", "pincode_like_inputs"),
+    ):
+        items = data.get(key) or []
+        if not items:
+            await _debug_send(message, f"{label}: 0 found")
+            continue
+        text = f"{label} ({len(items)}):\n{json.dumps(items, indent=2)}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])

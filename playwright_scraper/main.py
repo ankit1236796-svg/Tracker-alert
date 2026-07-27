@@ -88,6 +88,25 @@ HTTP surface:
                         discovery (see checkers/apple.py's
                         investigation notes) — no auth, same as every
                         other endpoint here.
+  POST /debug-pickup-flow
+                        Body: {"url": str, "pincode": str (optional,
+                        default "110001")}. /debug-dom's more targeted
+                        successor (see _capture_pickup_flow) — performs
+                        the FULL confirmed pincode-check interaction:
+                        click the "Check availability" trigger, wait for
+                        the overlay, fill pincode into its zipCode input,
+                        click Continue, wait for results, then return the
+                        overlay's full outerHTML (the actual point — what
+                        the result markup looks like) plus the same
+                        keyword-filtered DOM scan /debug-dom uses. Returns
+                        {"url", "pincode", "overlay_html",
+                        "data_autom_elements", "pincode_like_inputs",
+                        "pickup_related_buttons", "pickup_details_html",
+                        "pickup_details_clickables", "diagnostics"
+                        (per-step errors: trigger_click_error,
+                        overlay_wait_timed_out, zip_fill_error,
+                        continue_click_error, results_wait_timed_out)}.
+                        No auth, same as every other endpoint here.
   POST /refresh-apple-cookies
                         Body: {"url": str (an apple.com/<locale>/shop/...
                         product page), "pincode": str}. Loads the page in a
@@ -992,6 +1011,183 @@ def _capture_dom_elements(url: str, click_text: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# /debug-pickup-flow: the FULL confirmed pincode-check interaction,
+# end-to-end — click "Check availability" -> fill zipCode -> click
+# Continue -> wait for results -> dump the resulting overlay markup. This
+# is /debug-dom's more targeted successor: /debug-dom's own generic
+# exploration (2026-07-27) found and confirmed the exact real selectors
+# this uses (data-autom values, not guessed):
+#   [data-autom^="productLocatorTriggerLink"]  the "Check availability"
+#                                               trigger inside pickUpDetails
+#                                               — SKU-suffixed
+#                                               (productLocatorTriggerLink_
+#                                               <SKU>), confirming which
+#                                               variant's trigger was hit
+#   [data-autom="plOverlayContainer"]          the modal/overlay it opens
+#   [data-autom="zipCode"]                     the pincode input inside it
+#   [data-autom="continuePickUp"]              the submit button
+# The last unknown is what the RESULT markup looks like once Continue is
+# clicked — this endpoint's whole purpose is capturing that, via the
+# overlay's full outerHTML, so a real checker function can be built
+# against confirmed structure instead of another guess-and-verify round.
+# ---------------------------------------------------------------------------
+_PICKUP_TRIGGER_SELECTOR = '[data-autom^="productLocatorTriggerLink"]'
+_PICKUP_OVERLAY_SELECTOR = '[data-autom="plOverlayContainer"]'
+_PICKUP_ZIPCODE_SELECTOR = '[data-autom="zipCode"]'
+_PICKUP_CONTINUE_SELECTOR = '[data-autom="continuePickUp"]'
+
+
+def _capture_pickup_flow(url: str, pincode: str) -> dict:
+    """
+    Full interaction: load `url`, click the "Check availability" trigger,
+    wait for the overlay, fill `pincode` into its zipCode input, click
+    Continue, wait for results, then return the overlay's full outerHTML
+    plus the same keyword-filtered DOM scan _capture_dom_elements uses.
+
+    Every step that can fail is captured into "diagnostics" rather than
+    aborting the whole flow — a later step's failure still lets earlier
+    steps' diagnostics (and whatever partial DOM state exists) come back,
+    same "capture the failure mode, don't hide it" philosophy as every
+    other function in this file. Steps after a failure are skipped (there's
+    nothing meaningful left to click/fill once an earlier step didn't
+    happen), but the function always returns a result, never raises for
+    anything short of the whole page failing to load at all.
+    """
+    acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
+    if not acquired:
+        raise RuntimeError(
+            f"too many concurrent checks (max {MAX_CONCURRENT_CHECKS}) — "
+            f"timed out after {SLOT_WAIT_TIMEOUT_SECONDS}s waiting for a free slot"
+        )
+    try:
+        with sync_playwright() as pw:
+            browser, context = _new_browser_and_context(pw, user_agent=_apple_user_agent_for)
+            try:
+                page = context.new_page()
+
+                diagnostics: dict = {
+                    "goto_status": None,
+                    "goto_error": None,
+                    "pickup_details_wait_timed_out": None,
+                    "trigger_data_autom": None,
+                    "trigger_click_error": None,
+                    "overlay_wait_timed_out": None,
+                    "zip_fill_error": None,
+                    "continue_click_error": None,
+                    "results_wait_timed_out": None,
+                    "extract_error": None,
+                }
+
+                try:
+                    main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                    if main_response is not None:
+                        diagnostics["goto_status"] = main_response.status
+                except Exception as exc:
+                    diagnostics["goto_error"] = str(exc)
+                    logger.error(f"[debug-pickup-flow] page.goto failed for {url}: {exc}")
+
+                if diagnostics["goto_error"] is None:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                    except Exception:
+                        pass  # best-effort, same as every other endpoint here
+                    try:
+                        page.wait_for_selector('[data-autom="pickUpDetails"]', timeout=10000)
+                        diagnostics["pickup_details_wait_timed_out"] = False
+                    except PlaywrightTimeoutError:
+                        diagnostics["pickup_details_wait_timed_out"] = True
+                        logger.info(f"[debug-pickup-flow] pickUpDetails never appeared within 10s for {url}")
+                    except Exception as exc:
+                        diagnostics["pickup_details_wait_timed_out"] = True
+                        logger.warning(f"[debug-pickup-flow] pickUpDetails wait raised for {url}: {exc}")
+                    page.wait_for_timeout(3000)
+
+                    # Step 1: click the "Check availability" trigger.
+                    try:
+                        trigger = page.locator(_PICKUP_TRIGGER_SELECTOR).first
+                        trigger.wait_for(timeout=10000)
+                        diagnostics["trigger_data_autom"] = trigger.get_attribute("data-autom")
+                        trigger.click(timeout=5000)
+                    except Exception as exc:
+                        diagnostics["trigger_click_error"] = str(exc)
+                        logger.error(f"[debug-pickup-flow] trigger click failed for {url}: {exc}")
+
+                    # Step 2: wait for the overlay to appear.
+                    if diagnostics["trigger_click_error"] is None:
+                        try:
+                            page.wait_for_selector(_PICKUP_OVERLAY_SELECTOR, timeout=10000)
+                        except PlaywrightTimeoutError:
+                            diagnostics["overlay_wait_timed_out"] = True
+                            logger.info(f"[debug-pickup-flow] overlay never appeared within 10s for {url}")
+                        except Exception as exc:
+                            diagnostics["overlay_wait_timed_out"] = True
+                            logger.warning(f"[debug-pickup-flow] overlay wait raised for {url}: {exc}")
+
+                    # Step 3: fill the zipCode input.
+                    if diagnostics["trigger_click_error"] is None:
+                        try:
+                            zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
+                            zip_input.wait_for(timeout=8000)
+                            zip_input.fill(pincode)
+                        except Exception as exc:
+                            diagnostics["zip_fill_error"] = str(exc)
+                            logger.error(f"[debug-pickup-flow] zipCode fill failed for {url}: {exc}")
+
+                    # Step 4: click Continue.
+                    if diagnostics["trigger_click_error"] is None and diagnostics["zip_fill_error"] is None:
+                        try:
+                            continue_btn = page.locator(_PICKUP_CONTINUE_SELECTOR).first
+                            continue_btn.wait_for(timeout=5000)
+                            continue_btn.click(timeout=5000)
+                        except Exception as exc:
+                            diagnostics["continue_click_error"] = str(exc)
+                            logger.error(f"[debug-pickup-flow] continuePickUp click failed for {url}: {exc}")
+
+                    # Step 5: wait for the results to load in the overlay.
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                    except PlaywrightTimeoutError:
+                        diagnostics["results_wait_timed_out"] = True
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(4000)
+
+                # Full overlay markup — the actual point of this endpoint.
+                overlay_html = None
+                try:
+                    overlay_html = page.evaluate(
+                        """(selector) => {
+                            const el = document.querySelector(selector);
+                            if (!el) return null;
+                            const html = el.outerHTML || '';
+                            return html.length > 8000 ? html.slice(0, 8000) + '...(truncated)' : html;
+                        }""",
+                        _PICKUP_OVERLAY_SELECTOR,
+                    )
+                except Exception as exc:
+                    diagnostics["extract_error"] = str(exc)
+                    logger.error(f"[debug-pickup-flow] overlay extraction failed for {url}: {exc}")
+
+                result = {
+                    "page_title": None, "data_autom_elements": [],
+                    "pincode_like_inputs": [], "pickup_related_buttons": [],
+                    "pickup_details_html": [], "pickup_details_clickables": [],
+                }
+                try:
+                    result = page.evaluate(_DOM_CAPTURE_JS)
+                except Exception as exc:
+                    diagnostics["extract_error"] = f"{diagnostics.get('extract_error') or ''}; dom_capture: {exc}".lstrip("; ")
+                    logger.error(f"[debug-pickup-flow] DOM capture failed for {url}: {exc}")
+
+                logger.info(f"[debug-pickup-flow] {url} pincode={pincode!r}: diagnostics={diagnostics}")
+                return {**result, "overlay_html": overlay_html, "diagnostics": diagnostics}
+            finally:
+                browser.close()
+    finally:
+        _check_semaphore.release()
+
+
+# ---------------------------------------------------------------------------
 # /refresh-apple-cookies: launch a real headless-Chromium session, load an
 # Apple product page, and trigger the SAME fulfillment-messages request a
 # real visitor's own pickup-availability check performs — from INSIDE the
@@ -1369,6 +1565,22 @@ def create_app() -> Flask:
             return jsonify({"url": url, "error": str(exc)}), 502
 
         return jsonify({"url": url, **result}), 200
+
+    @app.route("/debug-pickup-flow", methods=["POST"])
+    def debug_pickup_flow():
+        data = request.get_json(silent=True) or {}
+        url = (data.get("url") or "").strip()
+        pincode = (data.get("pincode") or "").strip() or DEFAULT_DEBUG_PINCODE
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+
+        try:
+            result = _capture_pickup_flow(url, pincode)
+        except Exception as exc:
+            logger.error(f"[debug-pickup-flow] failed for {url}: {exc}")
+            return jsonify({"url": url, "pincode": pincode, "error": str(exc)}), 502
+
+        return jsonify({"url": url, "pincode": pincode, **result}), 200
 
     @app.route("/refresh-apple-cookies", methods=["POST"])
     def refresh_apple_cookies():
