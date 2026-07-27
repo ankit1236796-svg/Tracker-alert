@@ -98,6 +98,7 @@ import os
 import re
 import threading
 import time
+from typing import Callable
 from urllib.parse import urlencode, urlparse
 
 from bs4 import BeautifulSoup
@@ -214,20 +215,46 @@ _REALISTIC_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
-# Apple-specific override, used ONLY by _refresh_apple_cookies below — NOT
-# _REALISTIC_USER_AGENT above, which every OTHER browser this service
-# launches still uses unchanged (RelianceDigital/BigBasket/Zepto/Blinkit
-# checks, /check-stock, /debug-network). Copied byte-for-byte from a real,
-# confirmed-working Apple fulfillment-messages request captured via Chrome
-# DevTools (2026-07-27) — kept in sync with checkers/apple.py's own
-# _SEC_CH_UA constant, since a real browser's User-Agent and its
-# sec-ch-ua Client Hints headers must describe the same browser or the
-# mismatch is itself a detectable inconsistency. See checkers/apple.py's
-# "PARAM SET / HEADER HISTORY, PART 2" note for the full story.
-_APPLE_REALISTIC_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
-)
+
+
+def _apple_user_agent_for(browser) -> str:
+    """
+    Apple-specific User-Agent, used ONLY by _refresh_apple_cookies below —
+    NOT _REALISTIC_USER_AGENT above, which every OTHER browser this
+    service launches still uses unchanged (RelianceDigital/BigBasket/
+    Zepto/Blinkit checks, /check-stock, /debug-network).
+
+    2026-07-27 UPDATE: the Chrome/Edge VERSION here is now DERIVED from
+    `browser.version` (the real, actually-running Chromium build's own
+    reported version) rather than a hardcoded string. Original version:
+    the Dockerfile's Playwright image sat pinned at v1.47.0 (Chromium
+    129, Sept 2024) unchanged since this service was built, while this
+    constant hardcoded "Chrome/150.0.0.0 ... Edg/150.0.0.0" — copied from
+    a real captured working request — creating a growing, detectable
+    engine-vs-claimed-identity mismatch: the TLS/JA3 fingerprint, HTTP/2
+    behavior, and JS feature surface all still reflected the real frozen
+    Chromium 129 engine no matter what the header claimed. Deriving the
+    version here means bumping the Dockerfile's image tag in the future
+    automatically keeps this claim honest, with no separate hardcoded
+    number to remember to update. Still a custom desktop-shaped UA
+    string, not the browser's own raw default (which announces
+    "HeadlessChrome" — a strong, well-known bot signal real desktop
+    browsers never send) — keeps the Edge-branded template from the real
+    working capture, just with an always-accurate version number.
+
+    checkers/apple.py's own sec-ch-ua header (sent later, on the bot
+    service's httpx replay of whatever session this mints) derives its
+    version the same way — from the User-Agent string actually being
+    sent, not a second hardcoded constant — see its _sec_ch_ua_for.
+    """
+    chrome_version = browser.version  # e.g. "131.0.6778.85" — real, not guessed
+    major = chrome_version.split(".")[0]
+    return (
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36 Edg/{major}.0.0.0"
+    )
+
+
 _STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 window.chrome = window.chrome || { runtime: {} };
@@ -244,17 +271,25 @@ if (originalQuery) {
 """
 
 
-def _new_browser_and_context(pw, user_agent: str = _REALISTIC_USER_AGENT):
+def _new_browser_and_context(pw, user_agent: str | Callable[[object], str] = _REALISTIC_USER_AGENT):
     """Launch a browser + context with the anti-detection measures above —
     shared by _render_page (/check-stock), _capture_network_calls
     (/debug-network), and _refresh_apple_cookies (with its own
-    _APPLE_REALISTIC_USER_AGENT override) so all three get the same
-    defenses, not just whichever endpoint happened to be under
-    investigation when this was added."""
+    _apple_user_agent_for override) so all three get the same defenses,
+    not just whichever endpoint happened to be under investigation when
+    this was added.
+
+    `user_agent` may be a plain string (every caller except the Apple
+    refresh) or a callable taking the just-launched Browser and returning
+    a string (_apple_user_agent_for) — the browser instance has to exist
+    before its own real version can be read, so a callable is invoked
+    AFTER launch but before the context (and therefore the UA) is
+    created."""
     browser = pw.chromium.launch(headless=HEADLESS, proxy=_proxy_config())
+    resolved_user_agent = user_agent(browser) if callable(user_agent) else user_agent
     context = browser.new_context(
         viewport={"width": 1280, "height": 800},
-        user_agent=user_agent,
+        user_agent=resolved_user_agent,
         locale="en-US",
     )
     context.add_init_script(_STEALTH_INIT_SCRIPT)
@@ -723,7 +758,7 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
         )
     try:
         with sync_playwright() as pw:
-            browser, context = _new_browser_and_context(pw, user_agent=_APPLE_REALISTIC_USER_AGENT)
+            browser, context = _new_browser_and_context(pw, user_agent=_apple_user_agent_for)
             try:
                 page = context.new_page()
                 # NO resource blocker here (unlike /check-stock and
@@ -851,7 +886,12 @@ def _refresh_apple_cookies(url: str, pincode: str) -> dict:
 
                 return {
                     "cookies": cookie_header,
-                    "user_agent": _APPLE_REALISTIC_USER_AGENT,
+                    # Recomputed from the same (already-launched) browser
+                    # instance rather than a stored constant — a pure,
+                    # deterministic function of browser.version, so this
+                    # is guaranteed identical to whatever was actually
+                    # applied to the context above.
+                    "user_agent": _apple_user_agent_for(browser),
                     "pincode_check_confirmed": pincode_check_confirmed,
                     "diagnostics": diagnostics,
                 }

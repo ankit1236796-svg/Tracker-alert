@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 import time
 
 import httpx
@@ -18,6 +19,8 @@ from config import (
     APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED, APPLE_PICKUP_CHECK_INTERVAL,
     PLAYWRIGHT_SCRAPER_URL, PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN, APPLE_COOKIE_REFRESH_INTERVAL,
     APPLE_COOKIE_REFRESH_PRODUCT_URL, APPLE_COOKIE_REFRESH_PINCODE, CROMA_CHECK_INTERVAL,
+    APPLE_COOKIE_REFRESH_MAX_ATTEMPTS, APPLE_COOKIE_REFRESH_RETRY_DELAY_MIN_SECONDS,
+    APPLE_COOKIE_REFRESH_RETRY_DELAY_MAX_SECONDS,
 )
 from database import (
     init_db,
@@ -718,20 +721,13 @@ async def stock_checker_loop(bot: Bot):
 # share timing with CHECK_INTERVAL or APPLE_PICKUP_CHECK_INTERVAL.
 # ---------------------------------------------------------------------------
 
-async def run_apple_cookie_refresh_cycle() -> bool:
-    """
-    One refresh attempt: POSTs to playwright_scraper's
-    /refresh-apple-cookies, and on success stores the returned cookies +
-    User-Agent via database.set_apple_session_cookies. Returns True on a
-    successful refresh, False otherwise. Never raises — a Playwright crash,
-    a network error, or the service being down/misconfigured all just mean
-    this cycle's refresh didn't happen; whatever session is already stored
-    (or the APPLE_COOKIES/APPLE_USER_AGENT env var fallback) keeps serving
-    fast checks in the meantime.
-    """
-    if not PLAYWRIGHT_SCRAPER_URL:
-        return False
-
+async def _request_apple_cookie_refresh() -> dict | None:
+    """One POST to playwright_scraper's /refresh-apple-cookies. Returns the
+    parsed response dict on any response carrying usable (non-empty)
+    cookies + user_agent, else None — network errors, non-200 status,
+    non-JSON bodies, and missing cookies/user_agent are all logged here
+    and collapsed to None so run_apple_cookie_refresh_cycle's retry loop
+    has one simple thing to check. Never raises."""
     headers = {}
     if PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN:
         headers["X-Internal-Token"] = PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN
@@ -748,20 +744,20 @@ async def run_apple_cookie_refresh_cycle() -> bool:
             )
     except Exception as exc:
         logger.warning(f"[apple][cookie-refresh] request to playwright_scraper failed: {exc}")
-        return False
+        return None
 
     if resp.status_code != 200:
         logger.warning(
             f"[apple][cookie-refresh] playwright_scraper returned HTTP "
             f"{resp.status_code}: {resp.text[:300]!r}"
         )
-        return False
+        return None
 
     try:
         data = resp.json()
     except Exception as exc:
         logger.warning(f"[apple][cookie-refresh] non-JSON response from playwright_scraper: {exc}")
-        return False
+        return None
 
     cookies = (data.get("cookies") or "").strip()
     user_agent = (data.get("user_agent") or "").strip()
@@ -770,13 +766,84 @@ async def run_apple_cookie_refresh_cycle() -> bool:
             f"[apple][cookie-refresh] playwright_scraper response missing "
             f"cookies/user_agent: {data}"
         )
+        return None
+
+    return data
+
+
+async def run_apple_cookie_refresh_cycle() -> bool:
+    """
+    One refresh CYCLE — up to APPLE_COOKIE_REFRESH_MAX_ATTEMPTS calls to
+    _request_apple_cookie_refresh, stopping early the moment one comes
+    back with pincode_check_confirmed=True (the strongest available
+    signal that Akamai actually cleared this specific session; see
+    checkers/apple.py's investigation notes on why headers/params/UA
+    alone don't guarantee a working session — this turned out to be
+    genuinely probabilistic per-attempt, not deterministic).
+
+    If NONE of the attempts confirm, the LAST usable (cookies+UA
+    non-empty) attempt is still stored — matching the ORIGINAL single-
+    attempt behavior as a floor, so a run of bad luck never leaves the DB
+    session stale for the rest of APPLE_COOKIE_REFRESH_INTERVAL — but only
+    after genuinely trying to do better first, not settling for whatever
+    the first attempt produced regardless.
+
+    A randomized delay is inserted BETWEEN attempts (not just relying on
+    each attempt's own ~15-30s browser-launch-and-dwell duration) —
+    repeated rapid page loads from the same IP/session in a tight burst
+    is itself a bot signal, so retrying too aggressively could make
+    Akamai's assessment WORSE, not better (see
+    checkers.apple.check_pickup_at_official_stores's own pincode-delay
+    reasoning, applied here for the same reason).
+
+    Returns True if ANY attempt produced a usable session that got
+    stored (confirmed or not); False only if every attempt failed
+    outright (no usable cookies/user_agent from any of them) — same
+    external contract as before, callers don't need to change.
+    """
+    if not PLAYWRIGHT_SCRAPER_URL:
         return False
 
-    set_apple_session_cookies(cookies, user_agent)
+    best_result: dict | None = None
+    for attempt in range(1, APPLE_COOKIE_REFRESH_MAX_ATTEMPTS + 1):
+        data = await _request_apple_cookie_refresh()
+        if data is None:
+            logger.warning(
+                f"[apple][cookie-refresh] attempt {attempt}/{APPLE_COOKIE_REFRESH_MAX_ATTEMPTS} "
+                f"produced no usable session"
+            )
+        else:
+            best_result = data  # a usable floor, even if not confirmed
+            if data.get("pincode_check_confirmed"):
+                logger.info(
+                    f"[apple][cookie-refresh] attempt {attempt}/{APPLE_COOKIE_REFRESH_MAX_ATTEMPTS} "
+                    f"confirmed (pincode_check_confirmed=True) — using this session, no further attempts needed."
+                )
+                break
+            logger.info(
+                f"[apple][cookie-refresh] attempt {attempt}/{APPLE_COOKIE_REFRESH_MAX_ATTEMPTS} "
+                f"NOT confirmed (pincode_check_confirmed=False)"
+            )
+
+        if attempt < APPLE_COOKIE_REFRESH_MAX_ATTEMPTS:
+            delay = random.uniform(
+                APPLE_COOKIE_REFRESH_RETRY_DELAY_MIN_SECONDS, APPLE_COOKIE_REFRESH_RETRY_DELAY_MAX_SECONDS
+            )
+            logger.info(f"[apple][cookie-refresh] retrying in {delay:.1f}s...")
+            await asyncio.sleep(delay)
+
+    if best_result is None:
+        logger.warning(
+            f"[apple][cookie-refresh] all {APPLE_COOKIE_REFRESH_MAX_ATTEMPTS} attempts failed outright — "
+            f"DB session left unchanged."
+        )
+        return False
+
+    set_apple_session_cookies(best_result["cookies"].strip(), best_result["user_agent"].strip())
     logger.info(
         f"[apple][cookie-refresh] stored a freshly-refreshed Apple session "
-        f"(pincode_check_confirmed={data.get('pincode_check_confirmed')}, "
-        f"diagnostics={data.get('diagnostics')})"
+        f"(pincode_check_confirmed={best_result.get('pincode_check_confirmed')}, "
+        f"diagnostics={best_result.get('diagnostics')})"
     )
     return True
 
