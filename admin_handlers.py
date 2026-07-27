@@ -85,6 +85,8 @@ from database import (
     list_channel_forward_pickup,
     remove_channel_forward_pickup_by_id,
     remove_channel_forward_pickup_by_url,
+    get_channel_forward_pincodes,
+    set_channel_forward_pincodes,
 )
 import whatsapp_client
 import zyte_client
@@ -1360,6 +1362,38 @@ async def cmd_stopforwarding(message: Message, command: CommandObject):
         await message.answer("⚠️ That URL isn't in the forward list.")
 
 
+@router.message(Command("setchannelpincode"))
+async def cmd_setchannelpincode(message: Message, command: CommandObject):
+    """Sets the admin-wide default pincode(s) channel-forwarding uses for
+    pincode-dependent checkers (Croma, RelianceDigital, Apple's
+    refine_with_pincode) — see run_channel_forward_check_cycle in bot.py.
+    channel_forward_tracking rows have no owning user, so there's no
+    per-user pincode the way run_stock_check_cycle resolves one; this
+    command is the substitute. Mirrors /trackpickup's and
+    /addchannelpickup's multi-pincode parsing/validation exactly."""
+    usage = "Usage: <code>/setchannelpincode &lt;pincode1&gt; [pincode2] ... [pincode6]</code>"
+    if not command.args:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    pincodes = command.args.strip().split()
+    if not pincodes:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    for pincode in pincodes:
+        if not pincode.isdigit() or len(pincode) != 6:
+            await message.answer(f"⚠️ Invalid pincode: <code>{html.escape(pincode)}</code> (must be 6 digits).", parse_mode="HTML")
+            return
+
+    set_channel_forward_pincodes(pincodes)
+    await message.answer(
+        f"✅ Channel-forwarding will now use pincode(s) <code>{html.escape(', '.join(pincodes))}</code> "
+        f"for checks that need one (Croma, RelianceDigital, Apple pincode confirmation).",
+        parse_mode="HTML",
+    )
+
+
 @router.message(Command("addchannelpickup"))
 async def cmd_addchannelpickup(message: Message, command: CommandObject):
     usage = (
@@ -1585,6 +1619,33 @@ async def _apply_channel_forward_stock_result_now(
     return f"{status} — <b>{html.escape(row['name'])}</b>{price_str} [{get_site_label(row['site'])}]"
 
 
+async def _check_channel_forward_stock_row_now(row: dict, configured_pincodes: list[str]) -> tuple[bool | None, float | None]:
+    """/checkforwarding's own copy of bot.py's _check_channel_forward_
+    stock_row — same pincode-resolution logic (first configured pincode
+    for Croma/RelianceDigital, try every configured pincode for Apple,
+    pincode=None if nothing's configured yet), duplicated for the same
+    reason _apply_channel_forward_stock_result_now duplicates
+    _apply_result_to_channel_forward_row above (admin_handlers.py can't
+    import bot.py — circular)."""
+    if not configured_pincodes:
+        return await stock_checker.check_stock(row["url"], row["site"], pincode=None, caller="manual")
+
+    if row["site"] != "apple":
+        return await stock_checker.check_stock(
+            row["url"], row["site"], pincode=configured_pincodes[0], caller="manual"
+        )
+
+    now_in_stock: bool | None = None
+    current_price: float | None = None
+    for pincode in configured_pincodes:
+        now_in_stock, current_price = await stock_checker.check_stock(
+            row["url"], "apple", pincode=pincode, caller="manual"
+        )
+        if now_in_stock:
+            break
+    return now_in_stock, current_price
+
+
 @router.message(Command("checkforwarding"))
 async def cmd_checkforwarding(message: Message):
     """Live, on-demand check of every channel-forwarded product (stock +
@@ -1599,6 +1660,17 @@ async def cmd_checkforwarding(message: Message):
         await message.answer("📭 Nothing is currently set to forward.")
         return
 
+    configured_pincodes = get_channel_forward_pincodes()
+    if configured_pincodes:
+        pincode_line = f"📍 Configured pincode(s): <code>{html.escape(', '.join(configured_pincodes))}</code>"
+    else:
+        pincode_line = (
+            "⚠️ No pincode configured — Croma/RelianceDigital/Apple pincode-confirmation "
+            "checks will come back inconclusive. Run <code>/setchannelpincode &lt;pincode&gt;</code> "
+            "to fix this."
+        )
+    await message.answer(pincode_line, parse_mode="HTML")
+
     await message.answer(
         f"🔍 Checking {len(stock_rows)} stock item(s) and {len(pickup_rows)} "
         f"pickup item(s) now…"
@@ -1607,9 +1679,7 @@ async def cmd_checkforwarding(message: Message):
     lines: list[str] = []
     for row in stock_rows:
         try:
-            now_in_stock, current_price = await stock_checker.check_stock(
-                row["url"], row["site"], pincode=None, caller="manual",
-            )
+            now_in_stock, current_price = await _check_channel_forward_stock_row_now(row, configured_pincodes)
         except Exception as exc:
             lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> — check failed: {exc}")
             continue

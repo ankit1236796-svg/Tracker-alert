@@ -38,6 +38,7 @@ from database import (
     update_channel_forward_status,
     is_forwarding_paused,
     list_channel_forward_pickup,
+    get_channel_forward_pincodes,
 )
 from handlers import router
 from notifications import (
@@ -333,6 +334,62 @@ async def _apply_result_to_channel_forward_row(
         await send_channel_stock_alert(bot, channel["chat_id"], row, price=current_price)
 
 
+async def _check_channel_forward_stock_row(
+    row: dict, configured_pincodes: list[str],
+) -> tuple[bool | None, float | None]:
+    """
+    Resolves a pincode for one channel_forward_tracking row's check_stock
+    call from the admin-configured channel-forward pincodes (see
+    admin_handlers.py's /setchannelpincode) — the substitute for the
+    per-user pincode run_stock_check_cycle resolves via
+    get_user_primary_pincode, since these rows have no owning user.
+
+    No pincodes configured yet -> pincode=None, exactly today's existing
+    behavior (inconclusive for Croma/RelianceDigital/quick-commerce,
+    generic-page-only for Apple) — /setchannelpincode simply hasn't been
+    run yet.
+
+    Croma/RelianceDigital (and everything else) -> the FIRST configured
+    pincode only: their APIs answer "is this deliverable to THIS exact
+    address", a genuinely different question per pincode, so there's no
+    "try several" — one real pincode is all that's needed to stop coming
+    back inconclusive, and picking a second arbitrary one wouldn't make
+    the first any less valid.
+
+    Apple -> tries EVERY configured pincode in turn, stopping at the first
+    one that confirms in-stock. Unlike Croma/RelianceDigital,
+    checkers.apple.refine_with_pincode only ever CONFIRMS an already
+    in-stock generic-page result via nearby-store pickup availability —
+    it never downgrades — so trying multiple pincodes purely improves the
+    odds of catching a genuine confirmation instead of committing to
+    whichever pincode happens to be first. Each attempt's pincode/result
+    is logged so per-pincode availability is visible in Railway logs even
+    though channel_forward_tracking's schema only stores one boolean per
+    row (unlike channel_forward_pickup_tracking's own per-pincode dict).
+    """
+    if not configured_pincodes:
+        return await check_stock(row["url"], row["site"], pincode=None, caller="background")
+
+    if row["site"] != "apple":
+        return await check_stock(
+            row["url"], row["site"], pincode=configured_pincodes[0], caller="background"
+        )
+
+    now_in_stock: bool | None = None
+    current_price: float | None = None
+    for pincode in configured_pincodes:
+        now_in_stock, current_price = await check_stock(
+            row["url"], "apple", pincode=pincode, caller="background"
+        )
+        logger.info(
+            f"[channel-forward] #{row['id']} apple pincode={pincode!r} -> "
+            f"{'IN STOCK' if now_in_stock else ('OUT OF STOCK' if now_in_stock is False else 'INCONCLUSIVE')}"
+        )
+        if now_in_stock:
+            break
+    return now_in_stock, current_price
+
+
 async def run_channel_forward_check_cycle(bot: Bot) -> dict:
     """
     One check pass across every channel_forward_tracking row (stock) AND
@@ -349,15 +406,15 @@ async def run_channel_forward_check_cycle(bot: Bot) -> dict:
     keeping /listforwarding and /checkforwarding accurate even while
     forwarding is toggled off.
 
-    pincode is always None for the stock-side rows — channel_forward_
-    tracking rows have no owning user, so there's no per-user pincode to
-    resolve. Sites whose checker requires one (Apple, Croma,
-    RelianceDigital, quick-commerce) will come back inconclusive (None)
-    via check_stock's own existing "no pincode -> None" handling for
-    those sites — a known, accepted limitation of the current
-    channel-forwarding feature, not a bug; a future version could add a
-    configurable forward-pincode if that's needed. Pickup rows are
-    unaffected — they carry their own list of pincodes per row.
+    Stock-side rows resolve their pincode from the admin-configured
+    channel-forward pincode(s) (see /setchannelpincode and
+    _check_channel_forward_stock_row above) — channel_forward_tracking
+    rows have no owning user, so there's no per-user pincode to resolve
+    the way run_stock_check_cycle does. Until an admin configures one,
+    behavior is unchanged from before: pincode=None, inconclusive for
+    Croma/RelianceDigital/quick-commerce. Pickup rows are unaffected —
+    they carry their own list of pincodes per row, set at
+    /addchannelpickup time.
     """
     if is_service_paused():
         logger.info("[channel-forward] service globally paused — skipping this check cycle entirely")
@@ -365,15 +422,14 @@ async def run_channel_forward_check_cycle(bot: Bot) -> dict:
 
     rows = list_channel_forward_products()
     pickup_rows = list_channel_forward_pickup()
+    configured_pincodes = get_channel_forward_pincodes()
 
     sem = asyncio.Semaphore(10)
 
     async def _check_row(row: dict) -> None:
         async with sem:
             try:
-                now_in_stock, current_price = await check_stock(
-                    row["url"], row["site"], pincode=None, caller="background"
-                )
+                now_in_stock, current_price = await _check_channel_forward_stock_row(row, configured_pincodes)
             except Exception as exc:
                 logger.error(f"[channel-forward] error checking #{row['id']} url={row['url']!r}: {exc}")
                 return
@@ -877,6 +933,7 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="setchannel",     description="[admin] Register the channel for forwarded stock alerts"),
         BotCommand(command="addchannel",     description="[admin] Forward a product's stock alerts to the channel"),
         BotCommand(command="stopforwarding", description="[admin] Stop forwarding a product to the channel"),
+        BotCommand(command="setchannelpincode",    description="[admin] Set default pincode(s) for channel-forward checks"),
         BotCommand(command="addchannelpickup",     description="[admin] Forward Apple pickup alerts to the channel"),
         BotCommand(command="stopforwardingpickup", description="[admin] Stop forwarding a pickup item to the channel"),
         BotCommand(command="listforwarding", description="[admin] List everything forwarding to the channel"),

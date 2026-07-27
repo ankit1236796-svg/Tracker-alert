@@ -476,6 +476,32 @@ def init_db():
         )
         conn.commit()
 
+        # Admin-configured default pincode(s) for the channel-forwarding
+        # system (see admin_handlers.py's /setchannelpincode and bot.py's
+        # run_channel_forward_check_cycle). channel_forward_tracking/
+        # channel_forward_pickup_tracking rows have no owning user, so
+        # there's no per-user pincode (unlike run_stock_check_cycle's own
+        # get_user_primary_pincode lookup) to feed pincode-dependent
+        # checkers (Croma, RelianceDigital, Apple's refine_with_pincode) —
+        # this is the admin-wide substitute. Single global row (id fixed
+        # at 1), same "one row" shape as forward_channel/forwarding_status
+        # above — there's only ever one channel, so only one set of
+        # forwarding pincodes makes sense. pincodes is a JSON-encoded list
+        # of strings, same encoding as pickup_tracking.pincodes; empty
+        # list ('[]') means "not configured yet", preserving today's
+        # existing pincode=None/inconclusive behavior until an admin runs
+        # /setchannelpincode.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_forward_pincode_config (
+                id       INTEGER PRIMARY KEY CHECK (id = 1),
+                pincodes TEXT    NOT NULL DEFAULT '[]'
+            )
+        """)
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_forward_pincode_config (id, pincodes) VALUES (1, '[]')"
+        )
+        conn.commit()
+
         # Apple pickup-availability channel-forwarding — the pickup sibling
         # of channel_forward_tracking above (see admin_handlers.py's
         # /addchannelpickup, /stopforwardingpickup, and checkers/apple.py's
@@ -810,6 +836,32 @@ def set_forwarding_paused(paused: bool) -> dict:
         )
         conn.commit()
     return {"paused": paused, "paused_at": paused_at}
+
+
+def get_channel_forward_pincodes() -> list[str]:
+    """The admin-configured default pincode(s) for channel-forwarding (see
+    admin_handlers.py's /setchannelpincode) — [] if never configured, in
+    which case callers should preserve today's existing pincode=None
+    behavior for pincode-dependent checkers."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT pincodes FROM channel_forward_pincode_config WHERE id = 1"
+        ).fetchone()
+    if row is None:
+        return []
+    try:
+        return json.loads(row["pincodes"])
+    except (TypeError, ValueError):
+        return []
+
+
+def set_channel_forward_pincodes(pincodes: list[str]) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE channel_forward_pincode_config SET pincodes = ? WHERE id = 1",
+            (json.dumps(pincodes),),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
