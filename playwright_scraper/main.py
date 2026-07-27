@@ -55,6 +55,18 @@ HTTP surface:
                         For admin diagnostic use (e.g. RelianceDigital's
                         /debugreliance) — hit directly, no auth (matches
                         /check-stock; this whole service has none).
+  POST /debug-dom       Body: {"url": str}. _capture_network_calls' sibling
+                        for DOM STRUCTURE discovery instead of network
+                        traffic (see _capture_dom_elements) — loads the
+                        page, waits for it to settle, then returns every
+                        element whose data-autom/text/attributes mention
+                        pickup, fulfillment, store, zip, pincode, or
+                        location. Returns {"url", "page_title",
+                        "data_autom_elements", "pincode_like_inputs",
+                        "pickup_related_buttons", "diagnostics"}. Built for
+                        the 2026-07-27 Apple pickup-widget selector
+                        discovery (see checkers/apple.py's investigation
+                        notes) — no auth, same as every other endpoint here.
   POST /refresh-apple-cookies
                         Body: {"url": str (an apple.com/<locale>/shop/...
                         product page), "pincode": str}. Loads the page in a
@@ -286,7 +298,23 @@ def _new_browser_and_context(pw, user_agent: str | Callable[[object], str] = _RE
     before its own real version can be read, so a callable is invoked
     AFTER launch but before the context (and therefore the UA) is
     created."""
-    browser = pw.chromium.launch(headless=HEADLESS, proxy=_proxy_config())
+    # --disable-blink-features=AutomationControlled (2026-07-27, found via
+    # a working third-party Apple pickup monitor's own config — see
+    # checkers/apple.py's investigation notes) — blocks the CDP-automation
+    # signal at the browser-launch level, BEFORE any page ever loads.
+    # Different from (and stronger than) _STEALTH_INIT_SCRIPT's
+    # navigator.webdriver override below: that patches a JS property
+    # AFTER a real browser already set it true, which some fingerprinting
+    # can detect as a patched getter; this flag stops Chromium from ever
+    # setting the underlying automation flag in the first place. Applied
+    # to every browser this service launches (not just Apple) — a
+    # systemic defense, not site-specific, same reasoning as every other
+    # measure in this function.
+    browser = pw.chromium.launch(
+        headless=HEADLESS,
+        proxy=_proxy_config(),
+        args=["--disable-blink-features=AutomationControlled"],
+    )
     resolved_user_agent = user_agent(browser) if callable(user_agent) else user_agent
     context = browser.new_context(
         viewport={"width": 1280, "height": 800},
@@ -641,6 +669,168 @@ def _capture_network_calls(url: str, pincode: str) -> dict:
                     "all_responses_truncated": len(all_seen) > _MAX_ALL_SEEN_REPORTED,
                     "diagnostics": diagnostics,
                 }
+            finally:
+                browser.close()
+    finally:
+        _check_semaphore.release()
+
+
+# ---------------------------------------------------------------------------
+# /debug-dom: _capture_network_calls' sibling for DOM STRUCTURE discovery
+# rather than network traffic — built specifically to find Apple's real
+# pincode/pickup-availability widget selectors (2026-07-27 investigation:
+# fulfillment-messages never gets a validated Akamai session no matter
+# what's sent to it, so the plan shifted to reading the RENDERED PAGE
+# instead of replaying an API call — see checkers/apple.py's own notes).
+# Neither this sandbox's own outbound fetches (WebFetch) nor the Wayback
+# Machine can reach apple.com at all (both blocked outright), so real
+# selectors can only come from THIS service's own already-working
+# Playwright browser actually loading the page — same reasoning as
+# _capture_network_calls existing for RelianceDigital's serviceability
+# call instead of guessing at it, and the exact same "verify empirically,
+# don't guess" lesson this investigation already learned once with the
+# fulfillment-messages param set. Keyword-filtered rather than dumping
+# the full DOM (which would be enormous and mostly noise) — every element
+# whose data-autom/text/attributes mention pickup, fulfillment, store,
+# zip, pincode, or location, since those are the only parts of the page
+# actually relevant to this investigation.
+# ---------------------------------------------------------------------------
+_DOM_CAPTURE_JS = """() => {
+    function truncate(s, n) {
+        if (!s) return s;
+        s = s.trim().replace(/\\s+/g, ' ');
+        return s.length > n ? s.slice(0, n) + '...' : s;
+    }
+    function matchesKeywords(parts) {
+        const joined = parts.filter(Boolean).join(' ');
+        return /pickup|pick up|fulfil|store|location|zip|pin ?code/i.test(joined);
+    }
+
+    const dataAutomElements = Array.from(document.querySelectorAll('[data-autom]'))
+        .map(el => ({
+            tag: el.tagName.toLowerCase(),
+            data_autom: el.getAttribute('data-autom'),
+            text: truncate(el.textContent || '', 120),
+            aria_label: el.getAttribute('aria-label'),
+            aria_disabled: el.getAttribute('aria-disabled'),
+        }))
+        .filter(e => matchesKeywords([e.data_autom, e.text, e.aria_label]))
+        .slice(0, 60);
+
+    const pincodeLikeInputs = Array.from(document.querySelectorAll('input'))
+        .map(el => ({
+            placeholder: el.placeholder || null,
+            aria_label: el.getAttribute('aria-label'),
+            name: el.name || null,
+            id: el.id || null,
+            type: el.type || null,
+            data_autom: el.getAttribute('data-autom'),
+        }))
+        .filter(e => matchesKeywords([e.placeholder, e.aria_label, e.name, e.id, e.data_autom]))
+        .slice(0, 30);
+
+    const pickupRelatedButtons = Array.from(document.querySelectorAll('button, a[role="button"], a'))
+        .map(el => ({
+            tag: el.tagName.toLowerCase(),
+            data_autom: el.getAttribute('data-autom'),
+            text: truncate(el.textContent || '', 80),
+            aria_label: el.getAttribute('aria-label'),
+        }))
+        .filter(e => matchesKeywords([e.data_autom, e.text, e.aria_label]))
+        .slice(0, 40);
+
+    return {
+        page_title: document.title,
+        data_autom_elements: dataAutomElements,
+        pincode_like_inputs: pincodeLikeInputs,
+        pickup_related_buttons: pickupRelatedButtons,
+    };
+}"""
+
+
+def _capture_dom_elements(url: str) -> dict:
+    """Launch an isolated browser, load `url`, wait for it to settle, then
+    run _DOM_CAPTURE_JS to pull out every keyword-matching element — see
+    the module note above for why this exists. Uses _apple_user_agent_for
+    when `url` is an apple.com page (matching what production would
+    actually send), the default _REALISTIC_USER_AGENT otherwise, same as
+    every other endpoint in this file.
+
+    Every step that can silently fail (navigation, the network-idle wait,
+    the DOM extraction itself) is captured into "diagnostics" rather than
+    left to fail invisibly — mirrors _capture_network_calls' own
+    reasoning exactly."""
+    acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
+    if not acquired:
+        raise RuntimeError(
+            f"too many concurrent checks (max {MAX_CONCURRENT_CHECKS}) — "
+            f"timed out after {SLOT_WAIT_TIMEOUT_SECONDS}s waiting for a free slot"
+        )
+    try:
+        with sync_playwright() as pw:
+            is_apple = "apple.com" in urlparse(url).netloc.lower()
+            browser, context = _new_browser_and_context(
+                pw, user_agent=_apple_user_agent_for if is_apple else _REALISTIC_USER_AGENT,
+            )
+            try:
+                page = context.new_page()
+
+                diagnostics: dict = {
+                    "goto_status": None,
+                    "goto_error": None,
+                    "final_url": None,
+                    "page_title": None,
+                    "networkidle_timed_out": False,
+                    "networkidle_error": None,
+                    "extract_error": None,
+                }
+
+                try:
+                    main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                    if main_response is not None:
+                        diagnostics["goto_status"] = main_response.status
+                except Exception as exc:
+                    diagnostics["goto_error"] = str(exc)
+                    logger.error(f"[debug-dom] page.goto failed for {url}: {exc}")
+
+                try:
+                    diagnostics["final_url"] = page.url
+                    diagnostics["page_title"] = page.title()
+                except Exception as exc:
+                    logger.error(f"[debug-dom] could not read final_url/page_title for {url}: {exc}")
+
+                if diagnostics["goto_error"] is None:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                    except PlaywrightTimeoutError:
+                        diagnostics["networkidle_timed_out"] = True
+                        logger.info(f"[debug-dom] networkidle wait timed out for {url}")
+                    except Exception as exc:
+                        diagnostics["networkidle_error"] = str(exc)
+                        logger.error(f"[debug-dom] networkidle wait raised for {url}: {exc}")
+
+                # Same dwell as the reference implementation that inspired
+                # this whole investigation used (3s) — enough for the page's
+                # own JS to finish rendering pickup-availability state.
+                page.wait_for_timeout(3000)
+
+                result = {
+                    "page_title": None, "data_autom_elements": [],
+                    "pincode_like_inputs": [], "pickup_related_buttons": [],
+                }
+                try:
+                    result = page.evaluate(_DOM_CAPTURE_JS)
+                except Exception as exc:
+                    diagnostics["extract_error"] = str(exc)
+                    logger.error(f"[debug-dom] DOM extraction failed for {url}: {exc}")
+
+                logger.info(
+                    f"[debug-dom] {url}: {len(result.get('data_autom_elements', []))} data-autom "
+                    f"match(es), {len(result.get('pincode_like_inputs', []))} input match(es), "
+                    f"{len(result.get('pickup_related_buttons', []))} button match(es); "
+                    f"diagnostics={diagnostics}"
+                )
+                return {**result, "diagnostics": diagnostics}
             finally:
                 browser.close()
     finally:
@@ -1009,6 +1199,21 @@ def create_app() -> Flask:
             return jsonify({"url": url, "pincode": pincode, "error": str(exc)}), 502
 
         return jsonify({"url": url, "pincode": pincode, **result}), 200
+
+    @app.route("/debug-dom", methods=["POST"])
+    def debug_dom():
+        data = request.get_json(silent=True) or {}
+        url = (data.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+
+        try:
+            result = _capture_dom_elements(url)
+        except Exception as exc:
+            logger.error(f"[debug-dom] failed for {url}: {exc}")
+            return jsonify({"url": url, "error": str(exc)}), 502
+
+        return jsonify({"url": url, **result}), 200
 
     @app.route("/refresh-apple-cookies", methods=["POST"])
     def refresh_apple_cookies():
