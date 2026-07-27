@@ -634,7 +634,16 @@ def _fulfillment_messages_url(product_url: str, sku: str, pincode: str) -> str |
     from the product URL itself (".../in/shop/buy-iphone/..." -> "/in/shop/
     fulfillment-messages") rather than hardcoding "/in/", so this works for
     any Apple storefront locale. Returns None if the product URL doesn't
-    look like an apple.com /shop/ page at all."""
+    look like an apple.com /shop/ page at all.
+
+    Param set verified 2026-07-27 against a live Chrome DevTools capture of
+    a working request — see checkers/apple.py's _build_fulfillment_target
+    for the full story: `little`/`mts.1`/`fts` are gone from Apple's
+    current frontend request, replaced by `pl=true`. Keeping this in sync
+    with that function matters here specifically — this URL is what
+    pincode_check_confirmed's own validation probe below fetches, so a
+    stale param set here would keep reporting "unconfirmed" even after the
+    real checker in checkers/apple.py is fixed."""
     parsed = urlparse(product_url)
     segments = [s for s in parsed.path.split("/") if s]
     if "shop" not in segments:
@@ -643,8 +652,8 @@ def _fulfillment_messages_url(product_url: str, sku: str, pincode: str) -> str |
     locale_prefix = "/".join(segments[:shop_idx])
     path = f"/{locale_prefix}/shop/fulfillment-messages" if locale_prefix else "/shop/fulfillment-messages"
     params = {
-        "fae": "true", "location": pincode, "little": "false",
-        "parts.0": sku, "mts.0": "regular", "mts.1": "sticky", "fts": "true",
+        "fae": "true", "pl": "true", "mts.0": "regular",
+        "parts.0": sku, "location": pincode,
     }
     return f"{parsed.scheme}://{parsed.netloc}{path}?{urlencode(params)}"
 

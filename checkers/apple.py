@@ -193,14 +193,21 @@ def _extract_sku(soup: BeautifulSoup, html: str) -> str | None:
 
 
 def _build_fulfillment_target(sku: str, pincode: str) -> str:
+    # Param set verified 2026-07-27 against a live Chrome DevTools capture
+    # of a real, working fulfillment-messages request (see the "PARAM SET
+    # HISTORY" note above _cookie_auth_fetch below) — `little`, `mts.1`,
+    # and `fts` are gone from Apple's current frontend request entirely,
+    # and a new `pl=true` param appeared in their place. The OLD param set
+    # below (little/mts.1/fts, no pl) consistently 541'd ("Page Not
+    # Found") even with a valid, freshly-refreshed session and a real,
+    # currently-listed SKU — this is what actually fixed it, not a
+    # cookie/header problem.
     params = {
         "fae": "true",
-        "location": pincode,
-        "little": "false",
-        "parts.0": sku,
+        "pl": "true",
         "mts.0": "regular",
-        "mts.1": "sticky",
-        "fts": "true",
+        "parts.0": sku,
+        "location": pincode,
     }
     return f"{_FULFILLMENT_URL}?{urlencode(params)}"
 
@@ -294,9 +301,32 @@ def _resolve_apple_session() -> tuple[str, str, str]:
     return user_agent, cookies, "env"
 
 
+# PARAM SET / HEADER HISTORY, PART 2 (2026-07-27) — worth keeping next to
+# the HEADER HISTORY note above: after the Jul 25 header fix, this endpoint
+# started 541'ing ("Page Not Found") again — same status/body as the
+# original incident, but this time the SKU/pincode/cookies were all
+# confirmed correct (byte-identical extracted SKU vs. request parts.0;
+# fails identically across multiple SKUs and pincodes; fails even for the
+# refresh loop's own in-page fetch executed by a real, freshly-authenticated
+# Chromium session — ruling out a session-freshness or per-page cookie-
+# affinity explanation). A live Chrome DevTools "Copy as cURL" capture of a
+# genuinely working request revealed the actual cause: Apple's frontend no
+# longer sends `little`/`mts.1`/`fts` at all, and now sends `pl=true`
+# instead — see _build_fulfillment_target's own comment. The captured
+# request's Referer was also the SPECIFIC product variant page, not this
+# module's old hardcoded generic "https://www.apple.com/in/shop", and it
+# carried the standard Fetch-metadata/Client-Hints headers a real same-
+# origin `fetch()` call sends (sec-fetch-*, sec-ch-ua*, cache-control,
+# pragma, priority) that a plain httpx GET never adds on its own. Both are
+# applied below now: `referer` defaults to the real tracked product URL
+# (threaded through from every caller below) instead of a generic page, and
+# the extra headers are added unconditionally.
+_SEC_CH_UA = '"Not)A;Brand";v="99", "Google Chrome";v="128", "Chromium";v="128"'
+
+
 async def _cookie_auth_fetch(
     target: str, *, log_tag: str, context: str, timeout: float,
-    client: httpx.AsyncClient | None = None,
+    referer: str | None = None, client: httpx.AsyncClient | None = None,
 ) -> tuple[dict | None, str | None]:
     """
     One direct httpx GET to `target` (an Apple fulfillment-messages URL) —
@@ -321,6 +351,12 @@ async def _cookie_auth_fetch(
     log_tag="resolve", context="fulfillment-messages pincode='400051'") so
     each caller's Railway logs stay grep-able under its own existing
     prefix rather than a generic shared one.
+
+    `referer`: the specific product page URL this fulfillment-messages
+    call is for — see the PARAM SET / HEADER HISTORY, PART 2 note above.
+    Falls back to the generic shop page only when a caller genuinely has
+    no specific product URL to give (there's currently no such caller,
+    but this keeps the function usable if one is ever added).
 
     `client`: an optional pre-built httpx.AsyncClient to reuse instead of
     opening a fresh TCP+TLS connection for this one call — passed by
@@ -349,8 +385,25 @@ async def _cookie_auth_fetch(
         "User-Agent": user_agent,
         "Cookie": cookies,
         "Accept": "*/*",
-        "Referer": "https://www.apple.com/in/shop",
+        "Referer": referer or "https://www.apple.com/in/shop",
         "x-skip-redirect": "true",
+        # Fetch-metadata + Client Hints headers a real same-origin
+        # fetch() call sends automatically — a plain httpx GET doesn't add
+        # any of these on its own. sec-ch-ua* below matches the Chrome
+        # version/platform in `user_agent` (Chrome 128 on Windows, see
+        # playwright_scraper's _REALISTIC_USER_AGENT) — these are standard
+        # Client Hints values for that browser/OS combination, not scraped
+        # from a specific captured request, so double-check against a
+        # fresh capture if Apple's edge starts treating this differently.
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=1, i",
+        "pragma": "no-cache",
+        "cache-control": "no-cache",
     }
 
     # Diagnostic — header NAMES + cookie length only, never the cookie
@@ -432,16 +485,16 @@ async def _fetch_pickup_availability(
     Never raises; callers that only need the data can unpack as
     `data, _method, _diag = await ...`, exactly as before.
 
-    product_url is accepted for backward compatibility with every existing
-    call site's signature but is no longer used — the old navigate-first
-    approach needed it to establish a page session before triggering the
-    in-page fetch; the direct cookie-based approach doesn't navigate
-    anywhere, so there's nothing left to pass it to.
+    product_url is now used as the request's Referer header (see the
+    PARAM SET / HEADER HISTORY, PART 2 note above _cookie_auth_fetch) — a
+    real browser's fulfillment-messages call carries the SPECIFIC product
+    page's URL as Referer, not a generic shop-page URL, so every caller
+    passing a real tracked-product URL here now gets that matched exactly.
     """
     target = _build_fulfillment_target(sku, pincode)
     data, err = await _cookie_auth_fetch(
         target, log_tag="resolve", context=f"fulfillment-messages pincode={pincode!r}",
-        timeout=_FULFILLMENT_TIMEOUT,
+        timeout=_FULFILLMENT_TIMEOUT, referer=product_url,
     )
     diagnostics: list[tuple[str, str | None]] = [("direct", err)]
     if data is not None:
@@ -858,7 +911,7 @@ _OFFICIAL_STORE_TIMEOUT = 20.0
 
 
 async def _fetch_official_store_availability(
-    sku: str, pincode: str, *, client: httpx.AsyncClient | None = None,
+    sku: str, pincode: str, *, product_url: str | None = None, client: httpx.AsyncClient | None = None,
 ) -> dict | None:
     """
     One direct httpx GET straight to Apple's fulfillment-messages endpoint
@@ -876,7 +929,7 @@ async def _fetch_official_store_availability(
     target = _build_fulfillment_target(sku, pincode)
     data, _err = await _cookie_auth_fetch(
         target, log_tag="official-stores", context=f"pincode={pincode!r}",
-        timeout=_OFFICIAL_STORE_TIMEOUT, client=client,
+        timeout=_OFFICIAL_STORE_TIMEOUT, referer=product_url, client=client,
     )
     return data
 
@@ -892,7 +945,9 @@ _PINCODE_DELAY_MIN_SECONDS = 2.0
 _PINCODE_DELAY_MAX_SECONDS = 5.0
 
 
-async def check_pickup_at_official_stores(sku: str, pincodes: list[str]) -> dict[str, list[dict]]:
+async def check_pickup_at_official_stores(
+    sku: str, pincodes: list[str], *, product_url: str | None = None,
+) -> dict[str, list[dict]]:
     """
     Checks `sku` against every pincode in `pincodes` (config.
     APPLE_PICKUP_PINCODES in production) SEQUENTIALLY — NOT concurrently
@@ -915,7 +970,7 @@ async def check_pickup_at_official_stores(sku: str, pincodes: list[str]) -> dict
     results: dict[str, list[dict]] = {}
     async with httpx.AsyncClient(timeout=_OFFICIAL_STORE_TIMEOUT) as client:
         for i, pincode in enumerate(pincodes):
-            data = await _fetch_official_store_availability(sku, pincode, client=client)
+            data = await _fetch_official_store_availability(sku, pincode, product_url=product_url, client=client)
             if data is not None:
                 results[pincode] = available_stores_for_pickup(data, sku)
             if i < len(pincodes) - 1:
