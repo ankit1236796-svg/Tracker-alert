@@ -4122,6 +4122,7 @@ async def cmd_debugdom(message: Message, command: CommandObject):
         ("pincode_like_inputs", "pincode_like_inputs"),
         ("pickup_related_buttons", "pickup_related_buttons"),
         ("pickup_details_html", "pickup_details_html"),
+        ("pickup_details_clickables", "pickup_details_clickables"),
     ):
         for chunk in _send_category(label, data.get(key) or []):
             await _debug_send(message, chunk)
@@ -4141,6 +4142,7 @@ async def cmd_debugdom(message: Message, command: CommandObject):
                 ("after_click.pincode_like_inputs", "pincode_like_inputs"),
                 ("after_click.pickup_related_buttons", "pickup_related_buttons"),
                 ("after_click.pickup_details_html", "pickup_details_html"),
+                ("after_click.pickup_details_clickables", "pickup_details_clickables"),
             ):
                 for chunk in _send_category(label, after_click.get(key) or []):
                     await _debug_send(message, chunk)
