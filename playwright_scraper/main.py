@@ -55,18 +55,30 @@ HTTP surface:
                         For admin diagnostic use (e.g. RelianceDigital's
                         /debugreliance) — hit directly, no auth (matches
                         /check-stock; this whole service has none).
-  POST /debug-dom       Body: {"url": str}. _capture_network_calls' sibling
-                        for DOM STRUCTURE discovery instead of network
-                        traffic (see _capture_dom_elements) — loads the
-                        page, waits for it to settle, then returns every
-                        element whose data-autom/text/attributes mention
-                        pickup, fulfillment, store, zip, pincode, or
-                        location. Returns {"url", "page_title",
-                        "data_autom_elements", "pincode_like_inputs",
-                        "pickup_related_buttons", "diagnostics"}. Built for
-                        the 2026-07-27 Apple pickup-widget selector
-                        discovery (see checkers/apple.py's investigation
-                        notes) — no auth, same as every other endpoint here.
+  POST /debug-dom       Body: {"url": str, "click_text": str (optional)}.
+                        _capture_network_calls' sibling for DOM STRUCTURE
+                        discovery instead of network traffic (see
+                        _capture_dom_elements) — loads the page, waits for
+                        it to settle, then returns every element whose
+                        data-autom/text/attributes mention pickup,
+                        fulfillment, store, zip, pincode, or location, plus
+                        the full outerHTML of any pickUpDetails element(s).
+                        When click_text is given, also clicks the first
+                        element containing that text (case-insensitive)
+                        after the initial capture, waits for any resulting
+                        modal/overlay to settle, and re-runs the same
+                        extraction — returned as "after_click" — so a
+                        pincode input hidden behind a "Check availability"
+                        trigger becomes visible without guessing at the
+                        modal's own selectors first. Returns {"url",
+                        "page_title", "data_autom_elements",
+                        "pincode_like_inputs", "pickup_related_buttons",
+                        "pickup_details_html", "after_click", "diagnostics"
+                        (includes "click_result" when click_text was
+                        given)}. Built for the 2026-07-27 Apple pickup-
+                        widget selector discovery (see checkers/apple.py's
+                        investigation notes) — no auth, same as every
+                        other endpoint here.
   POST /refresh-apple-cookies
                         Body: {"url": str (an apple.com/<locale>/shop/...
                         product page), "pincode": str}. Loads the page in a
@@ -739,16 +751,28 @@ _DOM_CAPTURE_JS = """() => {
         .filter(e => matchesKeywords([e.data_autom, e.text, e.aria_label]))
         .slice(0, 40);
 
+    // Full outerHTML of every pickUpDetails element — added 2026-07-27
+    // once a real capture confirmed this is the actual container Apple
+    // renders pickup status into (data-autom="pickUpDetails"), so its
+    // exact clickable structure (the "Check availability" trigger, most
+    // likely) can be inspected directly instead of guessed at.
+    const pickupDetailsHtml = Array.from(document.querySelectorAll('[data-autom="pickUpDetails"]'))
+        .map(el => {
+            const html = el.outerHTML || '';
+            return html.length > 4000 ? html.slice(0, 4000) + '...(truncated)' : html;
+        });
+
     return {
         page_title: document.title,
         data_autom_elements: dataAutomElements,
         pincode_like_inputs: pincodeLikeInputs,
         pickup_related_buttons: pickupRelatedButtons,
+        pickup_details_html: pickupDetailsHtml,
     };
 }"""
 
 
-def _capture_dom_elements(url: str) -> dict:
+def _capture_dom_elements(url: str, click_text: str | None = None) -> dict:
     """Launch an isolated browser, load `url`, wait for it to settle, then
     run _DOM_CAPTURE_JS to pull out every keyword-matching element — see
     the module note above for why this exists. Uses _apple_user_agent_for
@@ -759,7 +783,21 @@ def _capture_dom_elements(url: str) -> dict:
     Every step that can silently fail (navigation, the network-idle wait,
     the DOM extraction itself) is captured into "diagnostics" rather than
     left to fail invisibly — mirrors _capture_network_calls' own
-    reasoning exactly."""
+    reasoning exactly.
+
+    `click_text` (2026-07-27): a real capture found no pincode input on
+    initial page load, but DID find a rendered "Check availability" label
+    inside pickUpDetails — consistent with the pincode field living behind
+    a click-triggered modal/overlay, not on the page from the start. When
+    given, this clicks the FIRST element whose text contains `click_text`
+    (case-insensitive substring match, via Playwright's own text= locator
+    engine) after the initial capture, waits for any resulting overlay to
+    settle, then runs _DOM_CAPTURE_JS a SECOND time — returned as
+    "after_click" alongside the original (now "before_click"-equivalent)
+    top-level fields, so a modal that's appended to the DOM (not a
+    same-origin iframe — those wouldn't be visible to this same
+    querySelectorAll-based capture) becomes visible without guessing at
+    its own selectors first."""
     acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
     if not acquired:
         raise RuntimeError(
@@ -783,6 +821,7 @@ def _capture_dom_elements(url: str) -> dict:
                     "networkidle_timed_out": False,
                     "networkidle_error": None,
                     "extract_error": None,
+                    "click_result": None,
                 }
 
                 try:
@@ -817,6 +856,7 @@ def _capture_dom_elements(url: str) -> dict:
                 result = {
                     "page_title": None, "data_autom_elements": [],
                     "pincode_like_inputs": [], "pickup_related_buttons": [],
+                    "pickup_details_html": [],
                 }
                 try:
                     result = page.evaluate(_DOM_CAPTURE_JS)
@@ -824,13 +864,50 @@ def _capture_dom_elements(url: str) -> dict:
                     diagnostics["extract_error"] = str(exc)
                     logger.error(f"[debug-dom] DOM extraction failed for {url}: {exc}")
 
+                after_click = None
+                if click_text:
+                    click_result: dict = {
+                        "attempted": True, "found": False,
+                        "clicked_element_text": None, "click_error": None,
+                        "post_click_extract_error": None,
+                    }
+                    try:
+                        locator = page.get_by_text(click_text, exact=False).first
+                        locator.wait_for(timeout=5000)
+                        click_result["found"] = True
+                        try:
+                            click_result["clicked_element_text"] = locator.inner_text()
+                        except Exception:
+                            pass
+                        locator.click(timeout=5000)
+                    except Exception as exc:
+                        click_result["click_error"] = str(exc)
+                        logger.error(f"[debug-dom] click on text={click_text!r} failed for {url}: {exc}")
+                    else:
+                        # Bounded, best-effort — a modal opening doesn't
+                        # necessarily trigger new network activity, so a
+                        # networkidle timeout here is expected/harmless,
+                        # not an error (same reasoning as the initial
+                        # page-load wait above).
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(3000)
+                        try:
+                            after_click = page.evaluate(_DOM_CAPTURE_JS)
+                        except Exception as exc:
+                            click_result["post_click_extract_error"] = str(exc)
+                            logger.error(f"[debug-dom] post-click DOM extraction failed for {url}: {exc}")
+                    diagnostics["click_result"] = click_result
+
                 logger.info(
                     f"[debug-dom] {url}: {len(result.get('data_autom_elements', []))} data-autom "
                     f"match(es), {len(result.get('pincode_like_inputs', []))} input match(es), "
                     f"{len(result.get('pickup_related_buttons', []))} button match(es); "
                     f"diagnostics={diagnostics}"
                 )
-                return {**result, "diagnostics": diagnostics}
+                return {**result, "after_click": after_click, "diagnostics": diagnostics}
             finally:
                 browser.close()
     finally:
@@ -1204,11 +1281,12 @@ def create_app() -> Flask:
     def debug_dom():
         data = request.get_json(silent=True) or {}
         url = (data.get("url") or "").strip()
+        click_text = (data.get("click_text") or "").strip() or None
         if not url:
             return jsonify({"error": "url is required"}), 400
 
         try:
-            result = _capture_dom_elements(url)
+            result = _capture_dom_elements(url, click_text=click_text)
         except Exception as exc:
             logger.error(f"[debug-dom] failed for {url}: {exc}")
             return jsonify({"url": url, "error": str(exc)}), 502
