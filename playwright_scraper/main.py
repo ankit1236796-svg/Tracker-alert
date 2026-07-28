@@ -1638,18 +1638,25 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
     """
     Reproduces _check_pickup_availability's flow exactly up through
     typing `pincode` (same navigate -> click trigger/resolved-state ->
-    wait overlay -> clear+press_sequentially), then runs a sequence of
-    checkpoints to find WHICH intervention (if any) actually enables
-    Continue — see the module note above for what each checkpoint tests.
+    wait overlay -> clear), then types it ONE CHARACTER AT A TIME
+    (instead of a single bulk press_sequentially(pincode) call),
+    capturing the field's value + focus state after EVERY keystroke —
+    added after a real run showed the final value stuck at "1" (only the
+    first character), to see exactly where that happens: growing then
+    reset, or focus lost after the first character so nothing after it
+    registers. Then runs a sequence of checkpoints to find WHICH
+    intervention (if any) actually enables Continue — see the module
+    note above for what each checkpoint tests.
 
     Returns {"checkpoints": {name: state_dict, ...}, "enabled_at": name
-    or None, "network_requests": [...], "diagnostics": {...}} —
-    "enabled_at" is the first checkpoint name where continue_disabled_attr
-    was False, or None if it never became enabled at any checkpoint
-    tried. Every checkpoint that WAS reached is included in
-    "checkpoints", even after "enabled_at" is found, up to (and
-    including) the one that succeeded — later checkpoints are skipped
-    once one succeeds, since there's nothing further to learn by
+    or None, "typing_trajectory": [{"char", "value_after",
+    "zip_focused_after"}, ...], "network_requests": [...],
+    "diagnostics": {...}} — "enabled_at" is the first checkpoint name
+    where continue_disabled_attr was False, or None if it never became
+    enabled at any checkpoint tried. Every checkpoint that WAS reached is
+    included in "checkpoints", even after "enabled_at" is found, up to
+    (and including) the one that succeeded — later checkpoints are
+    skipped once one succeeds, since there's nothing further to learn by
     continuing to poke at an already-fixed state. "network_requests" is
     every XHR/fetch response seen from just before typing onward,
     regardless of outcome.
@@ -1753,14 +1760,49 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
 
                 page.on("response", _on_response)
 
+                # Typed ONE character at a time (not a single bulk
+                # press_sequentially(pincode) call) so the value + focus
+                # state can be captured after EVERY keystroke — a real run
+                # showed the final value stuck at "1" (only the first
+                # character), and this is the fastest way to see exactly
+                # WHERE that happens: does the value grow correctly then
+                # get reset, or does typing just stop registering after
+                # character 1 (e.g. because focus moved off the element —
+                # CDP dispatches keystrokes to whatever has OS-level
+                # focus, not a specific DOM node, so if React replaces the
+                # input on its first re-render, every keystroke after
+                # that would go nowhere).
+                typing_trajectory: list[dict] = []
                 try:
                     zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
                     zip_input.wait_for(timeout=8000)
                     zip_input.clear()
-                    zip_input.press_sequentially(pincode, delay=50)
+                    for ch in pincode:
+                        step: dict = {"char": ch}
+                        try:
+                            zip_input.press_sequentially(ch, delay=50)
+                        except Exception as exc:
+                            step["press_error"] = str(exc)
+                            typing_trajectory.append(step)
+                            continue
+                        try:
+                            step["value_after"] = zip_input.input_value()
+                        except Exception as exc:
+                            step["value_after_error"] = str(exc)
+                        try:
+                            step["zip_focused_after"] = page.evaluate(
+                                "(sel) => document.activeElement === document.querySelector(sel)",
+                                _PICKUP_ZIPCODE_SELECTOR,
+                            )
+                        except Exception as exc:
+                            step["zip_focused_after_error"] = str(exc)
+                        typing_trajectory.append(step)
                 except Exception as exc:
                     diagnostics["zip_fill_error"] = str(exc)
-                    return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
+                    return {
+                        "checkpoints": checkpoints, "enabled_at": None,
+                        "typing_trajectory": typing_trajectory, "diagnostics": diagnostics,
+                    }
 
                 def _capture(name: str) -> dict:
                     try:
@@ -1827,12 +1869,13 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
 
                 logger.info(
                     f"[debug-zipcode-validation] {url} pincode={pincode!r}: "
-                    f"enabled_at={enabled_at} checkpoints={checkpoints} "
-                    f"network_requests={network_requests} diagnostics={diagnostics}"
+                    f"enabled_at={enabled_at} typing_trajectory={typing_trajectory} "
+                    f"checkpoints={checkpoints} network_requests={network_requests} diagnostics={diagnostics}"
                 )
                 return {
                     "checkpoints": checkpoints,
                     "enabled_at": enabled_at,
+                    "typing_trajectory": typing_trajectory,
                     "network_requests": network_requests,
                     "diagnostics": diagnostics,
                     "git_commit_sha": GIT_COMMIT_SHA,
