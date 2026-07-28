@@ -395,36 +395,33 @@ async def _check_channel_forward_stock_row(
 
 async def run_channel_forward_check_cycle(bot: Bot) -> dict:
     """
-    One check pass across every channel_forward_tracking row (stock) AND
-    every channel_forward_pickup_tracking row (Apple pickup — see
-    checkers.apple.check_channel_pickup_row) — both share this same
-    cadence/gating, so one function covers both. No cross-row dedup
-    (unlike run_stock_check_cycle) — this list is admin-curated and
-    expected to be small, so there's no meaningful redundant-fetch cost to
-    save. Shares the same is_service_paused() global gate as the regular
-    stock checker (a global pause should stop ALL automated checking, not
-    just per-user tracking) — separate from is_forwarding_paused(), which
-    only suppresses the ALERT send, not the check itself (see
-    _apply_result_to_channel_forward_row / check_channel_pickup_row),
-    keeping /listforwarding and /checkforwarding accurate even while
-    forwarding is toggled off.
+    One check pass across every channel_forward_tracking row (stock) —
+    channel_forward_pickup_tracking (Apple pickup) is checked separately
+    by run_channel_forward_pickup_check_cycle below, on the fully
+    decoupled apple_pickup_check_loop cadence (2026-07-28 — see that
+    loop's own module note for why: page-render pickup checks launch a
+    real headful-browser check per pincode and could otherwise stall this
+    fast CHECK_INTERVAL-paced stock cadence for every OTHER admin-curated
+    channel-forward product). No cross-row dedup (unlike
+    run_stock_check_cycle) — this list is admin-curated and expected to
+    be small, so there's no meaningful redundant-fetch cost to save.
+    Shares the same is_service_paused() global gate as the regular stock
+    checker (a global pause should stop ALL automated checking, not just
+    per-user tracking).
 
-    Stock-side rows resolve their pincode from the admin-configured
-    channel-forward pincode(s) (see /setchannelpincode and
-    _check_channel_forward_stock_row above) — channel_forward_tracking
-    rows have no owning user, so there's no per-user pincode to resolve
-    the way run_stock_check_cycle does. Until an admin configures one,
-    behavior is unchanged from before: pincode=None, inconclusive for
-    Croma/RelianceDigital/quick-commerce. Pickup rows are unaffected —
-    they carry their own list of pincodes per row, set at
-    /addchannelpickup time.
+    Rows resolve their pincode from the admin-configured channel-forward
+    pincode(s) (see /setchannelpincode and _check_channel_forward_stock_row
+    above) — channel_forward_tracking rows have no owning user, so
+    there's no per-user pincode to resolve the way run_stock_check_cycle
+    does. Until an admin configures one, behavior is unchanged from
+    before: pincode=None, inconclusive for Croma/RelianceDigital/
+    quick-commerce.
     """
     if is_service_paused():
         logger.info("[channel-forward] service globally paused — skipping this check cycle entirely")
-        return {"tracked": 0, "pickup_tracked": 0, "paused": True}
+        return {"tracked": 0, "paused": True}
 
     rows = list_channel_forward_products()
-    pickup_rows = list_channel_forward_pickup()
     configured_pincodes = get_channel_forward_pincodes()
 
     sem = asyncio.Semaphore(10)
@@ -441,6 +438,30 @@ async def run_channel_forward_check_cycle(bot: Bot) -> dict:
             except Exception as exc:
                 logger.error(f"[channel-forward] error applying result to #{row['id']}: {exc}")
 
+    await asyncio.gather(*[_check_row(row) for row in rows])
+    return {"tracked": len(rows)}
+
+
+async def run_channel_forward_pickup_check_cycle(bot: Bot) -> dict:
+    """
+    One check pass across every channel_forward_pickup_tracking row (Apple
+    pickup — see checkers.apple.check_channel_pickup_row). Split out of
+    run_channel_forward_check_cycle above (2026-07-28) when Apple pickup
+    checking as a whole was decoupled onto its own independent,
+    concurrent apple_pickup_check_loop — see that loop's own module note.
+    Same is_service_paused() global gate as every other cycle; separate
+    from is_forwarding_paused(), which only suppresses the ALERT send,
+    not the check itself (see check_channel_pickup_row), keeping
+    /listforwarding and /checkforwarding accurate even while forwarding
+    is toggled off.
+    """
+    if is_service_paused():
+        logger.info("[channel-forward][pickup] service globally paused — skipping this check cycle entirely")
+        return {"pickup_tracked": 0, "paused": True}
+
+    pickup_rows = list_channel_forward_pickup()
+    sem = asyncio.Semaphore(10)
+
     async def _check_pickup_row(row: dict) -> None:
         async with sem:
             try:
@@ -448,11 +469,8 @@ async def run_channel_forward_check_cycle(bot: Bot) -> dict:
             except Exception as exc:
                 logger.error(f"[channel-forward][pickup] error checking #{row['id']}: {exc}")
 
-    await asyncio.gather(
-        *[_check_row(row) for row in rows],
-        *[_check_pickup_row(row) for row in pickup_rows],
-    )
-    return {"tracked": len(rows), "pickup_tracked": len(pickup_rows)}
+    await asyncio.gather(*[_check_pickup_row(row) for row in pickup_rows])
+    return {"pickup_tracked": len(pickup_rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -639,25 +657,25 @@ async def stock_checker_loop(bot: Bot):
 
     Also runs run_croma_check_cycle (Croma products only — excluded from
     run_stock_check_cycle above) on its OWN CROMA_CHECK_INTERVAL cadence,
-    via the same "next due" timestamp pattern as next_apple_pickup_run
-    below — every other site's timing here is unaffected.
+    via a "next due" timestamp pattern — every other site's timing here
+    is unaffected.
 
-    Also runs run_pickup_check_cycle (Apple Store pickup-availability
-    tracking — a separate feature/table, see database.pickup_tracking) and
-    run_apple_official_pickup_cycle (the fixed-6-official-store auto-check,
-    a further separate feature/table — see database.
-    apple_official_pickup_status), but on their OWN longer
-    APPLE_PICKUP_CHECK_INTERVAL rather than every CHECK_INTERVAL tick — see
-    config.py's own note on APPLE_PICKUP_CHECK_INTERVAL for why (request-
-    volume reduction, part of extending APPLE_COOKIES' ~2-hour session
-    life). Tracked as a simple "next due" timestamp compared against each
-    loop iteration's cycle_start, rather than a separate background task —
-    same "simplest way to satisfy an interval without extra loops"
-    approach the old shared-interval version used, just no longer tied to
-    the same clock as the main stock check.
+    2026-07-28: Apple pickup checking (run_pickup_check_cycle,
+    run_apple_official_pickup_cycle, run_channel_forward_pickup_check_
+    cycle) no longer runs from this loop at all — it's a fully
+    independent, concurrent task (apple_pickup_check_loop, started
+    alongside this one in main()) on its own APPLE_PICKUP_CHECK_INTERVAL
+    cadence, so a slow page-render pickup cycle (each pincode check
+    launches a real headful-browser check, can legitimately take up to a
+    minute or more) can NEVER stall this loop's regular CHECK_INTERVAL-
+    paced checking for every other tracked site. See apple_pickup_check_
+    loop's own module note for the full detail — this used to be a
+    same-loop "next due" timestamp gate (next_apple_pickup_run), same
+    pattern as next_croma_run above, but that only controlled how OFTEN
+    the pickup cycle STARTED, not how long a slow one blocked everything
+    else once it did.
     """
     logger.info("Stock checker loop started.")
-    next_apple_pickup_run = time.monotonic()  # due immediately on the first iteration
     next_croma_run = time.monotonic()  # due immediately on the first iteration
     while True:
         cycle_start = time.monotonic()
@@ -678,17 +696,6 @@ async def stock_checker_loop(bot: Bot):
                 logger.error(f"Croma checker cycle error: {exc}")
             next_croma_run = cycle_start + CROMA_CHECK_INTERVAL
 
-        if cycle_start >= next_apple_pickup_run:
-            try:
-                await run_pickup_check_cycle(bot)
-            except Exception as exc:
-                logger.error(f"Pickup checker cycle error: {exc}")
-            try:
-                await run_apple_official_pickup_cycle(bot)
-            except Exception as exc:
-                logger.error(f"Apple official-store pickup cycle error: {exc}")
-            next_apple_pickup_run = cycle_start + APPLE_PICKUP_CHECK_INTERVAL
-
         # Sleep only the remainder of CHECK_INTERVAL, measured from cycle start,
         # so total cycle time ≈ CHECK_INTERVAL instead of checking_time + CHECK_INTERVAL.
         elapsed = time.monotonic() - cycle_start
@@ -704,6 +711,62 @@ async def stock_checker_loop(bot: Bot):
                 f"Cycle took {elapsed:.1f}s — longer than CHECK_INTERVAL "
                 f"({CHECK_INTERVAL}s); starting next cycle immediately"
             )
+
+
+# ---------------------------------------------------------------------------
+# Apple pickup-checking — fully independent, concurrent loop (2026-07-28),
+# decoupled from stock_checker_loop entirely (see that loop's own module
+# note on why). Covers every Apple-pickup-related cycle: run_pickup_check_
+# cycle (personal /trackpickup rows), run_apple_official_pickup_cycle (the
+# fixed-6-official-store auto-check), and run_channel_forward_pickup_check_
+# cycle (admin-curated channel-forward pickup rows) — all three now go
+# through checkers.apple's page-render pickup checker (playwright_scraper),
+# which launches a real headful-browser check per pincode and can take up
+# to roughly a minute per check in a realistic worst case (see
+# playwright_scraper/main.py's _check_pickup_availability retry-loop note).
+# Previously these ran sequentially INSIDE stock_checker_loop, gated by a
+# "next due" timestamp so they'd only START every APPLE_PICKUP_CHECK_
+# INTERVAL — but that gate only controlled START frequency, not how long a
+# slow cycle blocked the same loop's regular CHECK_INTERVAL-paced checking
+# for every OTHER tracked site once it began. Running as its own task
+# (started in main() alongside stock_checker_loop, access_maintenance_loop,
+# apple_cookie_refresh_loop) means a slow pickup cycle can never delay any
+# other site's checking, ever, regardless of how long it takes.
+#
+# Same self-pacing "run, then sleep INTERVAL" pattern as apple_cookie_
+# refresh_loop below (not "sleep the remainder" like stock_checker_loop) —
+# deliberately simple: if one pass runs long, the next one just starts
+# that much later rather than trying to catch up or overlap itself. Since
+# this loop is fully independent, a long-running pass here has zero effect
+# on any other loop's own cadence.
+#
+# Telegram alerts (send_pickup_alert / send_channel_pickup_alert) are
+# unaffected by this move — they still go through the SAME `bot` instance
+# passed into every cycle call here, to the exact same users/chats as
+# before; only the scheduling/concurrency changed, not delivery.
+# ---------------------------------------------------------------------------
+
+async def apple_pickup_check_loop(bot: Bot):
+    logger.info(
+        f"[apple][pickup] independent check loop started (interval={APPLE_PICKUP_CHECK_INTERVAL}s)"
+    )
+    while True:
+        try:
+            await run_pickup_check_cycle(bot)
+        except Exception as exc:
+            logger.error(f"[apple][pickup] Pickup checker cycle error: {exc}")
+
+        try:
+            await run_apple_official_pickup_cycle(bot)
+        except Exception as exc:
+            logger.error(f"[apple][pickup] Apple official-store pickup cycle error: {exc}")
+
+        try:
+            await run_channel_forward_pickup_check_cycle(bot)
+        except Exception as exc:
+            logger.error(f"[apple][pickup] Channel-forward pickup checker cycle error: {exc}")
+
+        await asyncio.sleep(APPLE_PICKUP_CHECK_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,12 +1113,16 @@ async def main():
     await register_commands(bot)
 
     # Background tasks: stock checking (existing), access maintenance
-    # (reminders + grace-period purge), and the Apple cookie auto-refresher
-    # run as independent concurrent loops on their own cadences
-    # (CHECK_INTERVAL vs ACCESS_CHECK_INTERVAL vs APPLE_COOKIE_REFRESH_INTERVAL).
+    # (reminders + grace-period purge), the Apple cookie auto-refresher,
+    # and Apple pickup checking (2026-07-28, decoupled from stock_checker_
+    # loop — see apple_pickup_check_loop's own module note) all run as
+    # independent concurrent loops on their own cadences (CHECK_INTERVAL
+    # vs ACCESS_CHECK_INTERVAL vs APPLE_COOKIE_REFRESH_INTERVAL vs
+    # APPLE_PICKUP_CHECK_INTERVAL).
     checker_task = asyncio.create_task(stock_checker_loop(bot))
     access_task = asyncio.create_task(access_maintenance_loop(bot))
     apple_cookie_task = asyncio.create_task(apple_cookie_refresh_loop())
+    apple_pickup_task = asyncio.create_task(apple_pickup_check_loop(bot))
 
     logger.info("Bot is starting…")
     try:
@@ -1064,6 +1131,7 @@ async def main():
         checker_task.cancel()
         access_task.cancel()
         apple_cookie_task.cancel()
+        apple_pickup_task.cancel()
         await bot.session.close()
 
 
