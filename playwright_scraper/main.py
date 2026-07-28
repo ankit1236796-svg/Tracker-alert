@@ -246,6 +246,19 @@ APPLE_REFRESH_POST_FETCH_WAIT_MS = int(os.getenv("APPLE_REFRESH_POST_FETCH_WAIT_
 # a new problem.
 APPLE_PICKUP_HEADLESS = os.getenv("APPLE_PICKUP_HEADLESS", "false").lower() == "true"
 
+# _check_pickup_availability retry loop (2026-07-28, added after repeated
+# real runs showed genuinely inconsistent Apple-side behavior — sometimes
+# pickUpDetails renders slowly, sometimes the pincode lookup's backend
+# call takes variable time to fire, sometimes it doesn't fire at all in
+# the allotted window — each individually confirmed via diagnostics
+# rather than assumed. Modeled on bot.py's run_apple_cookie_refresh_cycle
+# (APPLE_COOKIE_REFRESH_MAX_ATTEMPTS/RETRY_DELAY_*): retry the WHOLE
+# check (fresh browser + fresh navigation each attempt, not just the
+# in-page type/wait step) up to this many times, stopping early the
+# moment one attempt returns a conclusive (non-None) available signal.
+APPLE_PICKUP_MAX_ATTEMPTS = int(os.getenv("APPLE_PICKUP_MAX_ATTEMPTS", "3"))
+APPLE_PICKUP_RETRY_DELAY_SECONDS = float(os.getenv("APPLE_PICKUP_RETRY_DELAY_SECONDS", "3"))
+
 # /debug-network: default pincode applied when the caller doesn't specify
 # one — an arbitrary real Indian pincode, not tied to any particular store.
 DEFAULT_DEBUG_PINCODE = os.getenv("DEBUG_NETWORK_DEFAULT_PINCODE", "110001")
@@ -1323,6 +1336,42 @@ _PICKUP_MESSAGE_RECOMMENDATIONS_AVAILABLE_VALUES = ("available",)
 _FULFILLMENT_MESSAGES_AVAILABLE_VALUES = ("available", "eligible")
 
 
+def _find_stores_list(node, _depth: int = 0):
+    """
+    Recursively searches a parsed JSON body for a list that structurally
+    looks like a pickup "stores" array — every element a dict carrying a
+    "partsAvailability" key — REGARDLESS of what key it's nested under.
+
+    Fallback for _parse_pickup_stores (2026-07-28), added after a real
+    fulfillment-messages 200 OK response body was captured whose
+    pickupMessage did NOT contain a "stores" key at the expected path
+    (parse_error: "missing key 'stores' in response body"), proving
+    Apple's own response shape isn't fixed even for the same endpoint.
+    Rather than guessing a specific alternate key name to hardcode as a
+    second path (unconfirmed — no real captured example of the alternate
+    shape exists yet), this matches on the STRUCTURE already confirmed
+    from real captured data (a list of dicts, each carrying
+    partsAvailability), so it works regardless of the surrounding key
+    names. Depth-capped to avoid pathological recursion on adversarial/
+    huge bodies.
+    """
+    if _depth > 8:
+        return None
+    if isinstance(node, list):
+        if node and all(isinstance(item, dict) and "partsAvailability" in item for item in node):
+            return node
+        for item in node:
+            found = _find_stores_list(item, _depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, dict):
+        for value in node.values():
+            found = _find_stores_list(value, _depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
 def _parse_pickup_stores(
     body_text: str, path: list[str], sku: str, available_values: tuple[str, ...],
 ) -> tuple[bool | None, list[dict], str | None]:
@@ -1345,6 +1394,10 @@ def _parse_pickup_stores(
         {"store_name", "pickup_search_quote", "store_pickup_quote"} —
         empty whenever available is not True.
       - error: a short string on structural/parse failure, else None.
+
+    If `path` doesn't resolve to a list (a different response shape than
+    the one `path` was written for), falls back to _find_stores_list
+    before giving up — see that function's docstring for why.
     """
     try:
         data = json.loads(body_text)
@@ -1352,13 +1405,30 @@ def _parse_pickup_stores(
         return None, [], f"JSON parse failed: {exc}"
 
     node = data
+    path_error = None
     for key in path:
         if not isinstance(node, dict):
-            return None, [], f"expected a dict while navigating to {key!r}, got {type(node).__name__}"
+            path_error = f"expected a dict while navigating to {key!r}, got {type(node).__name__}"
+            node = None
+            break
         node = node.get(key)
         if node is None:
-            return None, [], f"missing key {key!r} in response body"
-    stores = node if isinstance(node, list) else []
+            path_error = f"missing key {key!r} in response body"
+            break
+    stores = node if isinstance(node, list) else None
+
+    if stores is None:
+        stores = _find_stores_list(data)
+        if stores is not None:
+            logger.info(
+                f"[check-pickup-availability] _parse_pickup_stores: path {path} didn't resolve "
+                f"({path_error}) but a stores-shaped list was found elsewhere in the body via "
+                f"structural fallback — response shape differs from what `path` expected."
+            )
+
+    if stores is None:
+        top_level = sorted(data.keys()) if isinstance(data, dict) else type(data).__name__
+        return None, [], f"{path_error}; body top-level keys: {top_level}"
 
     if not stores:
         return None, [], None  # no stores near this pincode — inconclusive
@@ -1385,8 +1455,14 @@ def _parse_pickup_stores(
     return (True if matching_stores else False), matching_stores, None
 
 
-def _check_pickup_availability(url: str, pincode: str) -> dict:
+def _check_pickup_availability_once(url: str, pincode: str) -> dict:
     """
+    ONE attempt — see _check_pickup_availability (below) for the retry
+    loop wrapping this. Launches its own fresh browser/context/page each
+    call, deliberately: a stale page/session is itself a plausible part
+    of the intermittency this retry loop exists to work around, so each
+    retry starts genuinely clean rather than reusing anything.
+
     Navigate, detect + click whichever pickUpDetails state is present
     (trigger_present or already_resolved — see
     _ALREADY_RESOLVED_TRIGGER_SELECTOR above), wait for the iPhone-
@@ -1428,6 +1504,300 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
     Every step failure is captured into `diagnostics` rather than raising
     — same "capture the failure mode, don't hide it" philosophy as every
     other function in this file.
+
+    NOTE: does NOT acquire _check_semaphore itself — the retry wrapper
+    (_check_pickup_availability, below) acquires it once for the whole
+    attempt sequence, not once per attempt.
+    """
+    with sync_playwright() as pw:
+        browser, context = _new_browser_and_context(
+            pw, user_agent=_apple_user_agent_for, headless=APPLE_PICKUP_HEADLESS,
+        )
+        try:
+            page = context.new_page()
+
+            diagnostics: dict = {
+                "goto_status": None,
+                "goto_error": None,
+                "pickup_details_wait_timed_out": None,
+                "state": None,  # "trigger_present" | "already_resolved" | "neither"
+                "click_error": None,
+                "overlay_wait_timed_out": None,
+                "zip_fill_error": None,
+                "enter_key_error": None,
+                "sku": None,
+                "sku_source": None,  # "page_content_regex" | "trigger_data_autom"
+                "sku_error": None,
+                "pickup_message_response_seen": False,
+                "fulfillment_messages_response_seen": False,
+                "response_wait_timed_out": None,
+                "used_endpoint": None,  # "pickup_message_recommendations" | "fulfillment_messages" | None
+                "parse_error": None,
+                # Fallback visibility (2026-07-28, added after a real
+                # run showed response_wait_timed_out=True on a URL
+                # that HAD produced a real pickup-message-
+                # recommendations 200 OK just minutes earlier via
+                # _diagnose_zipcode_validation's much broader keyword
+                # match): every XHR/fetch URL+status seen, REGARDLESS
+                # of whether it matched either strict marker above. If
+                # this ever shows a URL that plausibly IS the target
+                # endpoint but wasn't captured into captured_bodies,
+                # that's direct proof the marker strings themselves
+                # need adjusting — rather than guessing at that again.
+                "all_responses_seen": [],
+            }
+            _MAX_ALL_RESPONSES_SEEN = 40
+            available: bool | None = None
+            matching_stores: list[dict] = []
+
+            # Registered as early as possible (before goto even) —
+            # stricter than "before typing" and catches everything,
+            # with no risk of missing an early-firing call. Bodies
+            # kept as raw text (not pre-parsed) so a body read
+            # failure never crashes the listener itself.
+            captured_bodies: dict[str, str | None] = {
+                "pickup_message_recommendations": None,
+                "fulfillment_messages": None,
+            }
+
+            def _on_response(response):
+                url_lower = response.url.lower()
+                if len(diagnostics["all_responses_seen"]) < _MAX_ALL_RESPONSES_SEEN:
+                    diagnostics["all_responses_seen"].append({"url": response.url, "status": response.status})
+                try:
+                    if (
+                        _PICKUP_MESSAGE_RECOMMENDATIONS_URL_MARKER in url_lower
+                        and captured_bodies["pickup_message_recommendations"] is None
+                    ):
+                        captured_bodies["pickup_message_recommendations"] = response.text()
+                    elif (
+                        _FULFILLMENT_MESSAGES_URL_MARKER in url_lower
+                        and "location=" in url_lower
+                        and captured_bodies["fulfillment_messages"] is None
+                    ):
+                        captured_bodies["fulfillment_messages"] = response.text()
+                except Exception as exc:
+                    logger.error(f"[check-pickup-availability] response capture error on {response.url}: {exc}")
+
+            page.on("response", _on_response)
+
+            try:
+                main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                if main_response is not None:
+                    diagnostics["goto_status"] = main_response.status
+            except Exception as exc:
+                diagnostics["goto_error"] = str(exc)
+                logger.error(f"[check-pickup-availability] page.goto failed for {url}: {exc}")
+
+            if diagnostics["goto_error"] is None:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                except Exception:
+                    pass
+
+                try:
+                    diagnostics["sku"] = _extract_apple_sku(page.content())
+                    diagnostics["sku_source"] = "page_content_regex" if diagnostics["sku"] else None
+                except Exception as exc:
+                    diagnostics["sku_error"] = str(exc)
+
+                try:
+                    page.wait_for_selector(_PICKUP_DETAILS_SELECTOR, timeout=10000)
+                    diagnostics["pickup_details_wait_timed_out"] = False
+                except PlaywrightTimeoutError:
+                    diagnostics["pickup_details_wait_timed_out"] = True
+                except Exception:
+                    diagnostics["pickup_details_wait_timed_out"] = True
+                page.wait_for_timeout(3000)
+
+                if diagnostics["pickup_details_wait_timed_out"] is False:
+                    trigger_locator = page.locator(_PICKUP_TRIGGER_SELECTOR)
+                    resolved_locator = page.locator(_ALREADY_RESOLVED_TRIGGER_SELECTOR)
+
+                    click_target = None
+                    if trigger_locator.count() > 0:
+                        diagnostics["state"] = "trigger_present"
+                        click_target = trigger_locator.first
+                        # productLocatorTriggerLink_<SKU> — confirmed
+                        # (2026-07-28) more reliable than the generic
+                        # page-content regex above: a real run showed
+                        # the regex grabbing a DIFFERENT SKU
+                        # (MG6Q4HN/A) than this exact same trigger's
+                        # own attribute had shown on an earlier run
+                        # (MG6J4HN/A) for the identical product URL —
+                        # the page likely has multiple "partNumber"
+                        # occurrences (related/accessory items), and
+                        # the regex takes whichever appears first, not
+                        # necessarily the one this specific widget is
+                        # actually checking. This attribute is tied
+                        # directly to the trigger we're about to
+                        # click, so it takes priority when available.
+                        try:
+                            trigger_data_autom = click_target.get_attribute("data-autom")
+                            if trigger_data_autom and trigger_data_autom.startswith("productLocatorTriggerLink_"):
+                                trigger_sku = trigger_data_autom[len("productLocatorTriggerLink_"):]
+                                if trigger_sku:
+                                    diagnostics["sku"] = trigger_sku
+                                    diagnostics["sku_source"] = "trigger_data_autom"
+                        except Exception:
+                            pass  # falls back to the page-content regex result already set above
+                    elif resolved_locator.count() > 0:
+                        diagnostics["state"] = "already_resolved"
+                        click_target = resolved_locator.first
+                    else:
+                        diagnostics["state"] = "neither"
+
+                    if click_target is not None:
+                        try:
+                            click_target.click(timeout=5000)
+                        except Exception as exc:
+                            diagnostics["click_error"] = str(exc)
+                            logger.error(f"[check-pickup-availability] trigger click failed for {url}: {exc}")
+
+                        if diagnostics["click_error"] is None:
+                            try:
+                                page.wait_for_selector(_PICKUP_OVERLAY_SELECTOR, timeout=10000)
+                            except PlaywrightTimeoutError:
+                                diagnostics["overlay_wait_timed_out"] = True
+                            except Exception:
+                                diagnostics["overlay_wait_timed_out"] = True
+
+                            if not diagnostics["overlay_wait_timed_out"]:
+                                try:
+                                    zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
+                                    zip_input.wait_for(timeout=8000)
+                                    zip_input.clear()
+                                    for ch in pincode:
+                                        zip_input.press_sequentially(ch, delay=50)
+                                except Exception as exc:
+                                    diagnostics["zip_fill_error"] = str(exc)
+                                    logger.error(f"[check-pickup-availability] zipCode fill failed for {url}: {exc}")
+
+                                if diagnostics["zip_fill_error"] is None:
+                                    # Enter keypress (2026-07-28,
+                                    # added after a real intermittent
+                                    # non-firing case): the ONE
+                                    # confirmed-successful diagnostic
+                                    # run also pressed Enter shortly
+                                    # after typing (its checkpoint F) —
+                                    # "typing alone triggers it" was
+                                    # inferred from that run's overall
+                                    # success, never actually isolated
+                                    # from whether Enter played a
+                                    # part. Best-effort; a failure here
+                                    # doesn't block the poll below.
+                                    try:
+                                        page.keyboard.press("Enter")
+                                    except Exception as exc:
+                                        diagnostics["enter_key_error"] = str(exc)
+
+                                    # Poll for either response to
+                                    # arrive rather than a fixed
+                                    # dwell — Continue's own state is
+                                    # irrelevant now, so there's
+                                    # nothing else to wait on. Deadline
+                                    # raised 8000->15000ms (2026-07-28)
+                                    # — the one confirmed-successful
+                                    # diagnostic run stayed open for
+                                    # 7+ seconds AFTER typing across
+                                    # its own checkpoint dwells before
+                                    # giving up, longer than this
+                                    # function's old 8s total; a
+                                    # shorter window here couldn't
+                                    # actually rule out "just needs
+                                    # more time" as part of the
+                                    # explanation for intermittent
+                                    # non-firing.
+                                    waited_ms = 0
+                                    step_ms = 250
+                                    deadline_ms = 15000
+                                    while (
+                                        waited_ms < deadline_ms
+                                        and captured_bodies["pickup_message_recommendations"] is None
+                                        and captured_bodies["fulfillment_messages"] is None
+                                    ):
+                                        page.wait_for_timeout(step_ms)
+                                        waited_ms += step_ms
+
+                            diagnostics["pickup_message_response_seen"] = (
+                                captured_bodies["pickup_message_recommendations"] is not None
+                            )
+                            diagnostics["fulfillment_messages_response_seen"] = (
+                                captured_bodies["fulfillment_messages"] is not None
+                            )
+                            if not diagnostics["pickup_message_response_seen"] and not diagnostics["fulfillment_messages_response_seen"]:
+                                diagnostics["response_wait_timed_out"] = True
+
+            if diagnostics["sku"] is None:
+                diagnostics["parse_error"] = diagnostics["sku_error"] or "SKU could not be extracted from the page"
+            elif captured_bodies["pickup_message_recommendations"] is not None:
+                diagnostics["used_endpoint"] = "pickup_message_recommendations"
+                available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
+                    captured_bodies["pickup_message_recommendations"],
+                    ["body", "PickupMessage", "stores"],
+                    diagnostics["sku"],
+                    _PICKUP_MESSAGE_RECOMMENDATIONS_AVAILABLE_VALUES,
+                )
+            elif captured_bodies["fulfillment_messages"] is not None:
+                diagnostics["used_endpoint"] = "fulfillment_messages"
+                available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
+                    captured_bodies["fulfillment_messages"],
+                    ["body", "content", "pickupMessage", "stores"],
+                    diagnostics["sku"],
+                    _FULFILLMENT_MESSAGES_AVAILABLE_VALUES,
+                )
+
+            logger.info(
+                f"[check-pickup-availability] {url} pincode={pincode!r}: available={available} "
+                f"used_endpoint={diagnostics['used_endpoint']} matching_stores={len(matching_stores)} "
+                f"state={diagnostics['state']} diagnostics={diagnostics}"
+            )
+            return {
+                "available": available,
+                "matching_stores": matching_stores,
+                "diagnostics": diagnostics,
+                "git_commit_sha": GIT_COMMIT_SHA,
+            }
+        finally:
+            browser.close()
+
+
+def _check_pickup_availability(url: str, pincode: str) -> dict:
+    """
+    Retry wrapper around _check_pickup_availability_once (2026-07-28,
+    added as a pragmatic safety net for genuinely inconsistent Apple-side
+    behavior confirmed across multiple real runs — sometimes pickUpDetails
+    renders slowly [pickup_details_wait_timed_out], sometimes the pincode
+    lookup's backend call takes variable time or never fires in the
+    allotted window [response_wait_timed_out], sometimes a response body
+    arrives in a shape _parse_pickup_stores doesn't expect [parse_error].
+    Each failure mode individually confirmed via diagnostics on separate
+    real runs, not assumed — chasing every one as its own timing edge
+    case stopped being productive, so this retries the WHOLE check
+    (fresh browser + fresh navigation per attempt, not just the in-page
+    type/wait step — a stale page/session is itself a plausible part of
+    the intermittency) up to APPLE_PICKUP_MAX_ATTEMPTS times.
+
+    Modeled on bot.py's run_apple_cookie_refresh_cycle
+    (APPLE_COOKIE_REFRESH_MAX_ATTEMPTS / _RETRY_DELAY_*): stops early the
+    moment one attempt returns a CONCLUSIVE result (available is True or
+    False — both real signals in this endpoint's contract, see the
+    module note above _parse_pickup_stores on why False is meaningful
+    here specifically). If every attempt stays inconclusive (available
+    stays None), the LAST attempt's full result is returned as the floor
+    — same "genuinely tried to do better first, but never worse than a
+    single attempt" behavior as the cookie-refresh precedent.
+
+    Acquires _check_semaphore ONCE for the whole attempt sequence (not
+    once per attempt) — this is one logical caller-facing check, and
+    holding the slot across retries avoids re-queuing behind unrelated
+    concurrent checks between attempts.
+
+    diagnostics["attempt"] / diagnostics["max_attempts"] are added to
+    the returned result (on top of whatever _check_pickup_availability_
+    once already set) so a result is self-describing about how many
+    attempts it took — same "make it directly diagnosable" motivation as
+    all_responses_seen and git_commit_sha above.
     """
     acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
     if not acquired:
@@ -1436,257 +1806,32 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
             f"timed out after {SLOT_WAIT_TIMEOUT_SECONDS}s waiting for a free slot"
         )
     try:
-        with sync_playwright() as pw:
-            browser, context = _new_browser_and_context(
-                pw, user_agent=_apple_user_agent_for, headless=APPLE_PICKUP_HEADLESS,
-            )
-            try:
-                page = context.new_page()
+        result: dict | None = None
+        for attempt in range(1, APPLE_PICKUP_MAX_ATTEMPTS + 1):
+            result = _check_pickup_availability_once(url, pincode)
+            result["diagnostics"]["attempt"] = attempt
+            result["diagnostics"]["max_attempts"] = APPLE_PICKUP_MAX_ATTEMPTS
 
-                diagnostics: dict = {
-                    "goto_status": None,
-                    "goto_error": None,
-                    "pickup_details_wait_timed_out": None,
-                    "state": None,  # "trigger_present" | "already_resolved" | "neither"
-                    "click_error": None,
-                    "overlay_wait_timed_out": None,
-                    "zip_fill_error": None,
-                    "enter_key_error": None,
-                    "sku": None,
-                    "sku_source": None,  # "page_content_regex" | "trigger_data_autom"
-                    "sku_error": None,
-                    "pickup_message_response_seen": False,
-                    "fulfillment_messages_response_seen": False,
-                    "response_wait_timed_out": None,
-                    "used_endpoint": None,  # "pickup_message_recommendations" | "fulfillment_messages" | None
-                    "parse_error": None,
-                    # Fallback visibility (2026-07-28, added after a real
-                    # run showed response_wait_timed_out=True on a URL
-                    # that HAD produced a real pickup-message-
-                    # recommendations 200 OK just minutes earlier via
-                    # _diagnose_zipcode_validation's much broader keyword
-                    # match): every XHR/fetch URL+status seen, REGARDLESS
-                    # of whether it matched either strict marker above. If
-                    # this ever shows a URL that plausibly IS the target
-                    # endpoint but wasn't captured into captured_bodies,
-                    # that's direct proof the marker strings themselves
-                    # need adjusting — rather than guessing at that again.
-                    "all_responses_seen": [],
-                }
-                _MAX_ALL_RESPONSES_SEEN = 40
-                available: bool | None = None
-                matching_stores: list[dict] = []
-
-                # Registered as early as possible (before goto even) —
-                # stricter than "before typing" and catches everything,
-                # with no risk of missing an early-firing call. Bodies
-                # kept as raw text (not pre-parsed) so a body read
-                # failure never crashes the listener itself.
-                captured_bodies: dict[str, str | None] = {
-                    "pickup_message_recommendations": None,
-                    "fulfillment_messages": None,
-                }
-
-                def _on_response(response):
-                    url_lower = response.url.lower()
-                    if len(diagnostics["all_responses_seen"]) < _MAX_ALL_RESPONSES_SEEN:
-                        diagnostics["all_responses_seen"].append({"url": response.url, "status": response.status})
-                    try:
-                        if (
-                            _PICKUP_MESSAGE_RECOMMENDATIONS_URL_MARKER in url_lower
-                            and captured_bodies["pickup_message_recommendations"] is None
-                        ):
-                            captured_bodies["pickup_message_recommendations"] = response.text()
-                        elif (
-                            _FULFILLMENT_MESSAGES_URL_MARKER in url_lower
-                            and "location=" in url_lower
-                            and captured_bodies["fulfillment_messages"] is None
-                        ):
-                            captured_bodies["fulfillment_messages"] = response.text()
-                    except Exception as exc:
-                        logger.error(f"[check-pickup-availability] response capture error on {response.url}: {exc}")
-
-                page.on("response", _on_response)
-
-                try:
-                    main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-                    if main_response is not None:
-                        diagnostics["goto_status"] = main_response.status
-                except Exception as exc:
-                    diagnostics["goto_error"] = str(exc)
-                    logger.error(f"[check-pickup-availability] page.goto failed for {url}: {exc}")
-
-                if diagnostics["goto_error"] is None:
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
-                    except Exception:
-                        pass
-
-                    try:
-                        diagnostics["sku"] = _extract_apple_sku(page.content())
-                        diagnostics["sku_source"] = "page_content_regex" if diagnostics["sku"] else None
-                    except Exception as exc:
-                        diagnostics["sku_error"] = str(exc)
-
-                    try:
-                        page.wait_for_selector(_PICKUP_DETAILS_SELECTOR, timeout=10000)
-                        diagnostics["pickup_details_wait_timed_out"] = False
-                    except PlaywrightTimeoutError:
-                        diagnostics["pickup_details_wait_timed_out"] = True
-                    except Exception:
-                        diagnostics["pickup_details_wait_timed_out"] = True
-                    page.wait_for_timeout(3000)
-
-                    if diagnostics["pickup_details_wait_timed_out"] is False:
-                        trigger_locator = page.locator(_PICKUP_TRIGGER_SELECTOR)
-                        resolved_locator = page.locator(_ALREADY_RESOLVED_TRIGGER_SELECTOR)
-
-                        click_target = None
-                        if trigger_locator.count() > 0:
-                            diagnostics["state"] = "trigger_present"
-                            click_target = trigger_locator.first
-                            # productLocatorTriggerLink_<SKU> — confirmed
-                            # (2026-07-28) more reliable than the generic
-                            # page-content regex above: a real run showed
-                            # the regex grabbing a DIFFERENT SKU
-                            # (MG6Q4HN/A) than this exact same trigger's
-                            # own attribute had shown on an earlier run
-                            # (MG6J4HN/A) for the identical product URL —
-                            # the page likely has multiple "partNumber"
-                            # occurrences (related/accessory items), and
-                            # the regex takes whichever appears first, not
-                            # necessarily the one this specific widget is
-                            # actually checking. This attribute is tied
-                            # directly to the trigger we're about to
-                            # click, so it takes priority when available.
-                            try:
-                                trigger_data_autom = click_target.get_attribute("data-autom")
-                                if trigger_data_autom and trigger_data_autom.startswith("productLocatorTriggerLink_"):
-                                    trigger_sku = trigger_data_autom[len("productLocatorTriggerLink_"):]
-                                    if trigger_sku:
-                                        diagnostics["sku"] = trigger_sku
-                                        diagnostics["sku_source"] = "trigger_data_autom"
-                            except Exception:
-                                pass  # falls back to the page-content regex result already set above
-                        elif resolved_locator.count() > 0:
-                            diagnostics["state"] = "already_resolved"
-                            click_target = resolved_locator.first
-                        else:
-                            diagnostics["state"] = "neither"
-
-                        if click_target is not None:
-                            try:
-                                click_target.click(timeout=5000)
-                            except Exception as exc:
-                                diagnostics["click_error"] = str(exc)
-                                logger.error(f"[check-pickup-availability] trigger click failed for {url}: {exc}")
-
-                            if diagnostics["click_error"] is None:
-                                try:
-                                    page.wait_for_selector(_PICKUP_OVERLAY_SELECTOR, timeout=10000)
-                                except PlaywrightTimeoutError:
-                                    diagnostics["overlay_wait_timed_out"] = True
-                                except Exception:
-                                    diagnostics["overlay_wait_timed_out"] = True
-
-                                if not diagnostics["overlay_wait_timed_out"]:
-                                    try:
-                                        zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
-                                        zip_input.wait_for(timeout=8000)
-                                        zip_input.clear()
-                                        for ch in pincode:
-                                            zip_input.press_sequentially(ch, delay=50)
-                                    except Exception as exc:
-                                        diagnostics["zip_fill_error"] = str(exc)
-                                        logger.error(f"[check-pickup-availability] zipCode fill failed for {url}: {exc}")
-
-                                    if diagnostics["zip_fill_error"] is None:
-                                        # Enter keypress (2026-07-28,
-                                        # added after a real intermittent
-                                        # non-firing case): the ONE
-                                        # confirmed-successful diagnostic
-                                        # run also pressed Enter shortly
-                                        # after typing (its checkpoint F) —
-                                        # "typing alone triggers it" was
-                                        # inferred from that run's overall
-                                        # success, never actually isolated
-                                        # from whether Enter played a
-                                        # part. Best-effort; a failure here
-                                        # doesn't block the poll below.
-                                        try:
-                                            page.keyboard.press("Enter")
-                                        except Exception as exc:
-                                            diagnostics["enter_key_error"] = str(exc)
-
-                                        # Poll for either response to
-                                        # arrive rather than a fixed
-                                        # dwell — Continue's own state is
-                                        # irrelevant now, so there's
-                                        # nothing else to wait on. Deadline
-                                        # raised 8000->15000ms (2026-07-28)
-                                        # — the one confirmed-successful
-                                        # diagnostic run stayed open for
-                                        # 7+ seconds AFTER typing across
-                                        # its own checkpoint dwells before
-                                        # giving up, longer than this
-                                        # function's old 8s total; a
-                                        # shorter window here couldn't
-                                        # actually rule out "just needs
-                                        # more time" as part of the
-                                        # explanation for intermittent
-                                        # non-firing.
-                                        waited_ms = 0
-                                        step_ms = 250
-                                        deadline_ms = 15000
-                                        while (
-                                            waited_ms < deadline_ms
-                                            and captured_bodies["pickup_message_recommendations"] is None
-                                            and captured_bodies["fulfillment_messages"] is None
-                                        ):
-                                            page.wait_for_timeout(step_ms)
-                                            waited_ms += step_ms
-
-                                diagnostics["pickup_message_response_seen"] = (
-                                    captured_bodies["pickup_message_recommendations"] is not None
-                                )
-                                diagnostics["fulfillment_messages_response_seen"] = (
-                                    captured_bodies["fulfillment_messages"] is not None
-                                )
-                                if not diagnostics["pickup_message_response_seen"] and not diagnostics["fulfillment_messages_response_seen"]:
-                                    diagnostics["response_wait_timed_out"] = True
-
-                if diagnostics["sku"] is None:
-                    diagnostics["parse_error"] = diagnostics["sku_error"] or "SKU could not be extracted from the page"
-                elif captured_bodies["pickup_message_recommendations"] is not None:
-                    diagnostics["used_endpoint"] = "pickup_message_recommendations"
-                    available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
-                        captured_bodies["pickup_message_recommendations"],
-                        ["body", "PickupMessage", "stores"],
-                        diagnostics["sku"],
-                        _PICKUP_MESSAGE_RECOMMENDATIONS_AVAILABLE_VALUES,
-                    )
-                elif captured_bodies["fulfillment_messages"] is not None:
-                    diagnostics["used_endpoint"] = "fulfillment_messages"
-                    available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
-                        captured_bodies["fulfillment_messages"],
-                        ["body", "content", "pickupMessage", "stores"],
-                        diagnostics["sku"],
-                        _FULFILLMENT_MESSAGES_AVAILABLE_VALUES,
-                    )
-
+            if result["available"] is not None:
                 logger.info(
-                    f"[check-pickup-availability] {url} pincode={pincode!r}: available={available} "
-                    f"used_endpoint={diagnostics['used_endpoint']} matching_stores={len(matching_stores)} "
-                    f"state={diagnostics['state']} diagnostics={diagnostics}"
+                    f"[check-pickup-availability] {url} pincode={pincode!r}: attempt {attempt}/"
+                    f"{APPLE_PICKUP_MAX_ATTEMPTS} conclusive (available={result['available']}) — "
+                    f"no further attempts needed."
                 )
-                return {
-                    "available": available,
-                    "matching_stores": matching_stores,
-                    "diagnostics": diagnostics,
-                    "git_commit_sha": GIT_COMMIT_SHA,
-                }
-            finally:
-                browser.close()
+                return result
+
+            logger.info(
+                f"[check-pickup-availability] {url} pincode={pincode!r}: attempt {attempt}/"
+                f"{APPLE_PICKUP_MAX_ATTEMPTS} inconclusive (available=None)"
+            )
+            if attempt < APPLE_PICKUP_MAX_ATTEMPTS:
+                time.sleep(APPLE_PICKUP_RETRY_DELAY_SECONDS)
+
+        logger.warning(
+            f"[check-pickup-availability] {url} pincode={pincode!r}: all {APPLE_PICKUP_MAX_ATTEMPTS} "
+            f"attempts stayed inconclusive — returning the last attempt's result as the floor."
+        )
+        return result
     finally:
         _check_semaphore.release()
 
