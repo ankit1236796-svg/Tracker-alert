@@ -666,12 +666,16 @@ async def _fetch_pickup_availability_via_page_render(
     refine_with_pincode — this is the checker function itself; deciding
     whether/how it replaces or supplements the (currently broken) direct
     httpx path in those production call sites is a separate decision, not
-    made here. playwright_scraper's Dockerfile now starts a virtual
-    display (xvfb-run) so its headless=False requirement can run on
-    Railway's display-less container, but that Dockerfile change is
-    UNTESTED (no way to build/run a real Docker container from the
-    environment that wrote it) — see playwright_scraper/main.py's
-    _check_pickup_availability docstring for the full caveat.
+    made here. playwright_scraper's Dockerfile starts a virtual display
+    (start.sh — explicit Xvfb + readiness poll, revised after an earlier
+    xvfb-run-wrapped attempt deployed fine but still left this specific
+    function's headful launch failing with "Missing X server or
+    $DISPLAY") so its headless=False requirement can run on Railway's
+    display-less container — but that startup script is still UNTESTED
+    (no way to build/run a real Docker container from the environment
+    that wrote it). See playwright_scraper/main.py's
+    _check_pickup_availability docstring for the full caveat, including
+    why a working /debug-pickup-flow deploy is NOT evidence this works.
 
     Never raises.
     """
