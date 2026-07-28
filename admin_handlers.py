@@ -4310,6 +4310,9 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
     hint = data.get("tentative_positive_hint")
     await _debug_send(
         message,
+        f"git_commit_sha: {data.get('git_commit_sha')!r} — compare this against "
+        f"the commit you expect to be deployed, so a result that looks like an "
+        f"old bug can't be mistaken for a fix that didn't work (or vice versa)\n"
         f"available: {available!r}\n"
         f"tentative_positive_hint: {hint!r}"
         + ("  ⚠️ seen but NOT auto-confirmed — see raw_text below" if hint else "")
