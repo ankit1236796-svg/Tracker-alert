@@ -669,6 +669,17 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 # gets its own fresh attempt (each already includes playwright_scraper's
 # own internal retry loop, so this isn't relying on the cache for
 # resilience, only for genuine cross-user duplicate avoidance).
+#
+# Each cache entry is a dict (not a positional tuple — 2026-07-28,
+# widened when /debugpickupavailability was wired through this same
+# function so a manual two-calls-in-a-row test could actually observe a
+# cache hit) carrying {"ts", "available", "matching_stores", "error",
+# "diagnostics", "git_commit_sha"}: "diagnostics"/"git_commit_sha" are
+# playwright_scraper's own response fields, previously read only for a
+# log line and discarded — now threaded all the way back to the caller
+# (via the `meta` return value below) so a cache HIT can still report
+# what the underlying real check actually saw, not just "cached: True"
+# with nothing else to show for it.
 _PAGE_RENDER_CACHE_TTL_SECONDS = 150  # ~83% of APPLE_PICKUP_CHECK_INTERVAL's
                                        # 180s default (config.py) — same
                                        # "comfortably under one cycle's own
@@ -677,7 +688,7 @@ _PAGE_RENDER_CACHE_TTL_SECONDS = 150  # ~83% of APPLE_PICKUP_CHECK_INTERVAL's
                                        # collapses duplicates WITHIN one
                                        # apple_pickup_check_loop pass
                                        # without spanning into the next.
-_page_render_cache: dict[str, tuple[float, bool | None, list[dict], str | None]] = {}
+_page_render_cache: dict[str, dict] = {}
 _page_render_locks: dict[str, asyncio.Lock] = {}
 _page_render_locks_guard = asyncio.Lock()
 
@@ -696,7 +707,7 @@ async def _get_page_render_lock(key: str) -> asyncio.Lock:
 
 
 def _prune_page_render_cache(now: float) -> None:
-    expired = [k for k, (ts, *_rest) in _page_render_cache.items() if now - ts >= _PAGE_RENDER_CACHE_TTL_SECONDS]
+    expired = [k for k, entry in _page_render_cache.items() if now - entry["ts"] >= _PAGE_RENDER_CACHE_TTL_SECONDS]
     for k in expired:
         _page_render_cache.pop(k, None)
         _page_render_locks.pop(k, None)
@@ -729,12 +740,12 @@ def _adapt_page_render_stores(matching_stores: list[dict]) -> list[dict]:
 
 async def _fetch_pickup_availability_via_page_render(
     product_url: str, pincode: str,
-) -> tuple[bool | None, list[dict], str | None]:
+) -> tuple[bool | None, list[dict], str | None, dict]:
     """
     Calls playwright_scraper's /check-pickup-availability instead of
     Apple's fulfillment-messages API directly.
 
-    Returns (available, matching_stores, error):
+    Returns (available, matching_stores, error, meta):
       - available: True if at least one specific, named nearby store
         shows this SKU as available for pickup — a genuine, pincode-
         specific confirmation, same meaning as _evaluate_pickup_
@@ -757,11 +768,26 @@ async def _fetch_pickup_availability_via_page_render(
         `available` value), else a short human-readable reason (missing
         PLAYWRIGHT_SCRAPER_URL, network error, non-200, non-JSON) —
         mirrors _cookie_auth_fetch's (data, error) contract above.
+      - meta: {"served_from_cache": bool, "diagnostics": dict | None,
+        "git_commit_sha": str | None} (2026-07-28, added alongside the
+        cache below). "diagnostics"/"git_commit_sha" are playwright_
+        scraper's own response fields — previously read only for a log
+        line and discarded; now threaded all the way back so a cache HIT
+        can still report what the underlying real check actually saw,
+        not just "cached: True" with nothing else to show. Both are None
+        only when the call failed before a scraper response ever arrived
+        (served_from_cache is always False in that case too).
 
     WIRED into check_pickup_row / check_channel_pickup_row (2026-07-28) —
     the direct httpx path (_fetch_pickup_availability above) stays at 0%
     success (see this module's PARAM SET / HEADER HISTORY notes), so this
     page-render path is now the one those production cycles actually use.
+    Also now used by admin_handlers.py's /debugpickupavailability
+    (2026-07-28, previously a separate direct httpx call that bypassed
+    the cache below entirely — meaning two manual calls in a row could
+    never demonstrate a cache hit, since that command never touched the
+    cache either way; routing it through this same function makes it an
+    accurate diagnostic of the REAL production path, cache included).
     refine_with_pincode is untouched — a separate decision, not made
     here. playwright_scraper's Dockerfile starts a virtual display
     (start.sh — explicit Xvfb + readiness poll) so its headless=False
@@ -794,23 +820,28 @@ async def _fetch_pickup_availability_via_page_render(
     """
     from config import PLAYWRIGHT_SCRAPER_URL
 
+    no_check_meta = {"served_from_cache": False, "diagnostics": None, "git_commit_sha": None}
+
     if not PLAYWRIGHT_SCRAPER_URL:
         reason = "PLAYWRIGHT_SCRAPER_URL is not configured"
         logger.warning(f"[apple][page-render] {reason} — skipping pincode={pincode!r}")
-        return None, [], reason
+        return None, [], reason, no_check_meta
 
     cache_key = _page_render_cache_key(product_url, pincode)
     now = time.monotonic()
     _prune_page_render_cache(now)
 
     cached = _page_render_cache.get(cache_key)
-    if cached is not None and now - cached[0] < _PAGE_RENDER_CACHE_TTL_SECONDS:
+    if cached is not None and now - cached["ts"] < _PAGE_RENDER_CACHE_TTL_SECONDS:
         logger.info(
-            f"[apple][page-render] cache hit (age={now - cached[0]:.0f}s) pincode={pincode!r} "
+            f"[apple][page-render] cache hit (age={now - cached['ts']:.0f}s) pincode={pincode!r} "
             f"— browser check skipped"
         )
-        _, cached_available, cached_stores, cached_error = cached
-        return cached_available, cached_stores, cached_error
+        meta = {
+            "served_from_cache": True, "diagnostics": cached["diagnostics"],
+            "git_commit_sha": cached["git_commit_sha"],
+        }
+        return cached["available"], cached["matching_stores"], cached["error"], meta
 
     lock = await _get_page_render_lock(cache_key)
     async with lock:
@@ -818,13 +849,16 @@ async def _fetch_pickup_availability_via_page_render(
         # same key may have already populated the cache while we waited.
         now = time.monotonic()
         cached = _page_render_cache.get(cache_key)
-        if cached is not None and now - cached[0] < _PAGE_RENDER_CACHE_TTL_SECONDS:
+        if cached is not None and now - cached["ts"] < _PAGE_RENDER_CACHE_TTL_SECONDS:
             logger.info(
-                f"[apple][page-render] cache hit post-lock (age={now - cached[0]:.0f}s) "
+                f"[apple][page-render] cache hit post-lock (age={now - cached['ts']:.0f}s) "
                 f"pincode={pincode!r} — browser check skipped"
             )
-            _, cached_available, cached_stores, cached_error = cached
-            return cached_available, cached_stores, cached_error
+            meta = {
+                "served_from_cache": True, "diagnostics": cached["diagnostics"],
+                "git_commit_sha": cached["git_commit_sha"],
+            }
+            return cached["available"], cached["matching_stores"], cached["error"], meta
 
         try:
             async with httpx.AsyncClient(timeout=240.0) as client:
@@ -835,29 +869,35 @@ async def _fetch_pickup_availability_via_page_render(
         except Exception as exc:
             reason = f"request to playwright_scraper failed: {type(exc).__name__}: {exc}"
             logger.warning(f"[apple][page-render] {reason}")
-            return None, [], reason  # never cached — a fresh call may succeed
+            return None, [], reason, no_check_meta  # never cached — a fresh call may succeed
 
         if resp.status_code != 200:
             reason = f"playwright_scraper returned HTTP {resp.status_code}: {resp.text[:300]!r}"
             logger.warning(f"[apple][page-render] {reason}")
-            return None, [], reason  # never cached
+            return None, [], reason, no_check_meta  # never cached
 
         try:
             data = resp.json()
         except Exception as exc:
             reason = f"non-JSON response from playwright_scraper: {exc}"
             logger.warning(f"[apple][page-render] {reason}")
-            return None, [], reason  # never cached
+            return None, [], reason, no_check_meta  # never cached
 
         available = data.get("available")
         matching_stores = _adapt_page_render_stores(data.get("matching_stores") or [])
+        diagnostics = data.get("diagnostics")
+        git_commit_sha = data.get("git_commit_sha")
         logger.info(
             f"[apple][page-render] pincode={pincode!r}: available={available} "
             f"matching_stores={[s.get('store_name') for s in matching_stores]} "
-            f"diagnostics={data.get('diagnostics')}"
+            f"diagnostics={diagnostics}"
         )
-        _page_render_cache[cache_key] = (time.monotonic(), available, matching_stores, None)
-        return available, matching_stores, None
+        _page_render_cache[cache_key] = {
+            "ts": time.monotonic(), "available": available, "matching_stores": matching_stores,
+            "error": None, "diagnostics": diagnostics, "git_commit_sha": git_commit_sha,
+        }
+        meta = {"served_from_cache": False, "diagnostics": diagnostics, "git_commit_sha": git_commit_sha}
+        return available, matching_stores, None, meta
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1031,7 +1071,7 @@ async def check_pickup_row(bot, row: dict) -> dict:
     results: dict[str, list[dict]] = {}
     for pincode in row["pincodes"]:
         try:
-            available, stores, _error = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
+            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
         except Exception as exc:
             logger.error(
                 f"[apple][pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
@@ -1138,7 +1178,7 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     channel = None
     for pincode in row.get("pincodes") or []:
         try:
-            available, stores, _error = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
+            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
         except Exception as exc:
             logger.error(
                 f"[apple][channel-pickup] error checking #{row['id']} pincode={pincode!r}: {exc}"
