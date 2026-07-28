@@ -1288,6 +1288,14 @@ _PICKUP_NOT_AVAILABLE_PHRASES = ("not available today",)
 # NOT YET CONFIRMED for THIS overlay type (rf-productlocator-overlay) — see
 # the module note above. Logged as a hint only; never sets available=True.
 _PICKUP_TENTATIVE_AVAILABLE_HINT_PHRASES = ("available today", "pick up today at")
+# The overlay's own PRE-SEARCH placeholder text (confirmed via a real
+# 2026-07-28 capture) — used to detect "the zipCode fill/Continue never
+# actually produced a result" as its OWN distinct diagnostic, separate
+# from a genuine "not available" answer. Both currently classify as
+# available=None (see the module note above), but conflating "no result
+# ever loaded" with "a real negative result loaded" would hide a bug —
+# see results_placeholder_still_shown in diagnostics below.
+_PICKUP_SEARCH_PLACEHOLDER_PHRASE = "search by pin code"
 
 
 def _check_pickup_availability(url: str, pincode: str) -> dict:
@@ -1295,14 +1303,18 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
     Production version of _capture_pickup_flow: navigate, detect + click
     whichever pickUpDetails state is present (trigger_present or
     already_resolved — see _ALREADY_RESOLVED_TRIGGER_SELECTOR above), wait
-    for the iPhone-specific overlay, ensure the zipCode input holds
-    `pincode` (only fills if it doesn't already — a real observed run
-    showed the field can already hold the right value, in which case
-    filling again is redundant, not incorrect, but reading first avoids an
-    unnecessary extra input event), best-effort click Continue (observed:
-    results can auto-load off the fill alone, leaving Continue already
-    disabled/gone by the time we'd click it — not treated as a failure),
-    then read the overlay's own text and classify it.
+    for the iPhone-specific overlay, unconditionally fill the zipCode
+    input with `pincode` (matches _capture_pickup_flow's own proven-
+    working fill — an earlier conditional "only fill if it doesn't
+    already hold the right value" version was reverted after a real run
+    showed it can leave the field never actually submitted), click
+    Continue if it's actually enabled (recording continue_button_found/
+    continue_button_enabled explicitly rather than silently guessing why
+    it wasn't — see the code's own comment on why "not enabled" is
+    ambiguous), then wait for the overlay's pre-search placeholder text
+    to actually disappear (not just a fixed dwell — see
+    _PICKUP_SEARCH_PLACEHOLDER_PHRASE) before reading and classifying its
+    text.
 
     Every step failure is captured into `diagnostics` rather than raising
     — same "capture the failure mode, don't hide it" philosophy as every
@@ -1332,7 +1344,11 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                     "click_error": None,
                     "overlay_wait_timed_out": None,
                     "zip_fill_error": None,
+                    "continue_button_found": None,
+                    "continue_button_enabled": None,
                     "continue_click_error": None,
+                    "results_wait_timed_out": None,
+                    "results_placeholder_still_shown": None,
                     "extract_error": None,
                 }
                 available: bool | None = None
@@ -1394,37 +1410,84 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                                     try:
                                         zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
                                         zip_input.wait_for(timeout=8000)
-                                        # Only fill if it doesn't already hold the
-                                        # target pincode — a real run showed it
-                                        # can already be populated; an
-                                        # unconditional re-fill isn't WRONG, but
-                                        # reading first avoids a redundant input
-                                        # event and lets us tell the two cases
-                                        # apart in diagnostics if ever needed.
-                                        if zip_input.input_value() != pincode:
-                                            zip_input.fill(pincode)
+                                        # Unconditional fill (2026-07-28,
+                                        # reverted from a conditional
+                                        # input_value()-check version) —
+                                        # matches _capture_pickup_flow's
+                                        # own fill, the one flow that's
+                                        # actually been proven to reach a
+                                        # real result end-to-end. The
+                                        # conditional version was an
+                                        # untested "optimization" based on
+                                        # an unresolved ambiguity (did
+                                        # Apple pre-fill it, or did an
+                                        # earlier run's own fill do that);
+                                        # removed rather than kept as an
+                                        # unproven extra moving part.
+                                        zip_input.fill(pincode)
                                     except Exception as exc:
                                         diagnostics["zip_fill_error"] = str(exc)
                                         logger.error(f"[check-pickup-availability] zipCode fill failed for {url}: {exc}")
 
                                     if diagnostics["zip_fill_error"] is None:
-                                        # Best-effort — observed: results can
-                                        # auto-load off the fill alone, leaving
-                                        # Continue already disabled/gone. Not a
-                                        # failure either way.
+                                        # Continue's state is now recorded
+                                        # explicitly rather than silently
+                                        # inferred — "not enabled" used to
+                                        # be treated as "results already
+                                        # auto-loaded off the fill alone"
+                                        # (true in one observed case), but
+                                        # it could equally mean the fill
+                                        # never satisfied Apple's own
+                                        # validation JS and nothing was
+                                        # ever actually submitted. Both
+                                        # skip the click either way — the
+                                        # difference now is we can SEE
+                                        # which one happened afterward
+                                        # instead of guessing again.
                                         try:
                                             continue_btn = page.locator(_PICKUP_CONTINUE_SELECTOR).first
                                             continue_btn.wait_for(timeout=3000)
-                                            if continue_btn.is_enabled():
+                                            diagnostics["continue_button_found"] = True
+                                            diagnostics["continue_button_enabled"] = continue_btn.is_enabled()
+                                            if diagnostics["continue_button_enabled"]:
                                                 continue_btn.click(timeout=3000)
                                         except Exception as exc:
+                                            if diagnostics["continue_button_found"] is None:
+                                                diagnostics["continue_button_found"] = False
                                             diagnostics["continue_click_error"] = str(exc)
 
                                         try:
                                             page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
                                         except Exception:
                                             pass
-                                        page.wait_for_timeout(3000)
+
+                                        # Wait for the ACTUAL result to
+                                        # replace the overlay's pre-search
+                                        # placeholder ("Search by PIN Code
+                                        # to see availability...") instead
+                                        # of trusting a fixed dwell — a
+                                        # real 2026-07-28 run extracted
+                                        # that placeholder verbatim,
+                                        # meaning a fixed dwell alone isn't
+                                        # a reliable signal that results
+                                        # actually loaded.
+                                        try:
+                                            page.wait_for_function(
+                                                """({selector, placeholder}) => {
+                                                    const el = document.querySelector(selector);
+                                                    return el && !el.innerText.toLowerCase().includes(placeholder);
+                                                }""",
+                                                arg={
+                                                    "selector": _PICKUP_OVERLAY_SELECTOR,
+                                                    "placeholder": _PICKUP_SEARCH_PLACEHOLDER_PHRASE,
+                                                },
+                                                timeout=8000,
+                                            )
+                                        except PlaywrightTimeoutError:
+                                            diagnostics["results_wait_timed_out"] = True
+                                        except Exception:
+                                            pass
+                                        page.wait_for_timeout(1000)
 
                 try:
                     overlay = page.locator(_PICKUP_OVERLAY_SELECTOR).first
@@ -1436,6 +1499,7 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
 
                 if raw_text:
                     text_lower = raw_text.lower()
+                    diagnostics["results_placeholder_still_shown"] = _PICKUP_SEARCH_PLACEHOLDER_PHRASE in text_lower
                     if any(phrase in text_lower for phrase in _PICKUP_NOT_AVAILABLE_PHRASES):
                         available = None  # inconclusive, NOT False — see module note
                     elif any(phrase in text_lower for phrase in _PICKUP_TENTATIVE_AVAILABLE_HINT_PHRASES):
