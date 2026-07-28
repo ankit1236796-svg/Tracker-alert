@@ -4306,17 +4306,23 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
         await _debug_send(message, f"⚠️ Non-JSON response from playwright_scraper: {exc}")
         return
 
+    _CHUNK_SIZE = 3500
+
     available = data.get("available")
     await _debug_send(
         message,
         f"git_commit_sha: {data.get('git_commit_sha')!r} — compare this against "
         f"the commit you expect to be deployed, so a result that looks like an "
         f"old bug can't be mistaken for a fix that didn't work (or vice versa)\n"
-        f"available: {available!r}\n"
-        f"diagnostics: {data.get('diagnostics')}",
+        f"available: {available!r}",
     )
+    # Chunked separately from the above (2026-07-28) — diagnostics can now
+    # include up to 40 all_responses_seen entries, easily long enough to
+    # exceed Telegram's per-message limit on its own.
+    diagnostics_text = f"diagnostics:\n{json.dumps(data.get('diagnostics'), indent=2)}"
+    for i in range(0, len(diagnostics_text), _CHUNK_SIZE):
+        await _debug_send(message, diagnostics_text[i:i + _CHUNK_SIZE])
 
-    _CHUNK_SIZE = 3500
     matching_stores = data.get("matching_stores") or []
     if matching_stores:
         text = f"matching_stores ({len(matching_stores)}):\n{json.dumps(matching_stores, indent=2)}"

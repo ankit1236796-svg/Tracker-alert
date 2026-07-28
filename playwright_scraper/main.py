@@ -1398,12 +1398,32 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
     calls; bulk press_sequentially(pincode) was never specifically
     confirmed to do the same, so this keeps the proven mechanism rather
     than reverting to something merely equivalent in theory). A
-    network-response listener registered BEFORE typing captures whichever
-    of pickup-message-recommendations / fulfillment-messages fires, and
-    that response body — not Continue's click-ability, not scraped
-    overlay text — is what gets parsed. See the module note above this
-    function for the full architecture rationale and the available=False
-    caveat.
+    network-response listener registered BEFORE page.goto() (even earlier
+    than "before typing" — no risk of missing an early-firing call)
+    captures whichever of pickup-message-recommendations /
+    fulfillment-messages fires, and that response body — not Continue's
+    click-ability, not scraped overlay text — is what gets parsed. See
+    the module note above this function for the full architecture
+    rationale and the available=False caveat.
+
+    SKU is read from the trigger's own data-autom="productLocatorTriggerLink_
+    <SKU>" attribute when available (diagnostics["sku_source"] =
+    "trigger_data_autom") — confirmed more reliable than the generic
+    page-content regex fallback (diagnostics["sku"] set once early,
+    unconditionally, as a fallback for the already_resolved state which
+    has no such attribute to read): a real run showed the regex grabbing
+    a DIFFERENT sku than this same trigger's own attribute had shown for
+    the IDENTICAL product URL on an earlier run, most likely because the
+    page contains multiple "partNumber" occurrences (related/accessory
+    items) and the regex takes whichever appears first in page source,
+    not necessarily the one this specific widget is checking.
+
+    diagnostics["all_responses_seen"] records every XHR/fetch URL+status
+    observed regardless of whether it matched either strict marker above
+    — added after a real run showed response_wait_timed_out=True on a
+    URL that HAD produced a real 200 OK just minutes earlier via
+    _diagnose_zipcode_validation's much broader keyword match, so a
+    future recurrence is directly diagnosable instead of another guess.
 
     Every step failure is captured into `diagnostics` rather than raising
     — same "capture the failure mode, don't hide it" philosophy as every
@@ -1432,13 +1452,27 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                     "overlay_wait_timed_out": None,
                     "zip_fill_error": None,
                     "sku": None,
+                    "sku_source": None,  # "page_content_regex" | "trigger_data_autom"
                     "sku_error": None,
                     "pickup_message_response_seen": False,
                     "fulfillment_messages_response_seen": False,
                     "response_wait_timed_out": None,
                     "used_endpoint": None,  # "pickup_message_recommendations" | "fulfillment_messages" | None
                     "parse_error": None,
+                    # Fallback visibility (2026-07-28, added after a real
+                    # run showed response_wait_timed_out=True on a URL
+                    # that HAD produced a real pickup-message-
+                    # recommendations 200 OK just minutes earlier via
+                    # _diagnose_zipcode_validation's much broader keyword
+                    # match): every XHR/fetch URL+status seen, REGARDLESS
+                    # of whether it matched either strict marker above. If
+                    # this ever shows a URL that plausibly IS the target
+                    # endpoint but wasn't captured into captured_bodies,
+                    # that's direct proof the marker strings themselves
+                    # need adjusting — rather than guessing at that again.
+                    "all_responses_seen": [],
                 }
+                _MAX_ALL_RESPONSES_SEEN = 40
                 available: bool | None = None
                 matching_stores: list[dict] = []
 
@@ -1454,6 +1488,8 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
 
                 def _on_response(response):
                     url_lower = response.url.lower()
+                    if len(diagnostics["all_responses_seen"]) < _MAX_ALL_RESPONSES_SEEN:
+                        diagnostics["all_responses_seen"].append({"url": response.url, "status": response.status})
                     try:
                         if (
                             _PICKUP_MESSAGE_RECOMMENDATIONS_URL_MARKER in url_lower
@@ -1487,6 +1523,7 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
 
                     try:
                         diagnostics["sku"] = _extract_apple_sku(page.content())
+                        diagnostics["sku_source"] = "page_content_regex" if diagnostics["sku"] else None
                     except Exception as exc:
                         diagnostics["sku_error"] = str(exc)
 
@@ -1507,6 +1544,29 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                         if trigger_locator.count() > 0:
                             diagnostics["state"] = "trigger_present"
                             click_target = trigger_locator.first
+                            # productLocatorTriggerLink_<SKU> — confirmed
+                            # (2026-07-28) more reliable than the generic
+                            # page-content regex above: a real run showed
+                            # the regex grabbing a DIFFERENT SKU
+                            # (MG6Q4HN/A) than this exact same trigger's
+                            # own attribute had shown on an earlier run
+                            # (MG6J4HN/A) for the identical product URL —
+                            # the page likely has multiple "partNumber"
+                            # occurrences (related/accessory items), and
+                            # the regex takes whichever appears first, not
+                            # necessarily the one this specific widget is
+                            # actually checking. This attribute is tied
+                            # directly to the trigger we're about to
+                            # click, so it takes priority when available.
+                            try:
+                                trigger_data_autom = click_target.get_attribute("data-autom")
+                                if trigger_data_autom and trigger_data_autom.startswith("productLocatorTriggerLink_"):
+                                    trigger_sku = trigger_data_autom[len("productLocatorTriggerLink_"):]
+                                    if trigger_sku:
+                                        diagnostics["sku"] = trigger_sku
+                                        diagnostics["sku_source"] = "trigger_data_autom"
+                            except Exception:
+                                pass  # falls back to the page-content regex result already set above
                         elif resolved_locator.count() > 0:
                             diagnostics["state"] = "already_resolved"
                             click_target = resolved_locator.first
