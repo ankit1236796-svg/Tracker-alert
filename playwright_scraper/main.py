@@ -216,6 +216,17 @@ APPLE_REFRESH_NETWORKIDLE_TIMEOUT_MS = int(os.getenv("APPLE_REFRESH_NETWORKIDLE_
 APPLE_REFRESH_DWELL_MS = int(os.getenv("APPLE_REFRESH_DWELL_MS", "5000"))
 APPLE_REFRESH_POST_FETCH_WAIT_MS = int(os.getenv("APPLE_REFRESH_POST_FETCH_WAIT_MS", "2000"))
 
+# _check_pickup_availability's own headless override — defaults to headFUL
+# (false), the OPPOSITE default of the module-wide HEADLESS above. A
+# controlled same-network A/B test (2026-07-28) confirmed headless
+# Chromium fails to render Apple's pickUpDetails widget at all, while an
+# otherwise-identical headful run succeeds consistently. NOTE: headful
+# needs a real display; an unmodified Railway container has none. This
+# env var lets a deploy override back to headless=true once/if that's
+# resolved (e.g. Xvfb added to the Dockerfile — NOT done yet, see
+# _check_pickup_availability's own docstring), without a code change.
+APPLE_PICKUP_HEADLESS = os.getenv("APPLE_PICKUP_HEADLESS", "false").lower() == "true"
+
 # /debug-network: default pincode applied when the caller doesn't specify
 # one — an arbitrary real Indian pincode, not tied to any particular store.
 DEFAULT_DEBUG_PINCODE = os.getenv("DEBUG_NETWORK_DEFAULT_PINCODE", "110001")
@@ -324,7 +335,9 @@ if (originalQuery) {
 """
 
 
-def _new_browser_and_context(pw, user_agent: str | Callable[[object], str] = _REALISTIC_USER_AGENT):
+def _new_browser_and_context(
+    pw, user_agent: str | Callable[[object], str] = _REALISTIC_USER_AGENT, headless: bool = HEADLESS,
+):
     """Launch a browser + context with the anti-detection measures above —
     shared by _render_page (/check-stock), _capture_network_calls
     (/debug-network), and _refresh_apple_cookies (with its own
@@ -337,7 +350,15 @@ def _new_browser_and_context(pw, user_agent: str | Callable[[object], str] = _RE
     a string (_apple_user_agent_for) — the browser instance has to exist
     before its own real version can be read, so a callable is invoked
     AFTER launch but before the context (and therefore the UA) is
-    created."""
+    created.
+
+    `headless` defaults to the module-wide HEADLESS setting but is
+    overridable per-call — added 2026-07-28 for _check_pickup_availability,
+    which needs headless=False specifically (see APPLE_PICKUP_HEADLESS):
+    a controlled same-network A/B test confirmed headless Chromium fails to
+    render Apple's pickUpDetails widget at all, while headful succeeds
+    consistently. Every other caller keeps passing the module default
+    unchanged."""
     # --disable-blink-features=AutomationControlled (2026-07-27, found via
     # a working third-party Apple pickup monitor's own config — see
     # checkers/apple.py's investigation notes) — blocks the CDP-automation
@@ -351,7 +372,7 @@ def _new_browser_and_context(pw, user_agent: str | Callable[[object], str] = _RE
     # systemic defense, not site-specific, same reasoning as every other
     # measure in this function.
     browser = pw.chromium.launch(
-        headless=HEADLESS,
+        headless=headless,
         proxy=_proxy_config(),
         args=["--disable-blink-features=AutomationControlled"],
     )
@@ -1031,7 +1052,17 @@ def _capture_dom_elements(url: str, click_text: str | None = None) -> dict:
 # overlay's full outerHTML, so a real checker function can be built
 # against confirmed structure instead of another guess-and-verify round.
 # ---------------------------------------------------------------------------
+_PICKUP_DETAILS_SELECTOR = '[data-autom="pickUpDetails"]'
 _PICKUP_TRIGGER_SELECTOR = '[data-autom^="productLocatorTriggerLink"]'
+# 2026-07-28: pickUpDetails can ALSO render already "resolved" to a
+# default/session store (e.g. "Pick up Today at Apple Saket"), with NO
+# productLocatorTriggerLink at all — confirmed from a real captured dump.
+# That state's clickable element has NO data-autom attribute; the only
+# real, confirmed hook is data-ase-click="show" (its data-ase-overlay
+# value, "buac-overlay", varies and isn't a reliable selector on its own).
+# Clicking it reopens the SAME pincode-search overlay as the trigger above
+# — confirmed live, not guessed.
+_ALREADY_RESOLVED_TRIGGER_SELECTOR = f'{_PICKUP_DETAILS_SELECTOR} [data-ase-click="show"]'
 _PICKUP_OVERLAY_SELECTOR = '[data-autom="plOverlayContainer"]'
 _PICKUP_ZIPCODE_SELECTOR = '[data-autom="zipCode"]'
 _PICKUP_CONTINUE_SELECTOR = '[data-autom="continuePickUp"]'
@@ -1181,6 +1212,228 @@ def _capture_pickup_flow(url: str, pincode: str) -> dict:
 
                 logger.info(f"[debug-pickup-flow] {url} pincode={pincode!r}: diagnostics={diagnostics}")
                 return {**result, "overlay_html": overlay_html, "diagnostics": diagnostics}
+            finally:
+                browser.close()
+    finally:
+        _check_semaphore.release()
+
+
+# ---------------------------------------------------------------------------
+# /check-pickup-availability: PRODUCTION pincode-availability check via
+# page-render, for Apple's fulfillment-messages API being unusable (see
+# checkers/apple.py's module docstring — 0% success across every param/
+# header/cookie combination tried). Built directly on /debug-pickup-flow's
+# confirmed flow above, scoped to iPhone product pages ONLY (the only
+# tracked product category) — deliberately does NOT handle the different
+# "rf-storelocator-overlay" widget accessory pages use.
+#
+# ⚠️ TWO CAVEATS, BOTH DELIBERATE, NEITHER SILENTLY PAPERED OVER:
+#
+# 1. REQUIRES headless=False (APPLE_PICKUP_HEADLESS, default off — see
+#    above). A controlled same-network A/B test (2026-07-28) confirmed
+#    headless Chromium fails to render pickUpDetails at all, while headful
+#    succeeds consistently, on the SAME network/IP. Calling this on an
+#    unmodified Railway deploy (no physical display) will hit the same
+#    failure headless always did, unless a virtual display (e.g. Xvfb) is
+#    added to the Dockerfile/CMD first — NOT done yet. This function is
+#    safe to call locally/manually today; it is NOT yet wired into any
+#    scheduled production cron.
+#
+# 2. The "available" classification is DELIBERATELY conservative: only a
+#    CONFIRMED phrase for THIS overlay type sets available=True. As of
+#    2026-07-28, no such phrase has actually been confirmed — the one
+#    positive example captured ("Available Today") came from the
+#    DIFFERENT accessory-only "rf-storelocator-overlay" widget, which this
+#    function never touches. So `available` currently can only ever come
+#    back True (never) or None (in practice, always, right now) — same
+#    "never risk a false positive" posture checkers/apple.py's
+#    _evaluate_pickup_availability already uses for the fulfillment-
+#    messages signal (an inconclusive/negative pickup result is NEVER
+#    treated as a confirmed False either, there or here — India's sparse
+#    Apple Store network makes "no pickup nearby" the common case, not
+#    proof of no stock). `raw_text` and `tentative_positive_hint` are
+#    still returned so a real positive capture can be used to tighten this
+#    later instead of guessing at the phrasing now.
+# ---------------------------------------------------------------------------
+
+# Confirmed via a real captured overlay (2026-07-28): "Not available today
+# at 2 nearest stores." — same "inconclusive, not False" treatment
+# checkers/apple.py's _evaluate_pickup_availability already gives an
+# analogous fulfillment-messages result, for the same underlying reason
+# (sparse pickup coverage doesn't mean no stock).
+_PICKUP_NOT_AVAILABLE_PHRASES = ("not available today",)
+# NOT YET CONFIRMED for THIS overlay type (rf-productlocator-overlay) — see
+# the module note above. Logged as a hint only; never sets available=True.
+_PICKUP_TENTATIVE_AVAILABLE_HINT_PHRASES = ("available today", "pick up today at")
+
+
+def _check_pickup_availability(url: str, pincode: str) -> dict:
+    """
+    Production version of _capture_pickup_flow: navigate, detect + click
+    whichever pickUpDetails state is present (trigger_present or
+    already_resolved — see _ALREADY_RESOLVED_TRIGGER_SELECTOR above), wait
+    for the iPhone-specific overlay, ensure the zipCode input holds
+    `pincode` (only fills if it doesn't already — a real observed run
+    showed the field can already hold the right value, in which case
+    filling again is redundant, not incorrect, but reading first avoids an
+    unnecessary extra input event), best-effort click Continue (observed:
+    results can auto-load off the fill alone, leaving Continue already
+    disabled/gone by the time we'd click it — not treated as a failure),
+    then read the overlay's own text and classify it.
+
+    Every step failure is captured into `diagnostics` rather than raising
+    — same "capture the failure mode, don't hide it" philosophy as every
+    other function in this file. See the module note above this function
+    for the two deliberate caveats (headful requirement, conservative
+    classifier) — neither is a bug, both are documented open items.
+    """
+    acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
+    if not acquired:
+        raise RuntimeError(
+            f"too many concurrent checks (max {MAX_CONCURRENT_CHECKS}) — "
+            f"timed out after {SLOT_WAIT_TIMEOUT_SECONDS}s waiting for a free slot"
+        )
+    try:
+        with sync_playwright() as pw:
+            browser, context = _new_browser_and_context(
+                pw, user_agent=_apple_user_agent_for, headless=APPLE_PICKUP_HEADLESS,
+            )
+            try:
+                page = context.new_page()
+
+                diagnostics: dict = {
+                    "goto_status": None,
+                    "goto_error": None,
+                    "pickup_details_wait_timed_out": None,
+                    "state": None,  # "trigger_present" | "already_resolved" | "neither"
+                    "click_error": None,
+                    "overlay_wait_timed_out": None,
+                    "zip_fill_error": None,
+                    "continue_click_error": None,
+                    "extract_error": None,
+                }
+                available: bool | None = None
+                raw_text: str | None = None
+                tentative_positive_hint = False
+
+                try:
+                    main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                    if main_response is not None:
+                        diagnostics["goto_status"] = main_response.status
+                except Exception as exc:
+                    diagnostics["goto_error"] = str(exc)
+                    logger.error(f"[check-pickup-availability] page.goto failed for {url}: {exc}")
+
+                if diagnostics["goto_error"] is None:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                    except Exception:
+                        pass
+                    try:
+                        page.wait_for_selector(_PICKUP_DETAILS_SELECTOR, timeout=10000)
+                        diagnostics["pickup_details_wait_timed_out"] = False
+                    except PlaywrightTimeoutError:
+                        diagnostics["pickup_details_wait_timed_out"] = True
+                    except Exception:
+                        diagnostics["pickup_details_wait_timed_out"] = True
+                    page.wait_for_timeout(3000)
+
+                    if diagnostics["pickup_details_wait_timed_out"] is False:
+                        trigger_locator = page.locator(_PICKUP_TRIGGER_SELECTOR)
+                        resolved_locator = page.locator(_ALREADY_RESOLVED_TRIGGER_SELECTOR)
+
+                        click_target = None
+                        if trigger_locator.count() > 0:
+                            diagnostics["state"] = "trigger_present"
+                            click_target = trigger_locator.first
+                        elif resolved_locator.count() > 0:
+                            diagnostics["state"] = "already_resolved"
+                            click_target = resolved_locator.first
+                        else:
+                            diagnostics["state"] = "neither"
+
+                        if click_target is not None:
+                            try:
+                                click_target.click(timeout=5000)
+                            except Exception as exc:
+                                diagnostics["click_error"] = str(exc)
+                                logger.error(f"[check-pickup-availability] trigger click failed for {url}: {exc}")
+
+                            if diagnostics["click_error"] is None:
+                                try:
+                                    page.wait_for_selector(_PICKUP_OVERLAY_SELECTOR, timeout=10000)
+                                except PlaywrightTimeoutError:
+                                    diagnostics["overlay_wait_timed_out"] = True
+                                except Exception:
+                                    diagnostics["overlay_wait_timed_out"] = True
+
+                                if not diagnostics["overlay_wait_timed_out"]:
+                                    try:
+                                        zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
+                                        zip_input.wait_for(timeout=8000)
+                                        # Only fill if it doesn't already hold the
+                                        # target pincode — a real run showed it
+                                        # can already be populated; an
+                                        # unconditional re-fill isn't WRONG, but
+                                        # reading first avoids a redundant input
+                                        # event and lets us tell the two cases
+                                        # apart in diagnostics if ever needed.
+                                        if zip_input.input_value() != pincode:
+                                            zip_input.fill(pincode)
+                                    except Exception as exc:
+                                        diagnostics["zip_fill_error"] = str(exc)
+                                        logger.error(f"[check-pickup-availability] zipCode fill failed for {url}: {exc}")
+
+                                    if diagnostics["zip_fill_error"] is None:
+                                        # Best-effort — observed: results can
+                                        # auto-load off the fill alone, leaving
+                                        # Continue already disabled/gone. Not a
+                                        # failure either way.
+                                        try:
+                                            continue_btn = page.locator(_PICKUP_CONTINUE_SELECTOR).first
+                                            continue_btn.wait_for(timeout=3000)
+                                            if continue_btn.is_enabled():
+                                                continue_btn.click(timeout=3000)
+                                        except Exception as exc:
+                                            diagnostics["continue_click_error"] = str(exc)
+
+                                        try:
+                                            page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                                        except Exception:
+                                            pass
+                                        page.wait_for_timeout(3000)
+
+                try:
+                    overlay = page.locator(_PICKUP_OVERLAY_SELECTOR).first
+                    if overlay.count() > 0:
+                        raw_text = overlay.inner_text()
+                except Exception as exc:
+                    diagnostics["extract_error"] = str(exc)
+                    logger.error(f"[check-pickup-availability] overlay text extraction failed for {url}: {exc}")
+
+                if raw_text:
+                    text_lower = raw_text.lower()
+                    if any(phrase in text_lower for phrase in _PICKUP_NOT_AVAILABLE_PHRASES):
+                        available = None  # inconclusive, NOT False — see module note
+                    elif any(phrase in text_lower for phrase in _PICKUP_TENTATIVE_AVAILABLE_HINT_PHRASES):
+                        tentative_positive_hint = True
+                        available = None  # NOT auto-confirmed — see module note
+                        logger.warning(
+                            f"[check-pickup-availability] {url} pincode={pincode!r}: tentative "
+                            f"positive phrase seen but NOT confirmed for this overlay type — "
+                            f"reporting inconclusive; raw_text={raw_text[:500]!r}"
+                        )
+
+                logger.info(
+                    f"[check-pickup-availability] {url} pincode={pincode!r}: available={available} "
+                    f"state={diagnostics['state']} diagnostics={diagnostics}"
+                )
+                return {
+                    "available": available,
+                    "raw_text": raw_text,
+                    "tentative_positive_hint": tentative_positive_hint,
+                    "diagnostics": diagnostics,
+                }
             finally:
                 browser.close()
     finally:
@@ -1578,6 +1831,22 @@ def create_app() -> Flask:
             result = _capture_pickup_flow(url, pincode)
         except Exception as exc:
             logger.error(f"[debug-pickup-flow] failed for {url}: {exc}")
+            return jsonify({"url": url, "pincode": pincode, "error": str(exc)}), 502
+
+        return jsonify({"url": url, "pincode": pincode, **result}), 200
+
+    @app.route("/check-pickup-availability", methods=["POST"])
+    def check_pickup_availability():
+        data = request.get_json(silent=True) or {}
+        url = (data.get("url") or "").strip()
+        pincode = (data.get("pincode") or "").strip()
+        if not url or not pincode:
+            return jsonify({"error": "url and pincode are required"}), 400
+
+        try:
+            result = _check_pickup_availability(url, pincode)
+        except Exception as exc:
+            logger.error(f"[check-pickup-availability] failed for {url}: {exc}")
             return jsonify({"url": url, "pincode": pincode, "error": str(exc)}), 502
 
         return jsonify({"url": url, "pincode": pincode, **result}), 200
