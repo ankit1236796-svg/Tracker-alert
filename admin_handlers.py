@@ -4408,6 +4408,18 @@ async def cmd_debugzipcodevalidation(message: Message, command: CommandObject):
     )
 
     _CHUNK_SIZE = 3500
+    typing_trajectory = data.get("typing_trajectory") or []
+    if typing_trajectory:
+        text = f"typing_trajectory ({len(typing_trajectory)} keystrokes):\n{json.dumps(typing_trajectory, indent=2)}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+    else:
+        await _debug_send(
+            message,
+            "⚠️ typing_trajectory is empty — the flow failed before typing "
+            "even started. Check diagnostics above for which step failed.",
+        )
+
     checkpoints = data.get("checkpoints") or {}
     if checkpoints:
         text = f"checkpoints ({len(checkpoints)}):\n{json.dumps(checkpoints, indent=2)}"
