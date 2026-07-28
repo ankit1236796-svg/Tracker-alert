@@ -1189,6 +1189,13 @@ def _capture_pickup_flow(url: str, pincode: str) -> dict:
                     page.wait_for_timeout(4000)
 
                 # Full overlay markup — the actual point of this endpoint.
+                # Cap raised 8000->30000 (2026-07-28): a real Railway
+                # capture hit exactly 8014 chars, cutting off right before
+                # the results/store-list section — the whole reason this
+                # endpoint exists. Debug-only; the PRODUCTION classifier
+                # (_check_pickup_availability) never extracts outerHTML at
+                # all, so it was never affected by this cap either way —
+                # see its own raw_text extraction (.inner_text(), no cap).
                 overlay_html = None
                 try:
                     overlay_html = page.evaluate(
@@ -1196,7 +1203,7 @@ def _capture_pickup_flow(url: str, pincode: str) -> dict:
                             const el = document.querySelector(selector);
                             if (!el) return null;
                             const html = el.outerHTML || '';
-                            return html.length > 8000 ? html.slice(0, 8000) + '...(truncated)' : html;
+                            return html.length > 30000 ? html.slice(0, 30000) + '...(truncated)' : html;
                         }""",
                         _PICKUP_OVERLAY_SELECTOR,
                     )
