@@ -254,6 +254,11 @@ DEFAULT_DEBUG_PINCODE = os.getenv("DEBUG_NETWORK_DEFAULT_PINCODE", "110001")
 # would plausibly contain.
 _NETWORK_CAPTURE_KEYWORDS = (
     "serviceability", "delivery", "pincode", "availability", "stock", "fulfillment",
+    # "pickup" added 2026-07-28: pickup-message-recommendations, found via
+    # _diagnose_zipcode_validation's broader unfiltered capture, doesn't
+    # match any of the keywords above on its own — needed so its response
+    # body gets captured too, not just fulfillment-messages'.
+    "pickup",
 )
 # Cap on how much of each matched response body is kept, so one huge JSON
 # blob can't blow up the HTTP response back to the caller.
@@ -1710,15 +1715,22 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
     Returns {"checkpoints": {name: state_dict, ...}, "enabled_at": name
     or None, "typing_trajectory": [{"char", "value_after",
     "zip_focused_after"}, ...], "network_requests": [...],
-    "diagnostics": {...}} — "enabled_at" is the first checkpoint name
-    where continue_disabled_attr was False, or None if it never became
-    enabled at any checkpoint tried. Every checkpoint that WAS reached is
-    included in "checkpoints", even after "enabled_at" is found, up to
-    (and including) the one that succeeded — later checkpoints are
-    skipped once one succeeds, since there's nothing further to learn by
+    "network_response_bodies": [...], "diagnostics": {...}} —
+    "enabled_at" is the first checkpoint name where continue_disabled_attr
+    was False, or None if it never became enabled at any checkpoint
+    tried. Every checkpoint that WAS reached is included in
+    "checkpoints", even after "enabled_at" is found, up to (and
+    including) the one that succeeded — later checkpoints are skipped
+    once one succeeds, since there's nothing further to learn by
     continuing to poke at an already-fixed state. "network_requests" is
-    every XHR/fetch response seen from just before typing onward,
-    regardless of outcome.
+    every XHR/fetch response's url/method/status seen from just before
+    typing onward, regardless of outcome. "network_response_bodies" is
+    the FULL body (capped at _MAX_BODY_CHARS) for the subset of those
+    matching _NETWORK_CAPTURE_KEYWORDS — the same keyword list
+    /debug-network already uses, not a separate guess — added 2026-07-28
+    after a real run showed fulfillment-messages AND pickup-message-
+    recommendations both firing successfully (200 OK) after typing, from
+    the page's own JS, independent of whether Continue ever enables.
 
     Never raises; a failure at any step is recorded in "diagnostics" and
     whatever checkpoints were reached are still returned.
@@ -1800,21 +1812,44 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
                 # in advance), capped so one noisy page can't blow up the
                 # response.
                 network_requests: list[dict] = []
+                network_response_bodies: list[dict] = []
                 _MAX_NETWORK_REQUESTS = 40
 
                 def _on_response(response):
-                    if len(network_requests) >= _MAX_NETWORK_REQUESTS:
-                        return
                     try:
                         resource_type = response.request.resource_type
                     except Exception:
                         resource_type = "?"
                     if resource_type not in ("xhr", "fetch"):
                         return
-                    network_requests.append({
+                    if len(network_requests) < _MAX_NETWORK_REQUESTS:
+                        network_requests.append({
+                            "url": response.url,
+                            "method": response.request.method,
+                            "status": response.status,
+                        })
+                    # Full body ONLY for keyword-matching responses (2026-07-28,
+                    # after a real run showed fulfillment-messages AND
+                    # pickup-message-recommendations both firing successfully
+                    # from the page's own JS after typing, with 200 OK — the
+                    # actual availability data this whole checker exists to
+                    # find, independent of whether Continue ever enables).
+                    # _NETWORK_CAPTURE_KEYWORDS is the SAME list /debug-network
+                    # already uses, not a separate guess.
+                    url_lower = response.url.lower()
+                    if not any(kw in url_lower for kw in _NETWORK_CAPTURE_KEYWORDS):
+                        return
+                    try:
+                        body = response.text()
+                    except Exception as exc:
+                        body = f"<could not read response body: {exc}>"
+                    if body and len(body) > _MAX_BODY_CHARS:
+                        body = body[:_MAX_BODY_CHARS] + f"...(truncated, {len(body)} chars total)"
+                    network_response_bodies.append({
                         "url": response.url,
                         "method": response.request.method,
                         "status": response.status,
+                        "body": body,
                     })
 
                 page.on("response", _on_response)
@@ -1947,13 +1982,15 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
                 logger.info(
                     f"[debug-zipcode-validation] {url} pincode={pincode!r}: "
                     f"enabled_at={enabled_at} typing_trajectory={typing_trajectory} "
-                    f"checkpoints={checkpoints} network_requests={network_requests} diagnostics={diagnostics}"
+                    f"checkpoints={checkpoints} network_requests={network_requests} "
+                    f"network_response_bodies_count={len(network_response_bodies)} diagnostics={diagnostics}"
                 )
                 return {
                     "checkpoints": checkpoints,
                     "enabled_at": enabled_at,
                     "typing_trajectory": typing_trajectory,
                     "network_requests": network_requests,
+                    "network_response_bodies": network_response_bodies,
                     "diagnostics": diagnostics,
                     "git_commit_sha": GIT_COMMIT_SHA,
                 }

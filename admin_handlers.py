@@ -4444,3 +4444,19 @@ async def cmd_debugzipcodevalidation(message: Message, command: CommandObject):
             "typing, which argues against an async backend validation call "
             "being what Continue is waiting on.",
         )
+
+    network_response_bodies = data.get("network_response_bodies") or []
+    if network_response_bodies:
+        text = (
+            f"network_response_bodies ({len(network_response_bodies)} keyword-matched "
+            f"responses, full body):\n{json.dumps(network_response_bodies, indent=2)}"
+        )
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+    else:
+        await _debug_send(
+            message,
+            "network_response_bodies: none matched _NETWORK_CAPTURE_KEYWORDS — "
+            "either nothing availability-related fired, or it fired under a "
+            "URL that doesn't contain any of those keywords.",
+        )
