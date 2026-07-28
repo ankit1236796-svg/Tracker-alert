@@ -4329,6 +4329,87 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
 
 
 # ---------------------------------------------------------------------------
+# /debugpickupmessage: EXPERIMENTAL, fully isolated test of a THIRD Apple
+# endpoint — /shop/retail/pickup-message — that neither
+# _fetch_pickup_availability (direct fulfillment-messages, 0% success with
+# real cookies) nor _fetch_pickup_availability_via_page_render
+# (playwright_scraper) use. Found (2026-07-28) in two independent
+# open-source repos (one TypeScript, one Go) that reportedly call it with
+# ZERO cookies, ZERO session, ZERO special headers — a plain unauthenticated
+# GET — and describe a response shape matching what we've already confirmed
+# ourselves for pickup-message-recommendations/fulfillment-messages
+# (stores[], partsAvailability, pickupDisplay, storePickupQuote).
+#
+# PURELY ADDITIVE: does its own self-contained httpx GET, imports nothing
+# from and calls nothing in checkers/apple.py's existing pickup-availability
+# functions, doesn't touch playwright_scraper, doesn't touch any production
+# code path. Deliberately sends NO custom headers at all (not even a
+# realistic User-Agent) — faithfully reproducing the "zero anything" claim
+# being tested, not a guess at what MIGHT work. If this comes back gated/
+# blocked, nothing is lost; if it returns real data, that's a genuine
+# simplification opportunity (no browser launch needed) worth a real
+# follow-up, not decided here. Safe to delete freely once this experiment
+# concludes either way.
+# ---------------------------------------------------------------------------
+_DEBUG_PICKUP_MESSAGE_ADMIN_ID = 5004721766  # same hardcoded restriction
+# as every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter.
+
+
+@router.message(Command("debugpickupmessage"))
+async def cmd_debugpickupmessage(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_PICKUP_MESSAGE_ADMIN_ID:
+        return
+
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugpickupmessage &lt;sku&gt; &lt;location&gt; [country=in]</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: <code>/debugpickupmessage &lt;sku&gt; &lt;location&gt; [country=in]</code>",
+            parse_mode="HTML",
+        )
+        return
+    sku, location = parts[0], parts[1]
+    country = parts[2] if len(parts) > 2 else "in"
+
+    url = f"https://www.apple.com/{country}/shop/retail/pickup-message"
+    params = {"parts.0": sku, "location": location}
+
+    await _debug_send(
+        message,
+        f"🔍 EXPERIMENTAL — testing /shop/retail/pickup-message directly: "
+        f"ZERO cookies, ZERO session, ZERO custom headers (not even a "
+        f"User-Agent override), matching what two independent open-source "
+        f"implementations reportedly do.\n"
+        f"url: {url}\nparams: {params}",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, params=params)
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Request failed: {type(exc).__name__}: {exc}")
+        return
+
+    _CHUNK_SIZE = 3500
+    await _debug_send(message, f"status_code: {resp.status_code}\nfinal_url: {resp.url}")
+
+    body_text = resp.text
+    if body_text:
+        text = f"body ({len(body_text)} chars):\n{body_text}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+    else:
+        await _debug_send(message, "body: (empty)")
+
+
+# ---------------------------------------------------------------------------
 # /debugzipcodevalidation: thin wrapper around /debug-zipcode-validation —
 # evidence-gathering for WHY Continue stays disabled after typing pincode
 # (2026-07-28, after press_sequentially alone didn't fix it). Tests, in
