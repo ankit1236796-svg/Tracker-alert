@@ -4409,6 +4409,133 @@ async def cmd_debugpickupmessage(message: Message, command: CommandObject):
         await _debug_send(message, "body: (empty)")
 
 
+_DEBUG_PICKUP_MESSAGE_STRESS_MAX_ATTEMPTS = 20  # sensible cap — this is a
+# manual reliability probe, not something that should be able to hammer
+# apple.com by accident via a typo'd argument.
+
+
+@router.message(Command("debugpickupmessagestress"))
+async def cmd_debugpickupmessagestress(message: Message, command: CommandObject):
+    """EXPERIMENTAL, purely additive — repeatedly calls the same
+    /shop/retail/pickup-message endpoint /debugpickupmessage tests, N times
+    in a row, to see whether it stays consistently unauthenticated/200 or
+    eventually gets rate-limited/blocked. Never calls any existing
+    production pickup-availability code path (see
+    test_never_calls_existing_production_pickup_functions in
+    test_debugpickupmessagestress_command.py)."""
+    if message.from_user.id != _DEBUG_PICKUP_MESSAGE_ADMIN_ID:
+        return
+
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/debugpickupmessagestress &lt;sku&gt; &lt;location&gt; "
+            "[country=in] [attempts=8] [delay_seconds=3]</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: <code>/debugpickupmessagestress &lt;sku&gt; &lt;location&gt; "
+            "[country=in] [attempts=8] [delay_seconds=3]</code>",
+            parse_mode="HTML",
+        )
+        return
+    sku, location = parts[0], parts[1]
+    country = parts[2] if len(parts) > 2 else "in"
+
+    try:
+        attempts = int(parts[3]) if len(parts) > 3 else 8
+    except ValueError:
+        await message.answer("⚠️ attempts must be an integer.")
+        return
+    if attempts < 1 or attempts > _DEBUG_PICKUP_MESSAGE_STRESS_MAX_ATTEMPTS:
+        await message.answer(
+            f"⚠️ attempts must be between 1 and {_DEBUG_PICKUP_MESSAGE_STRESS_MAX_ATTEMPTS}.",
+        )
+        return
+
+    try:
+        delay_seconds = float(parts[4]) if len(parts) > 4 else 3.0
+    except ValueError:
+        await message.answer("⚠️ delay_seconds must be a number.")
+        return
+    if delay_seconds < 0:
+        await message.answer("⚠️ delay_seconds must be >= 0.")
+        return
+
+    url = f"https://www.apple.com/{country}/shop/retail/pickup-message"
+    params = {"parts.0": sku, "location": location}
+
+    await _debug_send(
+        message,
+        f"🔍 EXPERIMENTAL STRESS TEST — calling /shop/retail/pickup-message "
+        f"{attempts} times in a row (delay {delay_seconds}s between calls), "
+        f"ZERO cookies/session/custom headers each time.\n"
+        f"url: {url}\nparams: {params}",
+    )
+
+    results = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for i in range(attempts):
+            attempt_start = time.monotonic()
+            try:
+                resp = await client.get(url, params=params)
+                elapsed = time.monotonic() - attempt_start
+                results.append({
+                    "attempt": i + 1,
+                    "status_code": resp.status_code,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "body_len": len(resp.text),
+                    "error": None,
+                })
+            except Exception as exc:
+                elapsed = time.monotonic() - attempt_start
+                results.append({
+                    "attempt": i + 1,
+                    "status_code": None,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "body_len": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            if i < attempts - 1 and delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+    lines = ["— per-attempt results —"]
+    for r in results:
+        if r["error"] is not None:
+            lines.append(f"#{r['attempt']}: ERROR after {r['elapsed_seconds']}s — {r['error']}")
+        else:
+            lines.append(
+                f"#{r['attempt']}: status={r['status_code']} "
+                f"body_len={r['body_len']} elapsed={r['elapsed_seconds']}s",
+            )
+
+    status_counts = Counter(r["status_code"] for r in results if r["error"] is None)
+    error_count = sum(1 for r in results if r["error"] is not None)
+    status_summary = ", ".join(f"{code}: {count}" for code, count in status_counts.items()) or "(none)"
+
+    lines.append("")
+    lines.append("— summary —")
+    lines.append(f"attempts: {attempts}")
+    lines.append(f"status_code distribution: {status_summary}")
+    lines.append(f"errors/exceptions: {error_count}")
+    successful_elapsed = [r["elapsed_seconds"] for r in results if r["error"] is None]
+    if successful_elapsed:
+        lines.append(
+            f"elapsed: min={min(successful_elapsed)}s max={max(successful_elapsed)}s "
+            f"avg={round(sum(successful_elapsed) / len(successful_elapsed), 2)}s",
+        )
+    consistent = len(status_counts) <= 1 and error_count == 0
+    lines.append(f"consistent behavior throughout: {consistent}")
+
+    combined = "\n".join(lines)
+    _CHUNK_SIZE = 3500
+    for i in range(0, len(combined), _CHUNK_SIZE):
+        await _debug_send(message, combined[i:i + _CHUNK_SIZE])
+
+
 # ---------------------------------------------------------------------------
 # /debugzipcodevalidation: thin wrapper around /debug-zipcode-validation —
 # evidence-gathering for WHY Continue stays disabled after typing pincode
