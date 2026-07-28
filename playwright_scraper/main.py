@@ -1430,12 +1430,12 @@ def _find_stores_list(node, _depth: int = 0):
 
 def _parse_pickup_stores(
     body_text: str, path: list[str], sku: str, available_values: tuple[str, ...],
-) -> tuple[bool | None, list[dict], str | None]:
+) -> tuple[bool | None, list[dict], str | None, dict | None]:
     """
     Parses one pickup-response JSON body (either endpoint — `path` says
     where its stores array lives) and classifies availability for `sku`.
 
-    Returns (available, matching_stores, error):
+    Returns (available, matching_stores, error, info):
       - available: True if `sku` shows one of `available_values` at ANY
         store; False if the stores list is NON-EMPTY, `sku` was found in
         at least one store's partsAvailability, but none show it as
@@ -1450,6 +1450,21 @@ def _parse_pickup_stores(
         {"store_name", "pickup_search_quote", "store_pickup_quote"} —
         empty whenever available is not True.
       - error: a short string on structural/parse failure, else None.
+      - info: {"store_count": int, "sku_found": bool, "sku_keys_seen":
+        list[str]} whenever the body was successfully parsed down to a
+        stores list (even an empty one) — added 2026-07-28 after a real
+        run returned available=None/error=None/matching_stores=[] with
+        no way to tell WHICH of two different "inconclusive" cases that
+        was: zero stores near this pincode at all, vs. real stores
+        present but this SKU absent from every one of their
+        partsAvailability dicts (a possible SKU-formatting mismatch —
+        wrong case, stray whitespace, wrong variant). store_count/
+        sku_found distinguish the two directly; sku_keys_seen is every
+        partsAvailability key actually observed across all stores, so a
+        near-miss is immediately visible instead of requiring another
+        guess-and-redeploy round. None only on a structural failure
+        (JSON parse failure, or no stores list found anywhere at all) —
+        there's no store data to describe in that case.
 
     If `path` doesn't resolve to a list (a different response shape than
     the one `path` was written for), falls back to _find_stores_list
@@ -1464,7 +1479,7 @@ def _parse_pickup_stores(
     try:
         data = json.loads(body_text)
     except Exception as exc:
-        return None, [], f"JSON parse failed: {exc}"
+        return None, [], f"JSON parse failed: {exc}", None
 
     node = data
     path_error = None
@@ -1510,17 +1525,21 @@ def _parse_pickup_stores(
 
     if stores is None:
         top_level = sorted(data.keys()) if isinstance(data, dict) else type(data).__name__
-        return None, [], f"{path_error}; body top-level keys: {top_level}"
+        return None, [], f"{path_error}; body top-level keys: {top_level}", None
 
     if not stores:
-        return None, [], None  # no stores near this pincode — inconclusive
+        # no stores near this pincode — inconclusive
+        return None, [], None, {"store_count": 0, "sku_found": False, "sku_keys_seen": []}
 
     sku_found = False
     matching_stores: list[dict] = []
+    sku_keys_seen: set[str] = set()
     for store in stores:
         if not isinstance(store, dict):
             continue
-        part_info = (store.get("partsAvailability") or {}).get(sku)
+        parts_availability = store.get("partsAvailability") or {}
+        sku_keys_seen.update(parts_availability.keys())
+        part_info = parts_availability.get(sku)
         if part_info is None:
             continue
         sku_found = True
@@ -1531,10 +1550,12 @@ def _parse_pickup_stores(
                 "store_pickup_quote": part_info.get("storePickupQuote"),
             })
 
-    if not sku_found:
-        return None, [], None  # stores exist, but none carry data for OUR sku
+    info = {"store_count": len(stores), "sku_found": sku_found, "sku_keys_seen": sorted(sku_keys_seen)}
 
-    return (True if matching_stores else False), matching_stores, None
+    if not sku_found:
+        return None, [], None, info  # stores exist, but none carry data for OUR sku
+
+    return (True if matching_stores else False), matching_stores, None, info
 
 
 def _check_pickup_availability_once(url: str, pincode: str) -> dict:
@@ -1615,6 +1636,10 @@ def _check_pickup_availability_once(url: str, pincode: str) -> dict:
                 "response_wait_timed_out": None,
                 "used_endpoint": None,  # "pickup_message_recommendations" | "fulfillment_messages" | None
                 "parse_error": None,
+                # 2026-07-28: distinguishes the two different reasons
+                # available can end up None with parse_error=None — see
+                # _parse_pickup_stores' own docstring on `info`.
+                "parse_info": None,
                 # Fallback visibility (2026-07-28, added after a real
                 # run showed response_wait_timed_out=True on a URL
                 # that HAD produced a real pickup-message-
@@ -1814,7 +1839,7 @@ def _check_pickup_availability_once(url: str, pincode: str) -> dict:
                 diagnostics["parse_error"] = diagnostics["sku_error"] or "SKU could not be extracted from the page"
             elif captured_bodies["pickup_message_recommendations"] is not None:
                 diagnostics["used_endpoint"] = "pickup_message_recommendations"
-                available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
+                available, matching_stores, diagnostics["parse_error"], diagnostics["parse_info"] = _parse_pickup_stores(
                     captured_bodies["pickup_message_recommendations"],
                     ["body", "PickupMessage", "stores"],
                     diagnostics["sku"],
@@ -1822,7 +1847,7 @@ def _check_pickup_availability_once(url: str, pincode: str) -> dict:
                 )
             elif captured_bodies["fulfillment_messages"] is not None:
                 diagnostics["used_endpoint"] = "fulfillment_messages"
-                available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
+                available, matching_stores, diagnostics["parse_error"], diagnostics["parse_info"] = _parse_pickup_stores(
                     captured_bodies["fulfillment_messages"],
                     ["body", "content", "pickupMessage", "stores"],
                     diagnostics["sku"],
