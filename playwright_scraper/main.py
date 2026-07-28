@@ -1303,11 +1303,13 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
     Production version of _capture_pickup_flow: navigate, detect + click
     whichever pickUpDetails state is present (trigger_present or
     already_resolved — see _ALREADY_RESOLVED_TRIGGER_SELECTOR above), wait
-    for the iPhone-specific overlay, unconditionally fill the zipCode
-    input with `pincode` (matches _capture_pickup_flow's own proven-
-    working fill — an earlier conditional "only fill if it doesn't
-    already hold the right value" version was reverted after a real run
-    showed it can leave the field never actually submitted), click
+    for the iPhone-specific overlay, type `pincode` into the zipCode
+    input via real per-character keystroke simulation (clear() then
+    press_sequentially(), NOT fill() — a real diagnosed run showed fill()
+    sets the value with no error, but never satisfies Apple's own
+    validation JS, leaving Continue permanently disabled and results
+    never loading; Apple's page apparently listens for actual keyboard
+    events per character, not just a programmatic value change), click
     Continue if it's actually enabled (recording continue_button_found/
     continue_button_enabled explicitly rather than silently guessing why
     it wasn't — see the code's own comment on why "not enabled" is
@@ -1410,21 +1412,27 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                                     try:
                                         zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
                                         zip_input.wait_for(timeout=8000)
-                                        # Unconditional fill (2026-07-28,
-                                        # reverted from a conditional
-                                        # input_value()-check version) —
-                                        # matches _capture_pickup_flow's
-                                        # own fill, the one flow that's
-                                        # actually been proven to reach a
-                                        # real result end-to-end. The
-                                        # conditional version was an
-                                        # untested "optimization" based on
-                                        # an unresolved ambiguity (did
-                                        # Apple pre-fill it, or did an
-                                        # earlier run's own fill do that);
-                                        # removed rather than kept as an
-                                        # unproven extra moving part.
-                                        zip_input.fill(pincode)
+                                        # press_sequentially, NOT fill()
+                                        # (2026-07-28, switched after a
+                                        # real diagnosed run: fill()
+                                        # succeeded — no zip_fill_error —
+                                        # but Continue never became
+                                        # enabled and results never
+                                        # loaded, confirming Apple's page
+                                        # needs real keystroke events
+                                        # (keydown/input/keyup per
+                                        # character) to satisfy its own
+                                        # validation, not just a
+                                        # programmatic value change.
+                                        # .clear() first since
+                                        # press_sequentially APPENDS to
+                                        # existing content rather than
+                                        # replacing it (unlike fill) —
+                                        # matters for the already_resolved
+                                        # state, where the field can start
+                                        # non-empty.
+                                        zip_input.clear()
+                                        zip_input.press_sequentially(pincode, delay=50)
                                     except Exception as exc:
                                         diagnostics["zip_fill_error"] = str(exc)
                                         logger.error(f"[check-pickup-availability] zipCode fill failed for {url}: {exc}")
