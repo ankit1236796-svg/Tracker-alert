@@ -1451,6 +1451,7 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                     "click_error": None,
                     "overlay_wait_timed_out": None,
                     "zip_fill_error": None,
+                    "enter_key_error": None,
                     "sku": None,
                     "sku_source": None,  # "page_content_regex" | "trigger_data_autom"
                     "sku_error": None,
@@ -1600,14 +1601,43 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                                         logger.error(f"[check-pickup-availability] zipCode fill failed for {url}: {exc}")
 
                                     if diagnostics["zip_fill_error"] is None:
+                                        # Enter keypress (2026-07-28,
+                                        # added after a real intermittent
+                                        # non-firing case): the ONE
+                                        # confirmed-successful diagnostic
+                                        # run also pressed Enter shortly
+                                        # after typing (its checkpoint F) —
+                                        # "typing alone triggers it" was
+                                        # inferred from that run's overall
+                                        # success, never actually isolated
+                                        # from whether Enter played a
+                                        # part. Best-effort; a failure here
+                                        # doesn't block the poll below.
+                                        try:
+                                            page.keyboard.press("Enter")
+                                        except Exception as exc:
+                                            diagnostics["enter_key_error"] = str(exc)
+
                                         # Poll for either response to
                                         # arrive rather than a fixed
                                         # dwell — Continue's own state is
                                         # irrelevant now, so there's
-                                        # nothing else to wait on.
+                                        # nothing else to wait on. Deadline
+                                        # raised 8000->15000ms (2026-07-28)
+                                        # — the one confirmed-successful
+                                        # diagnostic run stayed open for
+                                        # 7+ seconds AFTER typing across
+                                        # its own checkpoint dwells before
+                                        # giving up, longer than this
+                                        # function's old 8s total; a
+                                        # shorter window here couldn't
+                                        # actually rule out "just needs
+                                        # more time" as part of the
+                                        # explanation for intermittent
+                                        # non-firing.
                                         waited_ms = 0
                                         step_ms = 250
-                                        deadline_ms = 8000
+                                        deadline_ms = 15000
                                         while (
                                             waited_ms < deadline_ms
                                             and captured_bodies["pickup_message_recommendations"] is None
