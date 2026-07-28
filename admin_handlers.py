@@ -4241,3 +4241,90 @@ async def cmd_debugpickupflow(message: Message, command: CommandObject):
         text = f"{label} ({len(items)}):\n{json.dumps(items, indent=2)}"
         for i in range(0, len(text), _CHUNK_SIZE):
             await _debug_send(message, text[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
+# /debugpickupavailability: thin wrapper around the PRODUCTION
+# /check-pickup-availability endpoint (checkers/apple.py's
+# _fetch_pickup_availability_via_page_render calls the same one) — unlike
+# /debugpickupflow above (which hits the raw diagnostic /debug-pickup-flow
+# endpoint and dumps HTML for a human to read), this exercises the actual
+# classifier that would run in production, so its `available` value is a
+# direct answer to "does the real checker logic work against this page
+# right now", not something inferred from eyeballing markup. NOT wired
+# into any production code path itself — purely diagnostic, safe to
+# delete alongside /check-pickup-availability once no longer needed.
+# ---------------------------------------------------------------------------
+_DEBUG_PICKUP_AVAILABILITY_ADMIN_ID = 5004721766  # same hardcoded restriction
+# as every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter.
+
+
+@router.message(Command("debugpickupavailability"))
+async def cmd_debugpickupavailability(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_PICKUP_AVAILABILITY_ADMIN_ID:
+        return
+
+    from config import PLAYWRIGHT_SCRAPER_URL
+
+    if not command.args:
+        await message.answer("Usage: <code>/debugpickupavailability &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/debugpickupavailability &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        return
+    url, pincode = parts[0], parts[1]
+
+    if not PLAYWRIGHT_SCRAPER_URL:
+        await _debug_send(message, "⚠️ PLAYWRIGHT_SCRAPER_URL is not set on this service — nothing to call.")
+        return
+
+    await _debug_send(
+        message,
+        f"🔍 Running the PRODUCTION pickup-availability checker on {url} for "
+        f"pincode {pincode} (playwright_scraper: {PLAYWRIGHT_SCRAPER_URL})…",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                f"{PLAYWRIGHT_SCRAPER_URL}/check-pickup-availability", json={"url": url, "pincode": pincode},
+            )
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Request to playwright_scraper failed: {exc}")
+        return
+
+    if resp.status_code != 200:
+        await _debug_send(message, f"⚠️ playwright_scraper returned HTTP {resp.status_code}: {resp.text[:500]!r}")
+        return
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Non-JSON response from playwright_scraper: {exc}")
+        return
+
+    available = data.get("available")
+    hint = data.get("tentative_positive_hint")
+    await _debug_send(
+        message,
+        f"available: {available!r}\n"
+        f"tentative_positive_hint: {hint!r}"
+        + ("  ⚠️ seen but NOT auto-confirmed — see raw_text below" if hint else "")
+        + f"\ndiagnostics: {data.get('diagnostics')}",
+    )
+
+    _CHUNK_SIZE = 3500
+    raw_text = data.get("raw_text")
+    if raw_text:
+        text = f"raw_text ({len(raw_text)} chars):\n{raw_text}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+    else:
+        await _debug_send(
+            message,
+            "⚠️ raw_text is empty — the overlay never appeared or nothing "
+            "could be extracted. Check diagnostics above for which step failed.",
+        )
