@@ -170,6 +170,17 @@ logger = logging.getLogger("playwright_scraper")
 PORT = int(os.getenv("PORT", "8080"))
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
 
+# Railway auto-injects this for every deploy built from git — surfaced in
+# /health and _check_pickup_availability's own diagnostics (2026-07-28)
+# so a test result can self-report which commit actually produced it,
+# instead of needing to cross-reference Railway's dashboard/logs by
+# timestamp to rule out "new code hasn't deployed yet" vs. "new code
+# deployed but the fix didn't work" — a real ambiguity hit once already
+# when a fix changed behavior but not the diagnostics dict's shape, so
+# two different commits' outputs looked identical. None locally / on any
+# platform that doesn't set this var.
+GIT_COMMIT_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA")
+
 # Optional shared secret for /refresh-apple-cookies only (every other
 # endpoint here stays unauthenticated, by design — see the module docstring
 # and README). Unset means no auth check, matching this service's existing
@@ -1528,6 +1539,7 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                     "raw_text": raw_text,
                     "tentative_positive_hint": tentative_positive_hint,
                     "diagnostics": diagnostics,
+                    "git_commit_sha": GIT_COMMIT_SHA,
                 }
             finally:
                 browser.close()
@@ -1992,6 +2004,7 @@ def create_app() -> Flask:
             "supported_stores": sorted(CHECKERS),
             "apple_cookie_refresh_auth_required": bool(INTERNAL_REFRESH_TOKEN),
             "playwright_version": playwright_version,
+            "git_commit_sha": GIT_COMMIT_SHA,
         })
 
     return app
