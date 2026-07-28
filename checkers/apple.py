@@ -640,14 +640,39 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 # here either.
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _adapt_page_render_stores(matching_stores: list[dict]) -> list[dict]:
+    """
+    Adapts playwright_scraper's matching_stores shape
+    ({"store_name", "pickup_search_quote", "store_pickup_quote"}) into the
+    {"store_name", "location"} shape available_stores_for_pickup produces
+    and notifications.send_pickup_alert / send_channel_pickup_alert
+    expect (2026-07-28, added when wiring page-render into
+    check_pickup_row/check_channel_pickup_row).
+
+    "location" here is NOT a geographic address (page-render's endpoint
+    doesn't return one) — it's the store's own pickup-timing quote
+    (store_pickup_quote preferred, pickup_search_quote as a fallback,
+    e.g. "Tomorrow at Apple Noida"), reused best-effort as still-useful
+    context in the alert text, same "speculative, several plausible
+    values" spirit as _extract_store_location above.
+    """
+    adapted = []
+    for store in matching_stores:
+        adapted.append({
+            "store_name": store.get("store_name") or "(unnamed store)",
+            "location": store.get("store_pickup_quote") or store.get("pickup_search_quote"),
+        })
+    return adapted
+
+
 async def _fetch_pickup_availability_via_page_render(
     product_url: str, pincode: str,
-) -> tuple[bool | None, str | None]:
+) -> tuple[bool | None, list[dict], str | None]:
     """
     Calls playwright_scraper's /check-pickup-availability instead of
     Apple's fulfillment-messages API directly.
 
-    Returns (available, error):
+    Returns (available, matching_stores, error):
       - available: True if at least one specific, named nearby store
         shows this SKU as available for pickup — a genuine, pincode-
         specific confirmation, same meaning as _evaluate_pickup_
@@ -662,20 +687,37 @@ async def _fetch_pickup_availability_via_page_render(
         stores near this pincode at all, the SKU not found in any
         store's data, or the check failing before a response ever
         arrived.
+      - matching_stores: every store showing SKU as available, as
+        {"store_name", "location"} — see _adapt_page_render_stores above
+        for what "location" actually holds here. Empty whenever
+        available is not True.
       - error: None on a successful call (regardless of the resulting
         `available` value), else a short human-readable reason (missing
         PLAYWRIGHT_SCRAPER_URL, network error, non-200, non-JSON) —
         mirrors _cookie_auth_fetch's (data, error) contract above.
 
-    NOT yet wired into check_pickup_row / check_channel_pickup_row /
-    refine_with_pincode — this is the checker function itself; deciding
-    whether/how it replaces or supplements the (currently broken) direct
-    httpx path in those production call sites is a separate decision, not
-    made here. playwright_scraper's Dockerfile starts a virtual display
+    WIRED into check_pickup_row / check_channel_pickup_row (2026-07-28) —
+    the direct httpx path (_fetch_pickup_availability above) stays at 0%
+    success (see this module's PARAM SET / HEADER HISTORY notes), so this
+    page-render path is now the one those production cycles actually use.
+    refine_with_pincode is untouched — a separate decision, not made
+    here. playwright_scraper's Dockerfile starts a virtual display
     (start.sh — explicit Xvfb + readiness poll) so its headless=False
     requirement can run on Railway's display-less container — confirmed
     working via a real deploy as of the checkpoint diagnostics this
     endpoint's rewrite is built on top of.
+
+    timeout=240.0 (2026-07-28, raised from 90.0 when this endpoint
+    started being called from an unattended production cycle instead of
+    only manual /debugpickupavailability calls): playwright_scraper's own
+    retry loop (APPLE_PICKUP_MAX_ATTEMPTS, default 3) can legitimately
+    take close to 90s on its own in a realistic worst case (three ~25-30s
+    attempts + inter-attempt delays), and a badly-behaving page hitting
+    several individual step timeouts within one attempt (pickup_details_
+    wait_timed_out, overlay_wait_timed_out, etc. — all real, previously
+    observed failure modes) can push a single attempt well past that. 90s
+    risked this client giving up before playwright_scraper's own retry
+    loop had a chance to.
 
     Never raises.
     """
@@ -684,10 +726,10 @@ async def _fetch_pickup_availability_via_page_render(
     if not PLAYWRIGHT_SCRAPER_URL:
         reason = "PLAYWRIGHT_SCRAPER_URL is not configured"
         logger.warning(f"[apple][page-render] {reason} — skipping pincode={pincode!r}")
-        return None, reason
+        return None, [], reason
 
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(timeout=240.0) as client:
             resp = await client.post(
                 f"{PLAYWRIGHT_SCRAPER_URL}/check-pickup-availability",
                 json={"url": product_url, "pincode": pincode},
@@ -695,28 +737,28 @@ async def _fetch_pickup_availability_via_page_render(
     except Exception as exc:
         reason = f"request to playwright_scraper failed: {type(exc).__name__}: {exc}"
         logger.warning(f"[apple][page-render] {reason}")
-        return None, reason
+        return None, [], reason
 
     if resp.status_code != 200:
         reason = f"playwright_scraper returned HTTP {resp.status_code}: {resp.text[:300]!r}"
         logger.warning(f"[apple][page-render] {reason}")
-        return None, reason
+        return None, [], reason
 
     try:
         data = resp.json()
     except Exception as exc:
         reason = f"non-JSON response from playwright_scraper: {exc}"
         logger.warning(f"[apple][page-render] {reason}")
-        return None, reason
+        return None, [], reason
 
     available = data.get("available")
-    matching_stores = data.get("matching_stores") or []
+    matching_stores = _adapt_page_render_stores(data.get("matching_stores") or [])
     logger.info(
         f"[apple][page-render] pincode={pincode!r}: available={available} "
         f"matching_stores={[s.get('store_name') for s in matching_stores]} "
         f"diagnostics={data.get('diagnostics')}"
     )
-    return available, None
+    return available, matching_stores, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -817,10 +859,11 @@ def available_stores_for_pickup(data: dict, sku: str) -> list[dict]:
 async def check_pickup_row(bot, row: dict) -> dict:
     """
     Checks every saved pincode for one database.pickup_tracking row RIGHT
-    NOW: calls the fulfillment-messages API per pincode, updates the row's
-    persisted pincode_status on any change, and sends a pickup-availability
-    notification (notifications.send_pickup_alert) on a genuine
-    unavailable->available transition.
+    NOW: calls playwright_scraper's page-render pickup check
+    (_fetch_pickup_availability_via_page_render) per pincode, updates the
+    row's persisted pincode_status on any change, and sends a
+    pickup-availability notification (notifications.send_pickup_alert) on
+    a genuine unavailable->available transition.
 
     Lives HERE rather than in bot.py (where it originated) so both
     bot.run_pickup_check_cycle's scheduled cycle AND handlers.py's
@@ -840,25 +883,40 @@ async def check_pickup_row(bot, row: dict) -> dict:
     this call — used by /mypickups to show the caller a live per-pincode
     result immediately, on top of the DB-update-and-notify side effects
     this function already performs (the scheduled cycle simply ignores the
-    return value). A pincode whose API call fails this round is absent
-    from the returned dict, mirroring its "left untouched" DB-status
-    behavior below.
+    return value). A pincode whose check fails this round is absent from
+    the returned dict, mirroring its "left untouched" DB-status behavior
+    below.
 
-    A pincode whose API call fails (data is None — network error, non-200,
-    non-JSON/challenge page) is left completely untouched: mirrors
-    bot._apply_result_to_row's "None = inconclusive, skip the write"
-    convention for the regular stock checker — a transient failure must
-    never flip a previously-available pincode back to unavailable, which
-    would otherwise manufacture a spurious future "transition" and a
-    duplicate/false alert once the API recovers.
+    2026-07-28: WIRED to _fetch_pickup_availability_via_page_render
+    (playwright_scraper), replacing the direct httpx path
+    (_fetch_pickup_availability), which stays at 0% success (see this
+    module's PARAM SET / HEADER HISTORY notes) — this row was effectively
+    a no-op before this change (every call returned data=None, so nothing
+    below the `continue` ever ran). SKU is no longer looked up here at
+    all: the page-render endpoint extracts it itself from the live page
+    (see playwright_scraper's own SKU-extraction priority note), so
+    row["sku"] (still used elsewhere, e.g. refine_with_pincode) is simply
+    unused in this function now.
 
-    A successful call with zero available stores (including zero stores
-    returned at all) IS a real, known "unavailable" answer for this
-    feature's specific question ("is pickup available near this pincode
-    right now") — unlike the generic OOS-inference use in
-    _evaluate_pickup_availability, there's no separate signal here that a
-    "no stores nearby" result could be confused with, so it's safe to
-    persist as False.
+    A pincode whose check returns available=None is left completely
+    untouched: mirrors bot._apply_result_to_row's "None = inconclusive,
+    skip the write" convention for the regular stock checker — a
+    transient failure (or a genuine "no stores near this pincode at all")
+    must never flip a previously-available pincode back to unavailable,
+    which would otherwise manufacture a spurious future "transition" and
+    a duplicate/false alert once the signal recovers. This now also
+    covers the outright-failure case (error is not None) since
+    _fetch_pickup_availability_via_page_render always returns
+    available=None whenever error is set.
+
+    A returned available=False (real candidate stores were checked for
+    this pincode, none show the SKU as available — page-render's own
+    confirmed-negative case, see that function's docstring) IS persisted
+    as a real "unavailable" answer, same reasoning this function's
+    predecessor used for "zero stores" under the direct-API path — just
+    now backed by a more precise signal that distinguishes it from "no
+    stores near this pincode at all" (which stays None/untouched instead,
+    unlike the old direct-API path which couldn't tell the two apart).
     """
     # Deferred imports: database.py/notifications.py don't import checkers
     # back (verified — no cycle either direction), but keeping these local
@@ -874,18 +932,17 @@ async def check_pickup_row(bot, row: dict) -> dict:
     results: dict[str, list[dict]] = {}
     for pincode in row["pincodes"]:
         try:
-            data, _method, _diag = await _fetch_pickup_availability(row["sku"], pincode, row["url"])
+            available, stores, _error = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
         except Exception as exc:
             logger.error(
                 f"[apple][pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
             )
             continue
-        if data is None:
+        if available is None:
             continue  # inconclusive this call — leave prior status untouched
 
-        stores = available_stores_for_pickup(data, row["sku"])
         results[pincode] = stores
-        now_available = bool(stores)
+        now_available = available
         was_available = bool(status.get(pincode, False))
 
         if now_available != was_available:
@@ -944,6 +1001,14 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     every call (unlike check_pickup_row, which only writes `if changed`)
     so /listforwarding's last-checked display stays accurate even on
     cycles with no transitions.
+
+    2026-07-28: WIRED to _fetch_pickup_availability_via_page_render, same
+    change and same reasoning as check_pickup_row above — see that
+    function's own docstring for the full detail (0%-success direct httpx
+    path replaced, None/False semantics, etc.). `sku` is still resolved
+    here (unlike check_pickup_row, which drops SKU lookup entirely) only
+    because update_channel_forward_pickup_status persists it separately;
+    it's no longer passed into the availability check itself.
     """
     # Deferred imports — see check_pickup_row's own note above for why.
     from database import update_channel_forward_pickup_status, is_forwarding_paused, get_forward_channel
@@ -974,18 +1039,17 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     channel = None
     for pincode in row.get("pincodes") or []:
         try:
-            data, _method, _diag = await _fetch_pickup_availability(sku, pincode, row["url"])
+            available, stores, _error = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
         except Exception as exc:
             logger.error(
                 f"[apple][channel-pickup] error checking #{row['id']} pincode={pincode!r}: {exc}"
             )
             continue
-        if data is None:
+        if available is None:
             continue  # inconclusive this call — leave prior status untouched
 
-        stores = available_stores_for_pickup(data, sku)
         results[pincode] = stores
-        now_available = bool(stores)
+        now_available = available
         was_available = bool(status.get(pincode, False))
         status[pincode] = now_available
 
