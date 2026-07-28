@@ -666,10 +666,12 @@ async def _fetch_pickup_availability_via_page_render(
     refine_with_pincode — this is the checker function itself; deciding
     whether/how it replaces or supplements the (currently broken) direct
     httpx path in those production call sites is a separate decision, not
-    made here. Also NOT usable as-is on an unmodified Railway deploy —
-    playwright_scraper needs a virtual display (Xvfb) added before this
-    can succeed there; see playwright_scraper/main.py's
-    _check_pickup_availability docstring for why.
+    made here. playwright_scraper's Dockerfile now starts a virtual
+    display (xvfb-run) so its headless=False requirement can run on
+    Railway's display-less container, but that Dockerfile change is
+    UNTESTED (no way to build/run a real Docker container from the
+    environment that wrote it) — see playwright_scraper/main.py's
+    _check_pickup_availability docstring for the full caveat.
 
     Never raises.
     """
