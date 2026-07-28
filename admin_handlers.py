@@ -4274,31 +4274,45 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
         return
 
     if not command.args:
-        await message.answer("Usage: <code>/debugpickupavailability &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        await message.answer(
+            "Usage: <code>/debugpickupavailability &lt;apple_url&gt; &lt;pincode&gt; [sku]</code>",
+            parse_mode="HTML",
+        )
         return
 
     parts = command.args.strip().split()
     if len(parts) < 2:
-        await message.answer("Usage: <code>/debugpickupavailability &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        await message.answer(
+            "Usage: <code>/debugpickupavailability &lt;apple_url&gt; &lt;pincode&gt; [sku]</code>",
+            parse_mode="HTML",
+        )
         return
     url, pincode = parts[0], parts[1]
+    sku = parts[2] if len(parts) > 2 else None
 
     await _debug_send(
         message,
         f"🔍 Running the PRODUCTION pickup-availability checker (same cached "
-        f"function check_pickup_row uses) on {url} for pincode {pincode}…",
+        f"function check_pickup_row uses) on {url} for pincode {pincode}"
+        + (f" (sku={sku!r} — will try direct_http first, Playwright fallback)" if sku else " (no sku given — Playwright only, same as before the direct_http fallback existed)")
+        + "…",
     )
 
-    available, matching_stores, error, meta = await apple._fetch_pickup_availability_via_page_render(url, pincode)
+    available, matching_stores, error, meta = await apple._fetch_pickup_availability_via_page_render(url, pincode, sku)
 
     _CHUNK_SIZE = 3500
 
     await _debug_send(
         message,
-        f"served_from_cache: {meta['served_from_cache']!r} — True means this exact "
+        f"method_used: {meta['method_used']!r} — which path actually produced this "
+        f"result: 'direct_http' (the new /shop/retail/pickup-message endpoint) or "
+        f"'playwright' (the Xvfb/browser fallback)\n"
+        f"direct_http_attempted: {meta['direct_http_attempted']!r}"
+        + (f" — failed with: {meta['direct_http_error']}" if meta['direct_http_error'] else "")
+        + f"\nserved_from_cache: {meta['served_from_cache']!r} — True means this exact "
         f"(url, pincode) was already checked within the last "
         f"{apple._PAGE_RENDER_CACHE_TTL_SECONDS}s and this call reused that result "
-        f"WITHOUT launching a new browser check; call this command twice in a row "
+        f"WITHOUT launching a new check; call this command twice in a row "
         f"for the same url/pincode to see it flip from False to True\n"
         f"git_commit_sha: {meta['git_commit_sha']!r} — compare this against "
         f"the commit you expect to be deployed, so a result that looks like an "

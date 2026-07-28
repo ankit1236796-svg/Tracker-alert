@@ -624,6 +624,152 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Pincode-specific availability via the PUBLIC, ZERO-AUTH /shop/retail/
+# pickup-message endpoint (2026-07-28) — a THIRD Apple endpoint, found in
+# two independent open-source implementations, that turned out to need NO
+# cookies/session/custom headers at all (unlike _fetch_pickup_availability
+# above, which stays at 0% success against fulfillment-messages the same
+# way). First proven live via /debugpickupmessage (a genuine 200 OK with
+# real pickupDisplay/storesCount data), then stress-tested for reliability
+# via /debugpickupmessagestress (8/8 200s, byte-identical body, ~0.27s
+# average — vs. 30-90+s for the Playwright approach). Response shape
+# matches fulfillment-messages exactly (body.content.pickupMessage.stores),
+# so _parse_pickup_message_response below reuses the same field names
+# _evaluate_pickup_availability/available_stores_for_pickup already know.
+#
+# This is now tried FIRST by _fetch_pickup_availability_via_page_render
+# below, with the existing Playwright/Xvfb approach kept as an AUTOMATIC
+# FALLBACK — never a manual switch — for whenever this endpoint errors,
+# times out, or returns an unexpected shape. Both paths stay active
+# simultaneously; see that function's own docstring for the exact
+# fallback contract and the `method_used`/`direct_http_attempted`/
+# `direct_http_error` meta fields that make which path actually ran
+# visible in diagnostics/logs for every single check.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_PICKUP_MESSAGE_URL_TEMPLATE = "https://www.apple.com/{country}/shop/retail/pickup-message"
+_PICKUP_MESSAGE_COUNTRY = "in"
+# Stress-tested average was ~0.27s (see module note above) — 15s is
+# generous headroom for a slow response while still being a small
+# fraction of the old 240s Playwright-path timeout below.
+_PICKUP_MESSAGE_TIMEOUT = 15.0
+
+
+def _parse_pickup_message_response(data: dict, sku: str) -> tuple[bool | None, list[dict], str | None, dict]:
+    """
+    Parses a /shop/retail/pickup-message response body — confirmed
+    (2026-07-28, live test) to share fulfillment-messages' exact shape:
+    body.content.pickupMessage.stores, each store carrying
+    partsAvailability keyed by SKU. Mirrors playwright_scraper's own
+    _parse_pickup_stores three-way True/False/None semantics exactly, so
+    both paths behave identically from every caller's point of view:
+      - True: at least one store shows this SKU as available/eligible for
+        pickup — a genuine, pincode-specific confirmation.
+      - False: real stores were returned and the SKU WAS found in at
+        least one store's partsAvailability, but none show it available —
+        a confirmed negative, not "no data".
+      - None: no stores near this pincode at all, OR the SKU wasn't found
+        in any returned store's partsAvailability — inconclusive, never a
+        confirmed negative (same "sparse Indian store network" reasoning
+        this module uses everywhere else).
+
+    error is set ONLY when the response is missing body/content/
+    pickupMessage entirely (a genuinely unexpected shape) — NOT on the
+    ordinary "zero stores"/"sku not found" cases above, which are valid,
+    fully-parsed signals. This distinction is what
+    _fetch_pickup_availability_via_page_render's fallback decision is
+    built on: error triggers a fallback to Playwright, a legitimate None
+    does not (it means exactly what Playwright's own None already means
+    to every caller).
+    """
+    try:
+        pickup_message = (data.get("body") or {}).get("content", {}).get("pickupMessage")
+    except AttributeError:
+        pickup_message = None
+    if not isinstance(pickup_message, dict):
+        return None, [], "unexpected response shape — no body.content.pickupMessage", {
+            "store_count": 0, "sku_found": False, "sku_keys_seen": [],
+        }
+    stores = pickup_message.get("stores")
+    if stores is None:
+        return None, [], "unexpected response shape — no body.content.pickupMessage.stores", {
+            "store_count": 0, "sku_found": False, "sku_keys_seen": [],
+        }
+
+    if not stores:
+        return None, [], None, {"store_count": 0, "sku_found": False, "sku_keys_seen": []}
+
+    sku_found = False
+    matching_stores: list[dict] = []
+    sku_keys_seen: set[str] = set()
+    for store in stores:
+        if not isinstance(store, dict):
+            continue
+        parts_availability = store.get("partsAvailability") or {}
+        sku_keys_seen.update(parts_availability.keys())
+        part_info = parts_availability.get(sku)
+        if part_info is None:
+            continue
+        sku_found = True
+        if part_info.get("pickupDisplay", "") in ("available", "eligible"):
+            matching_stores.append({
+                "store_name": store.get("storeName") or "(unnamed store)",
+                "location": _extract_store_location(store),
+            })
+
+    info = {"store_count": len(stores), "sku_found": sku_found, "sku_keys_seen": sorted(sku_keys_seen)}
+    if not sku_found:
+        return None, [], None, info
+    return (True if matching_stores else False), matching_stores, None, info
+
+
+async def _fetch_pickup_message_direct(sku: str, pincode: str) -> tuple[bool | None, list[dict], str | None, dict | None]:
+    """
+    One direct, unauthenticated httpx GET to /shop/retail/pickup-message —
+    ZERO cookies, ZERO session, ZERO custom headers (confirmed sufficient
+    live; see the module note above this section). Returns (available,
+    matching_stores, error, parse_info) with the same True/False/None
+    semantics as _parse_pickup_message_response above. error is set on a
+    network failure, non-200, non-JSON body, or a genuinely unexpected
+    response shape — the exact conditions
+    _fetch_pickup_availability_via_page_render treats as "this endpoint
+    failed, fall back to Playwright". Never raises.
+    """
+    url = _PICKUP_MESSAGE_URL_TEMPLATE.format(country=_PICKUP_MESSAGE_COUNTRY)
+    params = {"parts.0": sku, "location": pincode}
+
+    try:
+        async with httpx.AsyncClient(timeout=_PICKUP_MESSAGE_TIMEOUT) as client:
+            resp = await client.get(url, params=params)
+    except Exception as exc:
+        reason = f"request failed: {type(exc).__name__}: {exc}"
+        logger.warning(f"[apple][pickup-message-direct] pincode={pincode!r} {reason}")
+        return None, [], reason, None
+
+    if resp.status_code != 200:
+        reason = f"HTTP {resp.status_code}: {resp.text[:200]!r}"
+        logger.warning(f"[apple][pickup-message-direct] pincode={pincode!r} {reason}")
+        return None, [], reason, None
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        reason = f"non-JSON response: {exc}"
+        logger.warning(f"[apple][pickup-message-direct] pincode={pincode!r} {reason}")
+        return None, [], reason, None
+
+    available, matching_stores, error, info = _parse_pickup_message_response(data, sku)
+    if error is not None:
+        logger.warning(f"[apple][pickup-message-direct] pincode={pincode!r} {error}")
+    else:
+        logger.info(
+            f"[apple][pickup-message-direct] pincode={pincode!r}: available={available} "
+            f"matching_stores={[s.get('store_name') for s in matching_stores]}"
+        )
+    return available, matching_stores, error, info
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Pincode-specific availability via PAGE-RENDER (playwright_scraper), as an
 # alternative to _fetch_pickup_availability above. Exists because the
 # direct httpx approach is currently 0% successful — every SKU/pincode/
@@ -639,6 +785,12 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 # _check_pickup_availability docstring for the full architecture and —
 # importantly — its available=False caveat, not silently papered over
 # here either.
+#
+# 2026-07-28: no longer the PRIMARY method — _fetch_pickup_availability_
+# via_page_render below now tries _fetch_pickup_message_direct (above)
+# FIRST, falling back to this browser-based approach only when the direct
+# call fails. Kept in full, unchanged otherwise: it's the safety net the
+# whole fallback design depends on.
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ---------------------------------------------------------------------------
@@ -739,93 +891,119 @@ def _adapt_page_render_stores(matching_stores: list[dict]) -> list[dict]:
 
 
 async def _fetch_pickup_availability_via_page_render(
-    product_url: str, pincode: str,
+    product_url: str, pincode: str, sku: str | None = None,
 ) -> tuple[bool | None, list[dict], str | None, dict]:
     """
-    Calls playwright_scraper's /check-pickup-availability instead of
-    Apple's fulfillment-messages API directly.
+    Cross-user deduplicated pincode-specific pickup check. As of
+    2026-07-28 this tries TWO methods in a fixed order, not one:
+
+      1. PRIMARY — _fetch_pickup_message_direct (above): a single,
+         unauthenticated httpx GET to /shop/retail/pickup-message. Only
+         attempted when `sku` is given (callers that don't have one yet,
+         e.g. admin_handlers.py's /debugpickupavailability today, skip
+         straight to step 2 — exactly today's pre-2026-07-28 behavior).
+      2. FALLBACK — playwright_scraper's /check-pickup-availability (the
+         ENTIRE body of this function before 2026-07-28), used whenever
+         step 1 wasn't attempted, OR was attempted and failed (network
+         error, non-200, non-JSON, or an unexpected response shape — see
+         _parse_pickup_message_response's own docstring for exactly which
+         cases count as "failed" vs. a legitimate parsed result). A
+         legitimate step-1 result (including available=None from a
+         genuinely empty/no-match response) is NOT a failure and does
+         NOT fall back — it's returned as-is, same as it always would be
+         from step 2.
+
+    Both methods share the SAME cross-user cache (_page_render_cache) and
+    the SAME public return contract, so no caller needs to know or care
+    which one actually ran for a given call — that's the whole point of
+    "automatic fallback, not a manual switch" per the migration this was
+    built for.
 
     Returns (available, matching_stores, error, meta):
-      - available: True if at least one specific, named nearby store
-        shows this SKU as available for pickup — a genuine, pincode-
-        specific confirmation, same meaning as _evaluate_pickup_
-        availability's own True above. False if real candidate stores
-        were returned for this pincode but NONE show the SKU as
-        available — UNLIKE _evaluate_pickup_availability above, this
-        endpoint's False IS a confirmed negative here (not folded into
-        None), because pickup-message-recommendations already narrows to
-        specific stores actually near this pincode, not just "no stores
-        exist" (see playwright_scraper's own module note for the exact
-        reasoning). None covers every genuinely inconclusive case: no
-        stores near this pincode at all, the SKU not found in any
-        store's data, or the check failing before a response ever
-        arrived.
-      - matching_stores: every store showing SKU as available, as
-        {"store_name", "location"} — see _adapt_page_render_stores above
-        for what "location" actually holds here. Empty whenever
-        available is not True.
-      - error: None on a successful call (regardless of the resulting
-        `available` value), else a short human-readable reason (missing
-        PLAYWRIGHT_SCRAPER_URL, network error, non-200, non-JSON) —
-        mirrors _cookie_auth_fetch's (data, error) contract above.
+      - available / matching_stores / error: same meaning regardless of
+        which method produced them — True/False/None have the identical
+        semantics _parse_pickup_message_response and playwright_scraper's
+        own _parse_pickup_stores both independently document (True =
+        confirmed available at >=1 named store; False = real stores
+        checked, none available — a confirmed negative; None = no stores
+        near this pincode, SKU not found in the response, or the check
+        failed before a usable response arrived). matching_stores is
+        {"store_name", "location"} either way, empty whenever available
+        is not True.
       - meta: {"served_from_cache": bool, "diagnostics": dict | None,
-        "git_commit_sha": str | None} (2026-07-28, added alongside the
-        cache below). "diagnostics"/"git_commit_sha" are playwright_
-        scraper's own response fields — previously read only for a log
-        line and discarded; now threaded all the way back so a cache HIT
-        can still report what the underlying real check actually saw,
-        not just "cached: True" with nothing else to show. Both are None
-        only when the call failed before a scraper response ever arrived
-        (served_from_cache is always False in that case too).
+        "git_commit_sha": str | None, "method_used": str | None,
+        "direct_http_attempted": bool, "direct_http_error": str | None}.
+        "method_used" is "direct_http" or "playwright" — the SAME field
+        this docstring's whole design exists to make visible (requirement
+        (c) of the fallback-chain request this was built for): which path
+        actually produced this result, for every single check, in
+        diagnostics/logs. "direct_http_attempted"/"direct_http_error" stay
+        populated even when the FINAL result came from the Playwright
+        fallback, so a cache hit or a Playwright-served result still shows
+        whether/why step 1 was tried and didn't work out.
+        "diagnostics"/"git_commit_sha" are playwright_scraper's own
+        response fields when method_used=="playwright" (None when
+        method_used=="direct_http" — no browser involved, nothing to
+        report there); "diagnostics" holds _parse_pickup_message_response's
+        own `info` dict instead when method_used=="direct_http", so a
+        direct-http None can still be told apart from "no stores at all"
+        vs. "SKU not found", same as the Playwright path's parse_info
+        already does.
 
-    WIRED into check_pickup_row / check_channel_pickup_row (2026-07-28) —
-    the direct httpx path (_fetch_pickup_availability above) stays at 0%
-    success (see this module's PARAM SET / HEADER HISTORY notes), so this
-    page-render path is now the one those production cycles actually use.
-    Also now used by admin_handlers.py's /debugpickupavailability
-    (2026-07-28, previously a separate direct httpx call that bypassed
-    the cache below entirely — meaning two manual calls in a row could
-    never demonstrate a cache hit, since that command never touched the
-    cache either way; routing it through this same function makes it an
-    accurate diagnostic of the REAL production path, cache included).
-    refine_with_pincode is untouched — a separate decision, not made
-    here. playwright_scraper's Dockerfile starts a virtual display
-    (start.sh — explicit Xvfb + readiness poll) so its headless=False
-    requirement can run on Railway's display-less container — confirmed
-    working via a real deploy as of the checkpoint diagnostics this
-    endpoint's rewrite is built on top of.
+    WIRED into check_pickup_row / check_channel_pickup_row (2026-07-28,
+    both now pass their already-known `sku`) — the OLDER direct httpx path
+    (_fetch_pickup_availability, cookie-auth against fulfillment-messages)
+    stays at 0% success (see this module's PARAM SET / HEADER HISTORY
+    notes) and is UNRELATED to the new one added here; that one still isn't
+    used by these two functions. admin_handlers.py's
+    /debugpickupavailability calls this without a sku (unchanged 2026-07-28
+    behavior) — see its own file for the option to pass one manually.
+    refine_with_pincode is untouched — a separate decision, not made here.
+    playwright_scraper's Dockerfile starts a virtual display (start.sh —
+    explicit Xvfb + readiness poll) so its headless=False requirement can
+    run on Railway's display-less container — confirmed working via a real
+    deploy as of the checkpoint diagnostics this endpoint's rewrite is
+    built on top of.
 
-    timeout=240.0 (2026-07-28, raised from 90.0 when this endpoint
-    started being called from an unattended production cycle instead of
-    only manual /debugpickupavailability calls): playwright_scraper's own
-    retry loop (APPLE_PICKUP_MAX_ATTEMPTS, default 3) can legitimately
-    take close to 90s on its own in a realistic worst case (three ~25-30s
-    attempts + inter-attempt delays), and a badly-behaving page hitting
-    several individual step timeouts within one attempt (pickup_details_
-    wait_timed_out, overlay_wait_timed_out, etc. — all real, previously
-    observed failure modes) can push a single attempt well past that. 90s
-    risked this client giving up before playwright_scraper's own retry
-    loop had a chance to.
+    timeout=240.0 for the Playwright fallback (2026-07-28, raised from
+    90.0 when this endpoint started being called from an unattended
+    production cycle instead of only manual /debugpickupavailability
+    calls): playwright_scraper's own retry loop (APPLE_PICKUP_MAX_ATTEMPTS,
+    default 3) can legitimately take close to 90s on its own in a
+    realistic worst case (three ~25-30s attempts + inter-attempt delays),
+    and a badly-behaving page hitting several individual step timeouts
+    within one attempt (pickup_details_wait_timed_out, overlay_wait_timed_
+    out, etc. — all real, previously observed failure modes) can push a
+    single attempt well past that. 90s risked this client giving up before
+    playwright_scraper's own retry loop had a chance to. The direct-http
+    attempt has its own, much shorter timeout (_PICKUP_MESSAGE_TIMEOUT,
+    15.0s) — see that constant's own note.
 
     Cross-user deduplicated (2026-07-28) via _page_render_cache — see
     that module-level note above for the full reasoning. Identical
     (product_url, pincode) calls within _PAGE_RENDER_CACHE_TTL_SECONDS
     reuse the most recent SUCCESSFUL result instead of launching another
-    browser check; a lock per cache key prevents a thundering herd where
-    several concurrent calls for the same not-yet-cached key each launch
-    their own check before the first one has a chance to populate the
-    cache.
+    check by EITHER method; a lock per cache key prevents a thundering
+    herd where several concurrent calls for the same not-yet-cached key
+    each launch their own check before the first one has a chance to
+    populate the cache. The cache is checked BEFORE deciding which method
+    to try, so a cache hit skips both — not just the Playwright browser
+    launch this cache was originally built to avoid.
 
     Never raises.
     """
-    from config import PLAYWRIGHT_SCRAPER_URL
+    no_check_meta = {
+        "served_from_cache": False, "diagnostics": None, "git_commit_sha": None,
+        "method_used": None, "direct_http_attempted": False, "direct_http_error": None,
+    }
 
-    no_check_meta = {"served_from_cache": False, "diagnostics": None, "git_commit_sha": None}
-
-    if not PLAYWRIGHT_SCRAPER_URL:
-        reason = "PLAYWRIGHT_SCRAPER_URL is not configured"
-        logger.warning(f"[apple][page-render] {reason} — skipping pincode={pincode!r}")
-        return None, [], reason, no_check_meta
+    def _cached_meta(cached: dict) -> dict:
+        return {
+            "served_from_cache": True, "diagnostics": cached["diagnostics"],
+            "git_commit_sha": cached["git_commit_sha"], "method_used": cached["method_used"],
+            "direct_http_attempted": cached["direct_http_attempted"],
+            "direct_http_error": cached["direct_http_error"],
+        }
 
     cache_key = _page_render_cache_key(product_url, pincode)
     now = time.monotonic()
@@ -835,13 +1013,9 @@ async def _fetch_pickup_availability_via_page_render(
     if cached is not None and now - cached["ts"] < _PAGE_RENDER_CACHE_TTL_SECONDS:
         logger.info(
             f"[apple][page-render] cache hit (age={now - cached['ts']:.0f}s) pincode={pincode!r} "
-            f"— browser check skipped"
+            f"— check skipped (method_used={cached['method_used']!r})"
         )
-        meta = {
-            "served_from_cache": True, "diagnostics": cached["diagnostics"],
-            "git_commit_sha": cached["git_commit_sha"],
-        }
-        return cached["available"], cached["matching_stores"], cached["error"], meta
+        return cached["available"], cached["matching_stores"], cached["error"], _cached_meta(cached)
 
     lock = await _get_page_render_lock(cache_key)
     async with lock:
@@ -852,13 +1026,46 @@ async def _fetch_pickup_availability_via_page_render(
         if cached is not None and now - cached["ts"] < _PAGE_RENDER_CACHE_TTL_SECONDS:
             logger.info(
                 f"[apple][page-render] cache hit post-lock (age={now - cached['ts']:.0f}s) "
-                f"pincode={pincode!r} — browser check skipped"
+                f"pincode={pincode!r} — check skipped (method_used={cached['method_used']!r})"
             )
-            meta = {
-                "served_from_cache": True, "diagnostics": cached["diagnostics"],
-                "git_commit_sha": cached["git_commit_sha"],
-            }
-            return cached["available"], cached["matching_stores"], cached["error"], meta
+            return cached["available"], cached["matching_stores"], cached["error"], _cached_meta(cached)
+
+        direct_http_attempted = False
+        direct_http_error: str | None = None
+        if sku:
+            direct_http_attempted = True
+            d_available, d_stores, d_error, d_info = await _fetch_pickup_message_direct(sku, pincode)
+            if d_error is None:
+                logger.info(
+                    f"[apple][page-render] pincode={pincode!r}: served by direct_http "
+                    f"(Playwright fallback NOT needed) available={d_available} "
+                    f"matching_stores={[s.get('store_name') for s in d_stores]}"
+                )
+                _page_render_cache[cache_key] = {
+                    "ts": time.monotonic(), "available": d_available, "matching_stores": d_stores,
+                    "error": None, "diagnostics": d_info, "git_commit_sha": None,
+                    "method_used": "direct_http", "direct_http_attempted": True, "direct_http_error": None,
+                }
+                meta = {
+                    "served_from_cache": False, "diagnostics": d_info, "git_commit_sha": None,
+                    "method_used": "direct_http", "direct_http_attempted": True, "direct_http_error": None,
+                }
+                return d_available, d_stores, None, meta
+            direct_http_error = d_error
+            logger.warning(
+                f"[apple][page-render] pincode={pincode!r}: direct_http failed "
+                f"({d_error}) — falling back to Playwright"
+            )
+
+        from config import PLAYWRIGHT_SCRAPER_URL
+
+        if not PLAYWRIGHT_SCRAPER_URL:
+            reason = "PLAYWRIGHT_SCRAPER_URL is not configured"
+            logger.warning(f"[apple][page-render] {reason} — skipping pincode={pincode!r}")
+            meta = dict(no_check_meta)
+            meta["direct_http_attempted"] = direct_http_attempted
+            meta["direct_http_error"] = direct_http_error
+            return None, [], reason, meta
 
         try:
             async with httpx.AsyncClient(timeout=240.0) as client:
@@ -869,34 +1076,49 @@ async def _fetch_pickup_availability_via_page_render(
         except Exception as exc:
             reason = f"request to playwright_scraper failed: {type(exc).__name__}: {exc}"
             logger.warning(f"[apple][page-render] {reason}")
-            return None, [], reason, no_check_meta  # never cached — a fresh call may succeed
+            meta = dict(no_check_meta)
+            meta["direct_http_attempted"] = direct_http_attempted
+            meta["direct_http_error"] = direct_http_error
+            return None, [], reason, meta  # never cached — a fresh call may succeed
 
         if resp.status_code != 200:
             reason = f"playwright_scraper returned HTTP {resp.status_code}: {resp.text[:300]!r}"
             logger.warning(f"[apple][page-render] {reason}")
-            return None, [], reason, no_check_meta  # never cached
+            meta = dict(no_check_meta)
+            meta["direct_http_attempted"] = direct_http_attempted
+            meta["direct_http_error"] = direct_http_error
+            return None, [], reason, meta  # never cached
 
         try:
             data = resp.json()
         except Exception as exc:
             reason = f"non-JSON response from playwright_scraper: {exc}"
             logger.warning(f"[apple][page-render] {reason}")
-            return None, [], reason, no_check_meta  # never cached
+            meta = dict(no_check_meta)
+            meta["direct_http_attempted"] = direct_http_attempted
+            meta["direct_http_error"] = direct_http_error
+            return None, [], reason, meta  # never cached
 
         available = data.get("available")
         matching_stores = _adapt_page_render_stores(data.get("matching_stores") or [])
         diagnostics = data.get("diagnostics")
         git_commit_sha = data.get("git_commit_sha")
         logger.info(
-            f"[apple][page-render] pincode={pincode!r}: available={available} "
+            f"[apple][page-render] pincode={pincode!r}: served by playwright available={available} "
             f"matching_stores={[s.get('store_name') for s in matching_stores]} "
             f"diagnostics={diagnostics}"
         )
         _page_render_cache[cache_key] = {
             "ts": time.monotonic(), "available": available, "matching_stores": matching_stores,
             "error": None, "diagnostics": diagnostics, "git_commit_sha": git_commit_sha,
+            "method_used": "playwright", "direct_http_attempted": direct_http_attempted,
+            "direct_http_error": direct_http_error,
         }
-        meta = {"served_from_cache": False, "diagnostics": diagnostics, "git_commit_sha": git_commit_sha}
+        meta = {
+            "served_from_cache": False, "diagnostics": diagnostics, "git_commit_sha": git_commit_sha,
+            "method_used": "playwright", "direct_http_attempted": direct_http_attempted,
+            "direct_http_error": direct_http_error,
+        }
         return available, matching_stores, None, meta
 
 
@@ -1071,7 +1293,9 @@ async def check_pickup_row(bot, row: dict) -> dict:
     results: dict[str, list[dict]] = {}
     for pincode in row["pincodes"]:
         try:
-            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
+            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(
+                row["url"], pincode, sku=row.get("sku"),
+            )
         except Exception as exc:
             logger.error(
                 f"[apple][pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
@@ -1178,7 +1402,9 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     channel = None
     for pincode in row.get("pincodes") or []:
         try:
-            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(row["url"], pincode)
+            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(
+                row["url"], pincode, sku=sku,
+            )
         except Exception as exc:
             logger.error(
                 f"[apple][channel-pickup] error checking #{row['id']} pincode={pincode!r}: {exc}"
