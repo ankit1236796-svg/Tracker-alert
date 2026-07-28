@@ -1559,11 +1559,27 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
 #      production behavior)
 #   B. after an extra 500ms dwell with no further interaction (tests
 #      "debounced validation, no blur needed")
+#   E. after a much longer 5s dwell, STILL no blur (isolates "just needs
+#      more time" — e.g. a slow async validation call — from "needs a
+#      blur/focus-change event specifically", which B's 500ms alone
+#      can't rule out)
 #   C. after an explicit programmatic .blur() on the zipCode input
 #      (tests "needs blur specifically")
-#   D. after clicking a neutral point elsewhere in the overlay — a real
-#      click-driven blur, not a programmatic one (tests whether React's
-#      synthetic blur handling behaves differently for the two)
+#   D. after a REAL keyboard Tab press away from the field — tests
+#      whether React's synthetic blur handling differs for a genuine
+#      user-driven focus change vs. a programmatic .blur() call. NOT a
+#      positional click (an earlier version clicked near the overlay's
+#      top-left corner, which very likely landed on the backdrop's
+#      click-to-dismiss zone and closed the whole overlay instead of
+#      blurring the field — a bug in the diagnostic itself, not a
+#      discovery about Apple's page; Tab has no coordinates to get wrong)
+# A network-response listener is also registered before typing starts,
+# capturing every XHR/fetch response seen from that point on (method,
+# URL, status — no keyword filter, since the whole point is not having
+# to guess an endpoint name in advance) — tests whether Continue's
+# enablement is gated on an async backend call rather than purely local
+# field validation.
+#
 # Every checkpoint's full state is captured (not just enabled/disabled),
 # plus STATIC evidence independent of the sequence: zipCode's own HTML
 # validation attributes (pattern/maxlength/minlength/inputmode/type —
@@ -1627,13 +1643,16 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
     Continue — see the module note above for what each checkpoint tests.
 
     Returns {"checkpoints": {name: state_dict, ...}, "enabled_at": name
-    or None, "diagnostics": {...}} — "enabled_at" is the first checkpoint
-    name where continue_disabled_attr was False, or None if it never
-    became enabled at any checkpoint tried. Every checkpoint that WAS
-    reached is included in "checkpoints", even after "enabled_at" is
-    found, up to (and including) the one that succeeded — later
-    checkpoints are skipped once one succeeds, since there's nothing
-    further to learn by continuing to poke at an already-fixed state.
+    or None, "network_requests": [...], "diagnostics": {...}} —
+    "enabled_at" is the first checkpoint name where continue_disabled_attr
+    was False, or None if it never became enabled at any checkpoint
+    tried. Every checkpoint that WAS reached is included in
+    "checkpoints", even after "enabled_at" is found, up to (and
+    including) the one that succeeded — later checkpoints are skipped
+    once one succeeds, since there's nothing further to learn by
+    continuing to poke at an already-fixed state. "network_requests" is
+    every XHR/fetch response seen from just before typing onward,
+    regardless of outcome.
 
     Never raises; a failure at any step is recorded in "diagnostics" and
     whatever checkpoints were reached are still returned.
@@ -1705,6 +1724,35 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
                     diagnostics["overlay_wait_timed_out"] = True
                     return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
 
+                # Network capture, registered BEFORE typing so it catches
+                # anything fired by the type itself, not just afterward —
+                # tests whether Continue's enablement is gated on an async
+                # backend call (e.g. a store-availability lookup for this
+                # pincode) rather than purely local field validation. Every
+                # XHR/fetch response is recorded (not filtered by keyword —
+                # the whole point is not having to guess the endpoint name
+                # in advance), capped so one noisy page can't blow up the
+                # response.
+                network_requests: list[dict] = []
+                _MAX_NETWORK_REQUESTS = 40
+
+                def _on_response(response):
+                    if len(network_requests) >= _MAX_NETWORK_REQUESTS:
+                        return
+                    try:
+                        resource_type = response.request.resource_type
+                    except Exception:
+                        resource_type = "?"
+                    if resource_type not in ("xhr", "fetch"):
+                        return
+                    network_requests.append({
+                        "url": response.url,
+                        "method": response.request.method,
+                        "status": response.status,
+                    })
+
+                page.on("response", _on_response)
+
                 try:
                     zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
                     zip_input.wait_for(timeout=8000)
@@ -1734,6 +1782,16 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
                     if state.get("continue_disabled_attr") is False:
                         enabled_at = "B_after_500ms_dwell_no_blur"
 
+                # Checkpoint E: a MUCH longer dwell, still no blur — isolates
+                # "just needs more time" (e.g. a slow async validation call)
+                # from "specifically needs a blur/focus-change event", which
+                # B's 500ms alone can't rule out.
+                if enabled_at is None:
+                    page.wait_for_timeout(5000)
+                    state = _capture("E_after_5s_extended_dwell_no_blur")
+                    if state.get("continue_disabled_attr") is False:
+                        enabled_at = "E_after_5s_extended_dwell_no_blur"
+
                 # Checkpoint C: programmatic .blur() — tests "needs blur".
                 if enabled_at is None:
                     try:
@@ -1745,26 +1803,37 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
                     if state.get("continue_disabled_attr") is False:
                         enabled_at = "C_after_programmatic_blur"
 
-                # Checkpoint D: real click-elsewhere blur — tests whether
-                # React's synthetic blur handling differs for a genuine
-                # user-driven blur vs. a programmatic one.
+                # Checkpoint D: a REAL keyboard-driven Tab away from the
+                # field — tests whether React's synthetic blur handling
+                # differs for a genuine user-driven focus change vs. a
+                # programmatic .blur() call. Deliberately NOT a positional
+                # click on the overlay (an earlier version clicked near the
+                # overlay's top-left corner, which very likely landed on
+                # the backdrop's click-to-dismiss zone and closed the whole
+                # overlay instead of just blurring the field — a bug in
+                # this diagnostic, not a discovery about Apple's page).
+                # Tab is a pure keyboard action with no coordinates to get
+                # wrong, and is itself completely ordinary real-user
+                # behavior (type, then Tab to the next field/button).
                 if enabled_at is None:
                     try:
-                        page.locator(_PICKUP_OVERLAY_SELECTOR).first.click(position={"x": 5, "y": 5}, timeout=3000)
+                        page.keyboard.press("Tab")
                     except Exception:
                         pass
                     page.wait_for_timeout(500)
-                    state = _capture("D_after_click_elsewhere_blur")
+                    state = _capture("D_after_tab_key_blur")
                     if state.get("continue_disabled_attr") is False:
-                        enabled_at = "D_after_click_elsewhere_blur"
+                        enabled_at = "D_after_tab_key_blur"
 
                 logger.info(
                     f"[debug-zipcode-validation] {url} pincode={pincode!r}: "
-                    f"enabled_at={enabled_at} checkpoints={checkpoints} diagnostics={diagnostics}"
+                    f"enabled_at={enabled_at} checkpoints={checkpoints} "
+                    f"network_requests={network_requests} diagnostics={diagnostics}"
                 )
                 return {
                     "checkpoints": checkpoints,
                     "enabled_at": enabled_at,
+                    "network_requests": network_requests,
                     "diagnostics": diagnostics,
                     "git_commit_sha": GIT_COMMIT_SHA,
                 }
