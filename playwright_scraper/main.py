@@ -1211,10 +1211,13 @@ def _capture_pickup_flow(url: str, pincode: str) -> dict:
                 # Cap raised 8000->30000 (2026-07-28): a real Railway
                 # capture hit exactly 8014 chars, cutting off right before
                 # the results/store-list section — the whole reason this
-                # endpoint exists. Debug-only; the PRODUCTION classifier
-                # (_check_pickup_availability) never extracts outerHTML at
-                # all, so it was never affected by this cap either way —
-                # see its own raw_text extraction (.inner_text(), no cap).
+                # endpoint exists. Debug-only; PRODUCTION
+                # (_check_pickup_availability) doesn't scrape overlay
+                # HTML/text at all anymore (2026-07-28 network-
+                # interception rewrite — it parses the pickup-message-
+                # recommendations/fulfillment-messages response body
+                # directly), so this cap only ever affects this debug
+                # endpoint's own output.
                 overlay_html = None
                 try:
                     overlay_html = page.evaluate(
@@ -1251,94 +1254,160 @@ def _capture_pickup_flow(url: str, pincode: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # /check-pickup-availability: PRODUCTION pincode-availability check via
-# page-render, for Apple's fulfillment-messages API being unusable (see
-# checkers/apple.py's module docstring — 0% success across every param/
-# header/cookie combination tried). Built directly on /debug-pickup-flow's
-# confirmed flow above, scoped to iPhone product pages ONLY (the only
-# tracked product category) — deliberately does NOT handle the different
-# "rf-storelocator-overlay" widget accessory pages use.
+# page-render, for Apple's fulfillment-messages API being unusable when
+# replayed directly via httpx (see checkers/apple.py's module docstring —
+# 0% success across every param/header/cookie combination tried). Scoped
+# to iPhone product pages ONLY (the only tracked product category).
 #
-# ⚠️ TWO CAVEATS, BOTH DELIBERATE, NEITHER SILENTLY PAPERED OVER:
+# ARCHITECTURE (2026-07-28, network-interception rewrite): earlier
+# versions of this function scraped the pickup overlay's own rendered
+# text, and separately chased why its "Continue" button never visually
+# enabled even after correct, error-free pincode entry (see the git
+# history on this function for that whole investigation — blur/timing/
+# combobox theories, all ruled out with real diagnostic evidence). The
+# actual breakthrough: typing a valid pincode makes the page's own JS
+# fire pickup-message-recommendations (and fulfillment-messages) AS REAL
+# BACKEND CALLS, successfully (200 OK) — carrying genuine in-page session
+# context our own httpx replay can never reproduce — regardless of
+# whether Continue ever becomes clickable. So this function no longer
+# depends on Continue OR on scraping overlay text at all: it registers a
+# network-response listener before typing, types the pincode (confirmed
+# sufficient on its own to trigger both calls), and parses whichever
+# response body arrives directly. pickup-message-recommendations is
+# preferred (its shape was confirmed via real captured positive AND
+# negative examples); fulfillment-messages is a fallback for if that
+# specific endpoint doesn't fire, using the SAME shape/values already
+# established and used by checkers/apple.py's own
+# _evaluate_pickup_availability for years, not a fresh guess.
 #
-# 1. REQUIRES headless=False (APPLE_PICKUP_HEADLESS, default off — see
-#    above). A controlled same-network A/B test (2026-07-28) confirmed
-#    headless Chromium fails to render pickUpDetails at all, while headful
-#    succeeds consistently, on the SAME network/IP. The Dockerfile starts
-#    a virtual display via start.sh (explicit Xvfb + readiness poll) so a
-#    headful launch has something to render into on Railway's display-
-#    less container. A first deploy attempt (xvfb-run-wrapped CMD)
-#    started successfully but still failed this function specifically
-#    with "Missing X server or $DISPLAY" — misleadingly, /debug-pickup-
-#    flow's OWN success right after that deploy proved nothing either
-#    way, since that function never launches headless=False at all (see
-#    APPLE_PICKUP_HEADLESS's own note above). start.sh's revised startup
-#    is still UNTESTED from this environment (no usable Docker daemon to
-#    build/run against) — treat it as unverified until THIS function
-#    specifically succeeds against a real deploy, not any other endpoint.
-#    This function is safe to call locally/manually today; it is NOT yet
-#    wired into any scheduled production cron.
+# ⚠️ REQUIRES headless=False (APPLE_PICKUP_HEADLESS, default off — see
+# above). A controlled same-network A/B test confirmed headless Chromium
+# fails to render pickUpDetails at all, while headful succeeds
+# consistently. The Dockerfile starts a virtual display via start.sh
+# (explicit Xvfb + readiness poll) so a headful launch has something to
+# render into on Railway's display-less container — confirmed working via
+# a real deploy (git_commit_sha-verified) as of the checkpoint diagnostics
+# this rewrite is built on top of.
 #
-# 2. The "available" classification is DELIBERATELY conservative: only a
-#    CONFIRMED phrase for THIS overlay type sets available=True. As of
-#    2026-07-28, no such phrase has actually been confirmed — the one
-#    positive example captured ("Available Today") came from the
-#    DIFFERENT accessory-only "rf-storelocator-overlay" widget, which this
-#    function never touches. So `available` currently can only ever come
-#    back True (never) or None (in practice, always, right now) — same
-#    "never risk a false positive" posture checkers/apple.py's
-#    _evaluate_pickup_availability already uses for the fulfillment-
-#    messages signal (an inconclusive/negative pickup result is NEVER
-#    treated as a confirmed False either, there or here — India's sparse
-#    Apple Store network makes "no pickup nearby" the common case, not
-#    proof of no stock). `raw_text` and `tentative_positive_hint` are
-#    still returned so a real positive capture can be used to tighten this
-#    later instead of guessing at the phrasing now.
+# ⚠️ available=False IS a deliberate departure from this codebase's usual
+# "never assert False from a pickup-only signal" rule (see
+# checkers/apple.py's _evaluate_pickup_availability and its own module
+# docstring) — that rule exists because most Indian pincodes have ZERO
+# nearby Apple Stores, so "no store shows availability" is normally just
+# "no stores nearby," not "checked and out of stock." The distinction
+# that makes False defensible HERE: pickup-message-recommendations
+# already returns a list of SPECIFIC, NAMED candidate stores for this
+# exact pincode. An EMPTY stores list still means "no stores near here at
+# all" and stays None (same reasoning as always). But a NON-EMPTY list of
+# real stores where none show our SKU as "available" is a materially
+# stronger signal — real candidate stores were actually checked, not just
+# absent. See _parse_pickup_stores below for exactly where that line is
+# drawn.
 # ---------------------------------------------------------------------------
 
-# Confirmed via a real captured overlay (2026-07-28): "Not available today
-# at 2 nearest stores." — same "inconclusive, not False" treatment
-# checkers/apple.py's _evaluate_pickup_availability already gives an
-# analogous fulfillment-messages result, for the same underlying reason
-# (sparse pickup coverage doesn't mean no stock).
-_PICKUP_NOT_AVAILABLE_PHRASES = ("not available today",)
-# NOT YET CONFIRMED for THIS overlay type (rf-productlocator-overlay) — see
-# the module note above. Logged as a hint only; never sets available=True.
-_PICKUP_TENTATIVE_AVAILABLE_HINT_PHRASES = ("available today", "pick up today at")
-# The overlay's own PRE-SEARCH placeholder text (confirmed via a real
-# 2026-07-28 capture) — used to detect "the zipCode fill/Continue never
-# actually produced a result" as its OWN distinct diagnostic, separate
-# from a genuine "not available" answer. Both currently classify as
-# available=None (see the module note above), but conflating "no result
-# ever loaded" with "a real negative result loaded" would hide a bug —
-# see results_placeholder_still_shown in diagnostics below.
-_PICKUP_SEARCH_PLACEHOLDER_PHRASE = "search by pin code"
+_PICKUP_MESSAGE_RECOMMENDATIONS_URL_MARKER = "pickup-message-recommendations"
+_FULFILLMENT_MESSAGES_URL_MARKER = "fulfillment-messages"
+
+# Confirmed via real captured responses (2026-07-28):
+#   POSITIVE (iPhone 16 Plus 128GB Pink, MXVW3HN/A, Apple Noida):
+#     pickupDisplay "available", pickupSearchQuote "Available Tomorrow",
+#     storePickupQuote "Tomorrow at Apple Noida"
+#   NEGATIVE (iPhone 17 Black, no stock): pickupDisplay "ineligible"/
+#     "unavailable"
+_PICKUP_MESSAGE_RECOMMENDATIONS_AVAILABLE_VALUES = ("available",)
+# fulfillment-messages' OWN confirmed shape/values — checkers/apple.py's
+# _evaluate_pickup_availability, established independently and long
+# before this rewrite. Kept separate rather than merged with the values
+# above: these are two different endpoints, not guaranteed to agree on
+# field values just because they're both Apple pickup APIs.
+_FULFILLMENT_MESSAGES_AVAILABLE_VALUES = ("available", "eligible")
+
+
+def _parse_pickup_stores(
+    body_text: str, path: list[str], sku: str, available_values: tuple[str, ...],
+) -> tuple[bool | None, list[dict], str | None]:
+    """
+    Parses one pickup-response JSON body (either endpoint — `path` says
+    where its stores array lives) and classifies availability for `sku`.
+
+    Returns (available, matching_stores, error):
+      - available: True if `sku` shows one of `available_values` at ANY
+        store; False if the stores list is NON-EMPTY, `sku` was found in
+        at least one store's partsAvailability, but none show it as
+        available (see the module note above on why this specific case
+        is treated as a real negative, not the usual inconclusive None);
+        None if the stores list is empty (no stores near this pincode at
+        all — inconclusive, same reasoning this codebase always uses),
+        `sku` isn't present in ANY store's partsAvailability (no data
+        about OUR product specifically — also inconclusive, not "checked
+        and unavailable"), or the body couldn't be parsed at all.
+      - matching_stores: every store showing `sku` as available, as
+        {"store_name", "pickup_search_quote", "store_pickup_quote"} —
+        empty whenever available is not True.
+      - error: a short string on structural/parse failure, else None.
+    """
+    try:
+        data = json.loads(body_text)
+    except Exception as exc:
+        return None, [], f"JSON parse failed: {exc}"
+
+    node = data
+    for key in path:
+        if not isinstance(node, dict):
+            return None, [], f"expected a dict while navigating to {key!r}, got {type(node).__name__}"
+        node = node.get(key)
+        if node is None:
+            return None, [], f"missing key {key!r} in response body"
+    stores = node if isinstance(node, list) else []
+
+    if not stores:
+        return None, [], None  # no stores near this pincode — inconclusive
+
+    sku_found = False
+    matching_stores: list[dict] = []
+    for store in stores:
+        if not isinstance(store, dict):
+            continue
+        part_info = (store.get("partsAvailability") or {}).get(sku)
+        if part_info is None:
+            continue
+        sku_found = True
+        if part_info.get("pickupDisplay", "") in available_values:
+            matching_stores.append({
+                "store_name": store.get("storeName") or "(unnamed store)",
+                "pickup_search_quote": part_info.get("pickupSearchQuote"),
+                "store_pickup_quote": part_info.get("storePickupQuote"),
+            })
+
+    if not sku_found:
+        return None, [], None  # stores exist, but none carry data for OUR sku
+
+    return (True if matching_stores else False), matching_stores, None
 
 
 def _check_pickup_availability(url: str, pincode: str) -> dict:
     """
-    Production version of _capture_pickup_flow: navigate, detect + click
-    whichever pickUpDetails state is present (trigger_present or
-    already_resolved — see _ALREADY_RESOLVED_TRIGGER_SELECTOR above), wait
-    for the iPhone-specific overlay, type `pincode` into the zipCode
-    input via real per-character keystroke simulation (clear() then
-    press_sequentially(), NOT fill() — a real diagnosed run showed fill()
-    sets the value with no error, but never satisfies Apple's own
-    validation JS, leaving Continue permanently disabled and results
-    never loading; Apple's page apparently listens for actual keyboard
-    events per character, not just a programmatic value change), click
-    Continue if it's actually enabled (recording continue_button_found/
-    continue_button_enabled explicitly rather than silently guessing why
-    it wasn't — see the code's own comment on why "not enabled" is
-    ambiguous), then wait for the overlay's pre-search placeholder text
-    to actually disappear (not just a fixed dwell — see
-    _PICKUP_SEARCH_PLACEHOLDER_PHRASE) before reading and classifying its
-    text.
+    Navigate, detect + click whichever pickUpDetails state is present
+    (trigger_present or already_resolved — see
+    _ALREADY_RESOLVED_TRIGGER_SELECTOR above), wait for the iPhone-
+    specific overlay, then type `pincode` into zipCode via real
+    per-character keystroke simulation (clear() then press_sequentially()
+    per character — confirmed, via a real diagnosed run's own
+    typing_trajectory capture, to land every character correctly AND be
+    sufficient on its own to trigger Apple's backend pickup-availability
+    calls; bulk press_sequentially(pincode) was never specifically
+    confirmed to do the same, so this keeps the proven mechanism rather
+    than reverting to something merely equivalent in theory). A
+    network-response listener registered BEFORE typing captures whichever
+    of pickup-message-recommendations / fulfillment-messages fires, and
+    that response body — not Continue's click-ability, not scraped
+    overlay text — is what gets parsed. See the module note above this
+    function for the full architecture rationale and the available=False
+    caveat.
 
     Every step failure is captured into `diagnostics` rather than raising
     — same "capture the failure mode, don't hide it" philosophy as every
-    other function in this file. See the module note above this function
-    for the two deliberate caveats (headful requirement, conservative
-    classifier) — neither is a bug, both are documented open items.
+    other function in this file.
     """
     acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
     if not acquired:
@@ -1362,16 +1431,45 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                     "click_error": None,
                     "overlay_wait_timed_out": None,
                     "zip_fill_error": None,
-                    "continue_button_found": None,
-                    "continue_button_enabled": None,
-                    "continue_click_error": None,
-                    "results_wait_timed_out": None,
-                    "results_placeholder_still_shown": None,
-                    "extract_error": None,
+                    "sku": None,
+                    "sku_error": None,
+                    "pickup_message_response_seen": False,
+                    "fulfillment_messages_response_seen": False,
+                    "response_wait_timed_out": None,
+                    "used_endpoint": None,  # "pickup_message_recommendations" | "fulfillment_messages" | None
+                    "parse_error": None,
                 }
                 available: bool | None = None
-                raw_text: str | None = None
-                tentative_positive_hint = False
+                matching_stores: list[dict] = []
+
+                # Registered as early as possible (before goto even) —
+                # stricter than "before typing" and catches everything,
+                # with no risk of missing an early-firing call. Bodies
+                # kept as raw text (not pre-parsed) so a body read
+                # failure never crashes the listener itself.
+                captured_bodies: dict[str, str | None] = {
+                    "pickup_message_recommendations": None,
+                    "fulfillment_messages": None,
+                }
+
+                def _on_response(response):
+                    url_lower = response.url.lower()
+                    try:
+                        if (
+                            _PICKUP_MESSAGE_RECOMMENDATIONS_URL_MARKER in url_lower
+                            and captured_bodies["pickup_message_recommendations"] is None
+                        ):
+                            captured_bodies["pickup_message_recommendations"] = response.text()
+                        elif (
+                            _FULFILLMENT_MESSAGES_URL_MARKER in url_lower
+                            and "location=" in url_lower
+                            and captured_bodies["fulfillment_messages"] is None
+                        ):
+                            captured_bodies["fulfillment_messages"] = response.text()
+                    except Exception as exc:
+                        logger.error(f"[check-pickup-availability] response capture error on {response.url}: {exc}")
+
+                page.on("response", _on_response)
 
                 try:
                     main_response = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
@@ -1386,6 +1484,12 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                         page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
                     except Exception:
                         pass
+
+                    try:
+                        diagnostics["sku"] = _extract_apple_sku(page.content())
+                    except Exception as exc:
+                        diagnostics["sku_error"] = str(exc)
+
                     try:
                         page.wait_for_selector(_PICKUP_DETAILS_SELECTOR, timeout=10000)
                         diagnostics["pickup_details_wait_timed_out"] = False
@@ -1428,121 +1532,66 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
                                     try:
                                         zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
                                         zip_input.wait_for(timeout=8000)
-                                        # press_sequentially, NOT fill()
-                                        # (2026-07-28, switched after a
-                                        # real diagnosed run: fill()
-                                        # succeeded — no zip_fill_error —
-                                        # but Continue never became
-                                        # enabled and results never
-                                        # loaded, confirming Apple's page
-                                        # needs real keystroke events
-                                        # (keydown/input/keyup per
-                                        # character) to satisfy its own
-                                        # validation, not just a
-                                        # programmatic value change.
-                                        # .clear() first since
-                                        # press_sequentially APPENDS to
-                                        # existing content rather than
-                                        # replacing it (unlike fill) —
-                                        # matters for the already_resolved
-                                        # state, where the field can start
-                                        # non-empty.
                                         zip_input.clear()
-                                        zip_input.press_sequentially(pincode, delay=50)
+                                        for ch in pincode:
+                                            zip_input.press_sequentially(ch, delay=50)
                                     except Exception as exc:
                                         diagnostics["zip_fill_error"] = str(exc)
                                         logger.error(f"[check-pickup-availability] zipCode fill failed for {url}: {exc}")
 
                                     if diagnostics["zip_fill_error"] is None:
-                                        # Continue's state is now recorded
-                                        # explicitly rather than silently
-                                        # inferred — "not enabled" used to
-                                        # be treated as "results already
-                                        # auto-loaded off the fill alone"
-                                        # (true in one observed case), but
-                                        # it could equally mean the fill
-                                        # never satisfied Apple's own
-                                        # validation JS and nothing was
-                                        # ever actually submitted. Both
-                                        # skip the click either way — the
-                                        # difference now is we can SEE
-                                        # which one happened afterward
-                                        # instead of guessing again.
-                                        try:
-                                            continue_btn = page.locator(_PICKUP_CONTINUE_SELECTOR).first
-                                            continue_btn.wait_for(timeout=3000)
-                                            diagnostics["continue_button_found"] = True
-                                            diagnostics["continue_button_enabled"] = continue_btn.is_enabled()
-                                            if diagnostics["continue_button_enabled"]:
-                                                continue_btn.click(timeout=3000)
-                                        except Exception as exc:
-                                            if diagnostics["continue_button_found"] is None:
-                                                diagnostics["continue_button_found"] = False
-                                            diagnostics["continue_click_error"] = str(exc)
+                                        # Poll for either response to
+                                        # arrive rather than a fixed
+                                        # dwell — Continue's own state is
+                                        # irrelevant now, so there's
+                                        # nothing else to wait on.
+                                        waited_ms = 0
+                                        step_ms = 250
+                                        deadline_ms = 8000
+                                        while (
+                                            waited_ms < deadline_ms
+                                            and captured_bodies["pickup_message_recommendations"] is None
+                                            and captured_bodies["fulfillment_messages"] is None
+                                        ):
+                                            page.wait_for_timeout(step_ms)
+                                            waited_ms += step_ms
 
-                                        try:
-                                            page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
-                                        except Exception:
-                                            pass
+                                diagnostics["pickup_message_response_seen"] = (
+                                    captured_bodies["pickup_message_recommendations"] is not None
+                                )
+                                diagnostics["fulfillment_messages_response_seen"] = (
+                                    captured_bodies["fulfillment_messages"] is not None
+                                )
+                                if not diagnostics["pickup_message_response_seen"] and not diagnostics["fulfillment_messages_response_seen"]:
+                                    diagnostics["response_wait_timed_out"] = True
 
-                                        # Wait for the ACTUAL result to
-                                        # replace the overlay's pre-search
-                                        # placeholder ("Search by PIN Code
-                                        # to see availability...") instead
-                                        # of trusting a fixed dwell — a
-                                        # real 2026-07-28 run extracted
-                                        # that placeholder verbatim,
-                                        # meaning a fixed dwell alone isn't
-                                        # a reliable signal that results
-                                        # actually loaded.
-                                        try:
-                                            page.wait_for_function(
-                                                """({selector, placeholder}) => {
-                                                    const el = document.querySelector(selector);
-                                                    return el && !el.innerText.toLowerCase().includes(placeholder);
-                                                }""",
-                                                arg={
-                                                    "selector": _PICKUP_OVERLAY_SELECTOR,
-                                                    "placeholder": _PICKUP_SEARCH_PLACEHOLDER_PHRASE,
-                                                },
-                                                timeout=8000,
-                                            )
-                                        except PlaywrightTimeoutError:
-                                            diagnostics["results_wait_timed_out"] = True
-                                        except Exception:
-                                            pass
-                                        page.wait_for_timeout(1000)
-
-                try:
-                    overlay = page.locator(_PICKUP_OVERLAY_SELECTOR).first
-                    if overlay.count() > 0:
-                        raw_text = overlay.inner_text()
-                except Exception as exc:
-                    diagnostics["extract_error"] = str(exc)
-                    logger.error(f"[check-pickup-availability] overlay text extraction failed for {url}: {exc}")
-
-                if raw_text:
-                    text_lower = raw_text.lower()
-                    diagnostics["results_placeholder_still_shown"] = _PICKUP_SEARCH_PLACEHOLDER_PHRASE in text_lower
-                    if any(phrase in text_lower for phrase in _PICKUP_NOT_AVAILABLE_PHRASES):
-                        available = None  # inconclusive, NOT False — see module note
-                    elif any(phrase in text_lower for phrase in _PICKUP_TENTATIVE_AVAILABLE_HINT_PHRASES):
-                        tentative_positive_hint = True
-                        available = None  # NOT auto-confirmed — see module note
-                        logger.warning(
-                            f"[check-pickup-availability] {url} pincode={pincode!r}: tentative "
-                            f"positive phrase seen but NOT confirmed for this overlay type — "
-                            f"reporting inconclusive; raw_text={raw_text[:500]!r}"
-                        )
+                if diagnostics["sku"] is None:
+                    diagnostics["parse_error"] = diagnostics["sku_error"] or "SKU could not be extracted from the page"
+                elif captured_bodies["pickup_message_recommendations"] is not None:
+                    diagnostics["used_endpoint"] = "pickup_message_recommendations"
+                    available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
+                        captured_bodies["pickup_message_recommendations"],
+                        ["body", "PickupMessage", "stores"],
+                        diagnostics["sku"],
+                        _PICKUP_MESSAGE_RECOMMENDATIONS_AVAILABLE_VALUES,
+                    )
+                elif captured_bodies["fulfillment_messages"] is not None:
+                    diagnostics["used_endpoint"] = "fulfillment_messages"
+                    available, matching_stores, diagnostics["parse_error"] = _parse_pickup_stores(
+                        captured_bodies["fulfillment_messages"],
+                        ["body", "content", "pickupMessage", "stores"],
+                        diagnostics["sku"],
+                        _FULFILLMENT_MESSAGES_AVAILABLE_VALUES,
+                    )
 
                 logger.info(
                     f"[check-pickup-availability] {url} pincode={pincode!r}: available={available} "
+                    f"used_endpoint={diagnostics['used_endpoint']} matching_stores={len(matching_stores)} "
                     f"state={diagnostics['state']} diagnostics={diagnostics}"
                 )
                 return {
                     "available": available,
-                    "raw_text": raw_text,
-                    "tentative_positive_hint": tentative_positive_hint,
+                    "matching_stores": matching_stores,
                     "diagnostics": diagnostics,
                     "git_commit_sha": GIT_COMMIT_SHA,
                 }

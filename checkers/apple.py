@@ -627,12 +627,16 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 # alternative to _fetch_pickup_availability above. Exists because the
 # direct httpx approach is currently 0% successful — every SKU/pincode/
 # param/header/cookie combination tried failed (see this module's PARAM
-# SET / HEADER HISTORY notes above _cookie_auth_fetch) — while reading the
-# rendered DOM directly was confirmed working end-to-end via a real,
-# controlled investigation. See playwright_scraper/main.py's
-# _check_pickup_availability docstring for the full confirmed flow,
-# selectors, and — importantly — its two open caveats (headful-only,
-# conservative classifier), neither of which is silently papered over
+# SET / HEADER HISTORY notes above _cookie_auth_fetch). playwright_scraper's
+# _check_pickup_availability (2026-07-28 network-interception rewrite)
+# doesn't scrape rendered DOM at all anymore — it types the pincode into
+# Apple's own pickup-search field, which makes the page's OWN JS fire
+# pickup-message-recommendations (or fulfillment-messages as a fallback)
+# as real backend calls that succeed (200 OK) with genuine in-page session
+# context our httpx replay can never reproduce, and parses whichever
+# response body arrives directly. See playwright_scraper/main.py's
+# _check_pickup_availability docstring for the full architecture and —
+# importantly — its available=False caveat, not silently papered over
 # here either.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -644,19 +648,20 @@ async def _fetch_pickup_availability_via_page_render(
     Apple's fulfillment-messages API directly.
 
     Returns (available, error):
-      - available: True only for a confirmed positive signal for the
-        iPhone-specific overlay. As of 2026-07-28 no such phrase has
-        actually been confirmed yet (the one positive example captured
-        came from a DIFFERENT, accessory-only overlay this function
-        never touches) — so today this can only ever come back None,
-        never True, until a real capture confirms the phrasing and
-        playwright_scraper's classifier is tightened accordingly. None
-        also covers every other inconclusive case, INCLUDING a genuine
-        "not available" result — never treated as a confirmed False,
-        same reasoning _evaluate_pickup_availability above already uses
-        for the fulfillment-messages signal (India's sparse Apple Store
-        network makes "no pickup nearby" the common case, not proof of
-        no stock).
+      - available: True if at least one specific, named nearby store
+        shows this SKU as available for pickup — a genuine, pincode-
+        specific confirmation, same meaning as _evaluate_pickup_
+        availability's own True above. False if real candidate stores
+        were returned for this pincode but NONE show the SKU as
+        available — UNLIKE _evaluate_pickup_availability above, this
+        endpoint's False IS a confirmed negative here (not folded into
+        None), because pickup-message-recommendations already narrows to
+        specific stores actually near this pincode, not just "no stores
+        exist" (see playwright_scraper's own module note for the exact
+        reasoning). None covers every genuinely inconclusive case: no
+        stores near this pincode at all, the SKU not found in any
+        store's data, or the check failing before a response ever
+        arrived.
       - error: None on a successful call (regardless of the resulting
         `available` value), else a short human-readable reason (missing
         PLAYWRIGHT_SCRAPER_URL, network error, non-200, non-JSON) —
@@ -667,15 +672,10 @@ async def _fetch_pickup_availability_via_page_render(
     whether/how it replaces or supplements the (currently broken) direct
     httpx path in those production call sites is a separate decision, not
     made here. playwright_scraper's Dockerfile starts a virtual display
-    (start.sh — explicit Xvfb + readiness poll, revised after an earlier
-    xvfb-run-wrapped attempt deployed fine but still left this specific
-    function's headful launch failing with "Missing X server or
-    $DISPLAY") so its headless=False requirement can run on Railway's
-    display-less container — but that startup script is still UNTESTED
-    (no way to build/run a real Docker container from the environment
-    that wrote it). See playwright_scraper/main.py's
-    _check_pickup_availability docstring for the full caveat, including
-    why a working /debug-pickup-flow deploy is NOT evidence this works.
+    (start.sh — explicit Xvfb + readiness poll) so its headless=False
+    requirement can run on Railway's display-less container — confirmed
+    working via a real deploy as of the checkpoint diagnostics this
+    endpoint's rewrite is built on top of.
 
     Never raises.
     """
@@ -710,14 +710,10 @@ async def _fetch_pickup_availability_via_page_render(
         return None, reason
 
     available = data.get("available")
-    if data.get("tentative_positive_hint"):
-        logger.warning(
-            f"[apple][page-render] pincode={pincode!r}: tentative positive hint seen "
-            f"(unconfirmed phrase for this overlay type) — "
-            f"raw_text={(data.get('raw_text') or '')[:500]!r}"
-        )
+    matching_stores = data.get("matching_stores") or []
     logger.info(
         f"[apple][page-render] pincode={pincode!r}: available={available} "
+        f"matching_stores={[s.get('store_name') for s in matching_stores]} "
         f"diagnostics={data.get('diagnostics')}"
     )
     return available, None
