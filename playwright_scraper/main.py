@@ -221,10 +221,15 @@ APPLE_REFRESH_POST_FETCH_WAIT_MS = int(os.getenv("APPLE_REFRESH_POST_FETCH_WAIT_
 # controlled same-network A/B test (2026-07-28) confirmed headless
 # Chromium fails to render Apple's pickUpDetails widget at all, while an
 # otherwise-identical headful run succeeds consistently. NOTE: headful
-# needs a real display; an unmodified Railway container has none. This
-# env var lets a deploy override back to headless=true once/if that's
-# resolved (e.g. Xvfb added to the Dockerfile — NOT done yet, see
-# _check_pickup_availability's own docstring), without a code change.
+# needs a real display; the Dockerfile now starts one (xvfb-run — see
+# playwright_scraper/Dockerfile). That Dockerfile change is UNTESTED —
+# this sandbox has no usable Docker daemon, so neither the image build
+# nor a headful launch under Xvfb has actually been run/verified here,
+# only reasoned through from documented xvfb-run behavior. Confirm it
+# actually works (e.g. via /check-pickup-availability) once deployed,
+# rather than assuming it behaves as intended. This env var lets a
+# deploy override back to headless=true without a code change, e.g. if
+# Xvfb ever turns out to be unnecessary or itself causes a new problem.
 APPLE_PICKUP_HEADLESS = os.getenv("APPLE_PICKUP_HEADLESS", "false").lower() == "true"
 
 # /debug-network: default pincode applied when the caller doesn't specify
@@ -1232,12 +1237,14 @@ def _capture_pickup_flow(url: str, pincode: str) -> dict:
 # 1. REQUIRES headless=False (APPLE_PICKUP_HEADLESS, default off — see
 #    above). A controlled same-network A/B test (2026-07-28) confirmed
 #    headless Chromium fails to render pickUpDetails at all, while headful
-#    succeeds consistently, on the SAME network/IP. Calling this on an
-#    unmodified Railway deploy (no physical display) will hit the same
-#    failure headless always did, unless a virtual display (e.g. Xvfb) is
-#    added to the Dockerfile/CMD first — NOT done yet. This function is
-#    safe to call locally/manually today; it is NOT yet wired into any
-#    scheduled production cron.
+#    succeeds consistently, on the SAME network/IP. The Dockerfile now
+#    starts a virtual display (xvfb-run) so a headful launch has
+#    something to render into on Railway's display-less container — but
+#    that Dockerfile change is UNTESTED (this sandbox has no usable
+#    Docker daemon to build/run it against), so treat it as unverified
+#    until confirmed against a real deploy, not as a solved problem. This
+#    function is safe to call locally/manually today; it is NOT yet wired
+#    into any scheduled production cron.
 #
 # 2. The "available" classification is DELIBERATELY conservative: only a
 #    CONFIRMED phrase for THIS overlay type sets available=True. As of
