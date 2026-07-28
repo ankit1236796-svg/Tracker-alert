@@ -4419,3 +4419,16 @@ async def cmd_debugzipcodevalidation(message: Message, command: CommandObject):
             "⚠️ no checkpoints were reached — the flow failed before typing "
             "even started. Check diagnostics above for which step failed.",
         )
+
+    network_requests = data.get("network_requests") or []
+    if network_requests:
+        text = f"network_requests ({len(network_requests)} XHR/fetch since typing started):\n{json.dumps(network_requests, indent=2)}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+    else:
+        await _debug_send(
+            message,
+            "network_requests: none seen — no XHR/fetch call was fired after "
+            "typing, which argues against an async backend validation call "
+            "being what Continue is waiting on.",
+        )
