@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import time
 from urllib.parse import urlencode
 
 import httpx
@@ -640,6 +641,67 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 # here either.
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ---------------------------------------------------------------------------
+# Cross-user dedup for page-render checks (2026-07-28): mirrors stock_
+# checker.py's own _fetch_cache/_fetch_locks TTL-cache pattern (see that
+# module's own note on WHY — different users tracking the identical
+# product each got their own row, previously firing one independent
+# request per tracker even though the underlying check is identical),
+# keyed here by (product_url, pincode) instead of stock_checker.py's
+# fetch-parameter key. Matters MORE for Apple pickup specifically than
+# for the lighter checkers that pattern was built for: each check here
+# launches a real headful Chromium browser (playwright_scraper), and
+# MAX_CONCURRENT_CHECKS was JUST cut 4->2 after real resource-contention
+# failures under concurrent load — every check avoided here directly
+# reduces pressure on that same limited concurrency budget, not just
+# request volume.
+#
+# Caches the FULL (available, matching_stores) result, not just a raw
+# fetch like stock_checker.py does — unlike the stock checker, there's no
+# further per-user refinement step run on top afterward (available/
+# matching_stores from playwright_scraper IS the final per-pincode
+# answer), so caching the finished result is both correct and simpler.
+#
+# Only a genuinely SUCCESSFUL call (error is None) is cached — a failure
+# is never cached, so a transient blip for one user's check doesn't get
+# silently replayed as a failure for every other user sharing this exact
+# (product_url, pincode) within the TTL window; each of THEIR calls still
+# gets its own fresh attempt (each already includes playwright_scraper's
+# own internal retry loop, so this isn't relying on the cache for
+# resilience, only for genuine cross-user duplicate avoidance).
+_PAGE_RENDER_CACHE_TTL_SECONDS = 150  # ~83% of APPLE_PICKUP_CHECK_INTERVAL's
+                                       # 180s default (config.py) — same
+                                       # "comfortably under one cycle's own
+                                       # interval" proportion stock_checker.
+                                       # py's 240s/300s TTL uses, so this
+                                       # collapses duplicates WITHIN one
+                                       # apple_pickup_check_loop pass
+                                       # without spanning into the next.
+_page_render_cache: dict[str, tuple[float, bool | None, list[dict], str | None]] = {}
+_page_render_locks: dict[str, asyncio.Lock] = {}
+_page_render_locks_guard = asyncio.Lock()
+
+
+def _page_render_cache_key(product_url: str, pincode: str) -> str:
+    return f"{product_url}|{pincode}"
+
+
+async def _get_page_render_lock(key: str) -> asyncio.Lock:
+    async with _page_render_locks_guard:
+        lock = _page_render_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _page_render_locks[key] = lock
+        return lock
+
+
+def _prune_page_render_cache(now: float) -> None:
+    expired = [k for k, (ts, *_rest) in _page_render_cache.items() if now - ts >= _PAGE_RENDER_CACHE_TTL_SECONDS]
+    for k in expired:
+        _page_render_cache.pop(k, None)
+        _page_render_locks.pop(k, None)
+
+
 def _adapt_page_render_stores(matching_stores: list[dict]) -> list[dict]:
     """
     Adapts playwright_scraper's matching_stores shape
@@ -719,6 +781,15 @@ async def _fetch_pickup_availability_via_page_render(
     risked this client giving up before playwright_scraper's own retry
     loop had a chance to.
 
+    Cross-user deduplicated (2026-07-28) via _page_render_cache — see
+    that module-level note above for the full reasoning. Identical
+    (product_url, pincode) calls within _PAGE_RENDER_CACHE_TTL_SECONDS
+    reuse the most recent SUCCESSFUL result instead of launching another
+    browser check; a lock per cache key prevents a thundering herd where
+    several concurrent calls for the same not-yet-cached key each launch
+    their own check before the first one has a chance to populate the
+    cache.
+
     Never raises.
     """
     from config import PLAYWRIGHT_SCRAPER_URL
@@ -728,37 +799,65 @@ async def _fetch_pickup_availability_via_page_render(
         logger.warning(f"[apple][page-render] {reason} — skipping pincode={pincode!r}")
         return None, [], reason
 
-    try:
-        async with httpx.AsyncClient(timeout=240.0) as client:
-            resp = await client.post(
-                f"{PLAYWRIGHT_SCRAPER_URL}/check-pickup-availability",
-                json={"url": product_url, "pincode": pincode},
+    cache_key = _page_render_cache_key(product_url, pincode)
+    now = time.monotonic()
+    _prune_page_render_cache(now)
+
+    cached = _page_render_cache.get(cache_key)
+    if cached is not None and now - cached[0] < _PAGE_RENDER_CACHE_TTL_SECONDS:
+        logger.info(
+            f"[apple][page-render] cache hit (age={now - cached[0]:.0f}s) pincode={pincode!r} "
+            f"— browser check skipped"
+        )
+        _, cached_available, cached_stores, cached_error = cached
+        return cached_available, cached_stores, cached_error
+
+    lock = await _get_page_render_lock(cache_key)
+    async with lock:
+        # Re-check after acquiring the lock: a concurrent call for the
+        # same key may have already populated the cache while we waited.
+        now = time.monotonic()
+        cached = _page_render_cache.get(cache_key)
+        if cached is not None and now - cached[0] < _PAGE_RENDER_CACHE_TTL_SECONDS:
+            logger.info(
+                f"[apple][page-render] cache hit post-lock (age={now - cached[0]:.0f}s) "
+                f"pincode={pincode!r} — browser check skipped"
             )
-    except Exception as exc:
-        reason = f"request to playwright_scraper failed: {type(exc).__name__}: {exc}"
-        logger.warning(f"[apple][page-render] {reason}")
-        return None, [], reason
+            _, cached_available, cached_stores, cached_error = cached
+            return cached_available, cached_stores, cached_error
 
-    if resp.status_code != 200:
-        reason = f"playwright_scraper returned HTTP {resp.status_code}: {resp.text[:300]!r}"
-        logger.warning(f"[apple][page-render] {reason}")
-        return None, [], reason
+        try:
+            async with httpx.AsyncClient(timeout=240.0) as client:
+                resp = await client.post(
+                    f"{PLAYWRIGHT_SCRAPER_URL}/check-pickup-availability",
+                    json={"url": product_url, "pincode": pincode},
+                )
+        except Exception as exc:
+            reason = f"request to playwright_scraper failed: {type(exc).__name__}: {exc}"
+            logger.warning(f"[apple][page-render] {reason}")
+            return None, [], reason  # never cached — a fresh call may succeed
 
-    try:
-        data = resp.json()
-    except Exception as exc:
-        reason = f"non-JSON response from playwright_scraper: {exc}"
-        logger.warning(f"[apple][page-render] {reason}")
-        return None, [], reason
+        if resp.status_code != 200:
+            reason = f"playwright_scraper returned HTTP {resp.status_code}: {resp.text[:300]!r}"
+            logger.warning(f"[apple][page-render] {reason}")
+            return None, [], reason  # never cached
 
-    available = data.get("available")
-    matching_stores = _adapt_page_render_stores(data.get("matching_stores") or [])
-    logger.info(
-        f"[apple][page-render] pincode={pincode!r}: available={available} "
-        f"matching_stores={[s.get('store_name') for s in matching_stores]} "
-        f"diagnostics={data.get('diagnostics')}"
-    )
-    return available, matching_stores, None
+        try:
+            data = resp.json()
+        except Exception as exc:
+            reason = f"non-JSON response from playwright_scraper: {exc}"
+            logger.warning(f"[apple][page-render] {reason}")
+            return None, [], reason  # never cached
+
+        available = data.get("available")
+        matching_stores = _adapt_page_render_stores(data.get("matching_stores") or [])
+        logger.info(
+            f"[apple][page-render] pincode={pincode!r}: available={available} "
+            f"matching_stores={[s.get('store_name') for s in matching_stores]} "
+            f"diagnostics={data.get('diagnostics')}"
+        )
+        _page_render_cache[cache_key] = (time.monotonic(), available, matching_stores, None)
+        return available, matching_stores, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -81,6 +81,7 @@ from database import (
     bulk_stop_tracking,
     bulk_cancel_plan,
     list_tracked_links_by_store,
+    list_pickup_tracking_links_by_store,
     get_service_pause_info,
     set_service_paused,
     list_paused_user_ids,
@@ -983,6 +984,17 @@ def create_app() -> Flask:
             {"site": site, "links": grouped[site]}
             for site in ordered_sites if grouped.get(site)
         ]
+        # Apple pickup tracking (/trackpickup) lives in its own table
+        # (pickup_tracking), entirely separate from `products` — grouped
+        # above never sees it, so it was invisible here (2026-07-28 gap).
+        # Appended as its own section, same {name, tracker_count, url}
+        # shape as every other site's rows. "apple pickup" (lowercase,
+        # space) renders as "Apple pickup" via the template's own
+        # .capitalize() call, matching every other section's title
+        # without needing a template change.
+        pickup_links = list_pickup_tracking_links_by_store()
+        if pickup_links:
+            sections.append({"site": "apple pickup", "links": pickup_links})
         return render_template("links_by_store.html", sections=sections)
 
     # ── Pause/Resume Service ───────────────────────────────────────────────
