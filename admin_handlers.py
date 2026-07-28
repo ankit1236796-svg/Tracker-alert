@@ -4244,16 +4244,24 @@ async def cmd_debugpickupflow(message: Message, command: CommandObject):
 
 
 # ---------------------------------------------------------------------------
-# /debugpickupavailability: thin wrapper around the PRODUCTION
-# /check-pickup-availability endpoint (checkers/apple.py's
-# _fetch_pickup_availability_via_page_render calls the same one) — unlike
+# /debugpickupavailability: thin wrapper around checkers/apple.py's
+# _fetch_pickup_availability_via_page_render — THE SAME function check_
+# pickup_row/check_channel_pickup_row call in production — unlike
 # /debugpickupflow above (which hits the raw diagnostic /debug-pickup-flow
 # endpoint and dumps HTML for a human to read), this exercises the actual
-# classifier that would run in production, so its `available` value is a
-# direct answer to "does the real checker logic work against this page
-# right now", not something inferred from eyeballing markup. NOT wired
-# into any production code path itself — purely diagnostic, safe to
-# delete alongside /check-pickup-availability once no longer needed.
+# classifier AND the actual cross-user dedup cache that would run in
+# production, so its `available`/`served_from_cache` values are a direct
+# answer to "does the real checker logic work against this page right
+# now", not something inferred from eyeballing markup or a separate call
+# path that doesn't reflect what production actually does.
+#
+# 2026-07-28: previously did its OWN separate httpx POST straight to
+# playwright_scraper, bypassing _fetch_pickup_availability_via_page_render
+# (and its cache) entirely — meaning two manual calls in a row could
+# never demonstrate the cross-user dedup cache working, since this
+# command never touched that cache either way. Routing through the same
+# function production uses fixes that, and comes for free with a
+# `served_from_cache` field to make it directly visible.
 # ---------------------------------------------------------------------------
 _DEBUG_PICKUP_AVAILABILITY_ADMIN_ID = 5004721766  # same hardcoded restriction
 # as every other /debug* command above, on top of the router's own
@@ -4265,8 +4273,6 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
     if message.from_user.id != _DEBUG_PICKUP_AVAILABILITY_ADMIN_ID:
         return
 
-    from config import PLAYWRIGHT_SCRAPER_URL
-
     if not command.args:
         await message.answer("Usage: <code>/debugpickupavailability &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
         return
@@ -4277,53 +4283,37 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
         return
     url, pincode = parts[0], parts[1]
 
-    if not PLAYWRIGHT_SCRAPER_URL:
-        await _debug_send(message, "⚠️ PLAYWRIGHT_SCRAPER_URL is not set on this service — nothing to call.")
-        return
-
     await _debug_send(
         message,
-        f"🔍 Running the PRODUCTION pickup-availability checker on {url} for "
-        f"pincode {pincode} (playwright_scraper: {PLAYWRIGHT_SCRAPER_URL})…",
+        f"🔍 Running the PRODUCTION pickup-availability checker (same cached "
+        f"function check_pickup_row uses) on {url} for pincode {pincode}…",
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(
-                f"{PLAYWRIGHT_SCRAPER_URL}/check-pickup-availability", json={"url": url, "pincode": pincode},
-            )
-    except Exception as exc:
-        await _debug_send(message, f"⚠️ Request to playwright_scraper failed: {exc}")
-        return
-
-    if resp.status_code != 200:
-        await _debug_send(message, f"⚠️ playwright_scraper returned HTTP {resp.status_code}: {resp.text[:500]!r}")
-        return
-
-    try:
-        data = resp.json()
-    except Exception as exc:
-        await _debug_send(message, f"⚠️ Non-JSON response from playwright_scraper: {exc}")
-        return
+    available, matching_stores, error, meta = await apple._fetch_pickup_availability_via_page_render(url, pincode)
 
     _CHUNK_SIZE = 3500
 
-    available = data.get("available")
     await _debug_send(
         message,
-        f"git_commit_sha: {data.get('git_commit_sha')!r} — compare this against "
+        f"served_from_cache: {meta['served_from_cache']!r} — True means this exact "
+        f"(url, pincode) was already checked within the last "
+        f"{apple._PAGE_RENDER_CACHE_TTL_SECONDS}s and this call reused that result "
+        f"WITHOUT launching a new browser check; call this command twice in a row "
+        f"for the same url/pincode to see it flip from False to True\n"
+        f"git_commit_sha: {meta['git_commit_sha']!r} — compare this against "
         f"the commit you expect to be deployed, so a result that looks like an "
         f"old bug can't be mistaken for a fix that didn't work (or vice versa)\n"
-        f"available: {available!r}",
+        f"available: {available!r}"
+        + (f"\nerror: {error}" if error else ""),
     )
     # Chunked separately from the above (2026-07-28) — diagnostics can now
     # include up to 40 all_responses_seen entries, easily long enough to
-    # exceed Telegram's per-message limit on its own.
-    diagnostics_text = f"diagnostics:\n{json.dumps(data.get('diagnostics'), indent=2)}"
+    # exceed Telegram's per-message limit on its own. None when the call
+    # failed before a scraper response ever arrived (see error above).
+    diagnostics_text = f"diagnostics:\n{json.dumps(meta['diagnostics'], indent=2)}"
     for i in range(0, len(diagnostics_text), _CHUNK_SIZE):
         await _debug_send(message, diagnostics_text[i:i + _CHUNK_SIZE])
 
-    matching_stores = data.get("matching_stores") or []
     if matching_stores:
         text = f"matching_stores ({len(matching_stores)}):\n{json.dumps(matching_stores, indent=2)}"
         for i in range(0, len(text), _CHUNK_SIZE):
@@ -4333,7 +4323,7 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
             message,
             "matching_stores: none — either genuinely not available at any "
             "nearby store, no stores near this pincode at all, or the "
-            "check failed before reaching that point. Check diagnostics "
+            "check failed before reaching that point. Check diagnostics/error "
             "above (used_endpoint/parse_error/response_wait_timed_out) for which.",
         )
 
