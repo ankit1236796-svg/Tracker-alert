@@ -4331,3 +4331,91 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
             "⚠️ raw_text is empty — the overlay never appeared or nothing "
             "could be extracted. Check diagnostics above for which step failed.",
         )
+
+
+# ---------------------------------------------------------------------------
+# /debugzipcodevalidation: thin wrapper around /debug-zipcode-validation —
+# evidence-gathering for WHY Continue stays disabled after typing pincode
+# (2026-07-28, after press_sequentially alone didn't fix it). Tests, in
+# order, whether an extra dwell, a programmatic blur, or a real
+# click-elsewhere blur is what Apple's validation actually needs — plus
+# static evidence (zipCode's own HTML validation attrs, React's attached
+# event-handler keys, any visible error text) independent of that
+# sequence. NOT wired into any production code path — purely diagnostic,
+# safe to delete alongside /debug-zipcode-validation once no longer
+# needed.
+# ---------------------------------------------------------------------------
+_DEBUG_ZIPCODE_VALIDATION_ADMIN_ID = 5004721766  # same hardcoded restriction
+# as every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter.
+
+
+@router.message(Command("debugzipcodevalidation"))
+async def cmd_debugzipcodevalidation(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_ZIPCODE_VALIDATION_ADMIN_ID:
+        return
+
+    from config import PLAYWRIGHT_SCRAPER_URL
+
+    if not command.args:
+        await message.answer("Usage: <code>/debugzipcodevalidation &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/debugzipcodevalidation &lt;apple_url&gt; &lt;pincode&gt;</code>", parse_mode="HTML")
+        return
+    url, pincode = parts[0], parts[1]
+
+    if not PLAYWRIGHT_SCRAPER_URL:
+        await _debug_send(message, "⚠️ PLAYWRIGHT_SCRAPER_URL is not set on this service — nothing to call.")
+        return
+
+    await _debug_send(
+        message,
+        f"🔍 Testing checkpoints A (typed) → B (+500ms dwell) → C (programmatic "
+        f"blur) → D (click-elsewhere blur) on {url} for pincode {pincode} — "
+        f"stops at the first checkpoint where Continue actually becomes enabled "
+        f"(playwright_scraper: {PLAYWRIGHT_SCRAPER_URL})…",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                f"{PLAYWRIGHT_SCRAPER_URL}/debug-zipcode-validation", json={"url": url, "pincode": pincode},
+            )
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Request to playwright_scraper failed: {exc}")
+        return
+
+    if resp.status_code != 200:
+        await _debug_send(message, f"⚠️ playwright_scraper returned HTTP {resp.status_code}: {resp.text[:500]!r}")
+        return
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        await _debug_send(message, f"⚠️ Non-JSON response from playwright_scraper: {exc}")
+        return
+
+    enabled_at = data.get("enabled_at")
+    await _debug_send(
+        message,
+        f"git_commit_sha: {data.get('git_commit_sha')!r}\n"
+        f"enabled_at: {enabled_at!r}"
+        + ("  ✅ THIS is what actually enables Continue" if enabled_at else "  ⚠️ never became enabled at any checkpoint tried")
+        + f"\ndiagnostics: {data.get('diagnostics')}",
+    )
+
+    _CHUNK_SIZE = 3500
+    checkpoints = data.get("checkpoints") or {}
+    if checkpoints:
+        text = f"checkpoints ({len(checkpoints)}):\n{json.dumps(checkpoints, indent=2)}"
+        for i in range(0, len(text), _CHUNK_SIZE):
+            await _debug_send(message, text[i:i + _CHUNK_SIZE])
+    else:
+        await _debug_send(
+            message,
+            "⚠️ no checkpoints were reached — the flow failed before typing "
+            "even started. Check diagnostics above for which step failed.",
+        )

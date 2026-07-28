@@ -1548,6 +1548,233 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# /debug-zipcode-validation: evidence-gathering diagnostic for WHY
+# Continue stays disabled after typing pincode into zipCode
+# (_check_pickup_availability's remaining open bug, 2026-07-28) — the
+# keystroke-simulation fix (press_sequentially instead of fill()) did NOT
+# resolve it, confirmed via a real deploy (git_commit_sha-verified). This
+# tests, in order, stopping at the first checkpoint where Continue
+# actually becomes enabled:
+#   A. immediately after typing (reproduces the confirmed-still-broken
+#      production behavior)
+#   B. after an extra 500ms dwell with no further interaction (tests
+#      "debounced validation, no blur needed")
+#   C. after an explicit programmatic .blur() on the zipCode input
+#      (tests "needs blur specifically")
+#   D. after clicking a neutral point elsewhere in the overlay — a real
+#      click-driven blur, not a programmatic one (tests whether React's
+#      synthetic blur handling behaves differently for the two)
+# Every checkpoint's full state is captured (not just enabled/disabled),
+# plus STATIC evidence independent of the sequence: zipCode's own HTML
+# validation attributes (pattern/maxlength/minlength/inputmode/type —
+# rules a format mismatch in vs out) and, where discoverable, React's own
+# attached event-handler prop names on the zipCode element (via its
+# internal __reactProps*/__reactEventHandlers* key — confirms which
+# synthetic events (onBlur/onChange/onInput/onKeyUp) the page actually
+# listens for, without needing to guess).
+# ---------------------------------------------------------------------------
+
+_ZIPCODE_VALIDATION_STATE_JS = """(continueSelector) => {
+    const continueBtn = document.querySelector(continueSelector);
+    const zipInput = document.querySelector('[data-autom="zipCode"]');
+
+    function reactHandlerKeys(el) {
+        if (!el) return [];
+        const key = Object.keys(el).find(
+            (k) => k.startsWith('__reactProps') || k.startsWith('__reactEventHandlers')
+        );
+        if (!key) return [];
+        const props = el[key];
+        if (!props) return [];
+        return Object.keys(props).filter((k) => k.toLowerCase().startsWith('on'));
+    }
+
+    let nearbyErrorText = null;
+    if (zipInput) {
+        const container = zipInput.closest('form') || zipInput.parentElement;
+        if (container) {
+            const candidates = container.querySelectorAll('[class*="error" i], [class*="invalid" i], [role="alert"]');
+            for (const c of candidates) {
+                const t = (c.innerText || '').trim();
+                if (t) { nearbyErrorText = t; break; }
+            }
+        }
+    }
+
+    return {
+        continue_disabled_attr: continueBtn ? continueBtn.disabled : null,
+        continue_aria_disabled: continueBtn ? continueBtn.getAttribute('aria-disabled') : null,
+        continue_class: continueBtn ? continueBtn.className : null,
+        zip_value: zipInput ? zipInput.value : null,
+        zip_is_active_element: document.activeElement === zipInput,
+        zip_pattern: zipInput ? zipInput.getAttribute('pattern') : null,
+        zip_maxlength: zipInput ? zipInput.getAttribute('maxlength') : null,
+        zip_minlength: zipInput ? zipInput.getAttribute('minlength') : null,
+        zip_inputmode: zipInput ? zipInput.getAttribute('inputmode') : null,
+        zip_type: zipInput ? zipInput.getAttribute('type') : null,
+        zip_react_handler_keys: reactHandlerKeys(zipInput),
+        nearby_error_text: nearbyErrorText,
+    };
+}"""
+
+
+def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
+    """
+    Reproduces _check_pickup_availability's flow exactly up through
+    typing `pincode` (same navigate -> click trigger/resolved-state ->
+    wait overlay -> clear+press_sequentially), then runs a sequence of
+    checkpoints to find WHICH intervention (if any) actually enables
+    Continue — see the module note above for what each checkpoint tests.
+
+    Returns {"checkpoints": {name: state_dict, ...}, "enabled_at": name
+    or None, "diagnostics": {...}} — "enabled_at" is the first checkpoint
+    name where continue_disabled_attr was False, or None if it never
+    became enabled at any checkpoint tried. Every checkpoint that WAS
+    reached is included in "checkpoints", even after "enabled_at" is
+    found, up to (and including) the one that succeeded — later
+    checkpoints are skipped once one succeeds, since there's nothing
+    further to learn by continuing to poke at an already-fixed state.
+
+    Never raises; a failure at any step is recorded in "diagnostics" and
+    whatever checkpoints were reached are still returned.
+    """
+    acquired = _check_semaphore.acquire(timeout=SLOT_WAIT_TIMEOUT_SECONDS)
+    if not acquired:
+        raise RuntimeError(
+            f"too many concurrent checks (max {MAX_CONCURRENT_CHECKS}) — "
+            f"timed out after {SLOT_WAIT_TIMEOUT_SECONDS}s waiting for a free slot"
+        )
+    try:
+        with sync_playwright() as pw:
+            browser, context = _new_browser_and_context(
+                pw, user_agent=_apple_user_agent_for, headless=APPLE_PICKUP_HEADLESS,
+            )
+            try:
+                page = context.new_page()
+                diagnostics: dict = {
+                    "goto_error": None,
+                    "pickup_details_wait_timed_out": None,
+                    "state": None,
+                    "click_error": None,
+                    "overlay_wait_timed_out": None,
+                    "zip_fill_error": None,
+                }
+                checkpoints: dict = {}
+                enabled_at: str | None = None
+
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                except Exception as exc:
+                    diagnostics["goto_error"] = str(exc)
+                    return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=SIGNAL_WAIT_TIMEOUT_MS)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_selector(_PICKUP_DETAILS_SELECTOR, timeout=10000)
+                    diagnostics["pickup_details_wait_timed_out"] = False
+                except Exception:
+                    diagnostics["pickup_details_wait_timed_out"] = True
+                    return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
+                page.wait_for_timeout(3000)
+
+                trigger_locator = page.locator(_PICKUP_TRIGGER_SELECTOR)
+                resolved_locator = page.locator(_ALREADY_RESOLVED_TRIGGER_SELECTOR)
+                click_target = None
+                if trigger_locator.count() > 0:
+                    diagnostics["state"] = "trigger_present"
+                    click_target = trigger_locator.first
+                elif resolved_locator.count() > 0:
+                    diagnostics["state"] = "already_resolved"
+                    click_target = resolved_locator.first
+                else:
+                    diagnostics["state"] = "neither"
+                    return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
+
+                try:
+                    click_target.click(timeout=5000)
+                except Exception as exc:
+                    diagnostics["click_error"] = str(exc)
+                    return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
+
+                try:
+                    page.wait_for_selector(_PICKUP_OVERLAY_SELECTOR, timeout=10000)
+                except Exception:
+                    diagnostics["overlay_wait_timed_out"] = True
+                    return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
+
+                try:
+                    zip_input = page.locator(_PICKUP_ZIPCODE_SELECTOR).first
+                    zip_input.wait_for(timeout=8000)
+                    zip_input.clear()
+                    zip_input.press_sequentially(pincode, delay=50)
+                except Exception as exc:
+                    diagnostics["zip_fill_error"] = str(exc)
+                    return {"checkpoints": checkpoints, "enabled_at": None, "diagnostics": diagnostics}
+
+                def _capture(name: str) -> dict:
+                    try:
+                        state = page.evaluate(_ZIPCODE_VALIDATION_STATE_JS, _PICKUP_CONTINUE_SELECTOR)
+                    except Exception as exc:
+                        state = {"capture_error": str(exc)}
+                    checkpoints[name] = state
+                    return state
+
+                # Checkpoint A: immediately after typing.
+                state = _capture("A_immediately_after_typing")
+                if state.get("continue_disabled_attr") is False:
+                    enabled_at = "A_immediately_after_typing"
+
+                # Checkpoint B: extra dwell, no blur — tests debounce alone.
+                if enabled_at is None:
+                    page.wait_for_timeout(500)
+                    state = _capture("B_after_500ms_dwell_no_blur")
+                    if state.get("continue_disabled_attr") is False:
+                        enabled_at = "B_after_500ms_dwell_no_blur"
+
+                # Checkpoint C: programmatic .blur() — tests "needs blur".
+                if enabled_at is None:
+                    try:
+                        zip_input.evaluate("el => el.blur()")
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(500)
+                    state = _capture("C_after_programmatic_blur")
+                    if state.get("continue_disabled_attr") is False:
+                        enabled_at = "C_after_programmatic_blur"
+
+                # Checkpoint D: real click-elsewhere blur — tests whether
+                # React's synthetic blur handling differs for a genuine
+                # user-driven blur vs. a programmatic one.
+                if enabled_at is None:
+                    try:
+                        page.locator(_PICKUP_OVERLAY_SELECTOR).first.click(position={"x": 5, "y": 5}, timeout=3000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(500)
+                    state = _capture("D_after_click_elsewhere_blur")
+                    if state.get("continue_disabled_attr") is False:
+                        enabled_at = "D_after_click_elsewhere_blur"
+
+                logger.info(
+                    f"[debug-zipcode-validation] {url} pincode={pincode!r}: "
+                    f"enabled_at={enabled_at} checkpoints={checkpoints} diagnostics={diagnostics}"
+                )
+                return {
+                    "checkpoints": checkpoints,
+                    "enabled_at": enabled_at,
+                    "diagnostics": diagnostics,
+                    "git_commit_sha": GIT_COMMIT_SHA,
+                }
+            finally:
+                browser.close()
+    finally:
+        _check_semaphore.release()
+
+
+# ---------------------------------------------------------------------------
 # /refresh-apple-cookies: launch a real headless-Chromium session, load an
 # Apple product page, and trigger the SAME fulfillment-messages request a
 # real visitor's own pickup-availability check performs — from INSIDE the
@@ -1954,6 +2181,22 @@ def create_app() -> Flask:
             result = _check_pickup_availability(url, pincode)
         except Exception as exc:
             logger.error(f"[check-pickup-availability] failed for {url}: {exc}")
+            return jsonify({"url": url, "pincode": pincode, "error": str(exc)}), 502
+
+        return jsonify({"url": url, "pincode": pincode, **result}), 200
+
+    @app.route("/debug-zipcode-validation", methods=["POST"])
+    def debug_zipcode_validation():
+        data = request.get_json(silent=True) or {}
+        url = (data.get("url") or "").strip()
+        pincode = (data.get("pincode") or "").strip()
+        if not url or not pincode:
+            return jsonify({"error": "url and pincode are required"}), 400
+
+        try:
+            result = _diagnose_zipcode_validation(url, pincode)
+        except Exception as exc:
+            logger.error(f"[debug-zipcode-validation] failed for {url}: {exc}")
             return jsonify({"url": url, "pincode": pincode, "error": str(exc)}), 502
 
         return jsonify({"url": url, "pincode": pincode, **result}), 200
