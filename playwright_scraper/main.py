@@ -425,10 +425,39 @@ def _new_browser_and_context(
     # to every browser this service launches (not just Apple) — a
     # systemic defense, not site-specific, same reasoning as every other
     # measure in this function.
+    #
+    # --disable-dev-shm-usage (2026-07-28, added after a real
+    # "BrowserType.launch: Target page, context or browser has been
+    # closed" 502 surfaced from /check-pickup-availability while multiple
+    # checks were running concurrently, shortly after MAX_CONCURRENT_
+    # CHECKS was raised 2->4). This container's Dockerfile/start.sh never
+    # configured Chromium's shared-memory usage at all — confirmed by
+    # direct inspection, no prior mention of shm/no-sandbox anywhere in
+    # this service. Docker containers commonly cap /dev/shm at a small
+    # default (often 64MB) regardless of available RAM, and Chromium uses
+    # /dev/shm heavily for rendering; running MULTIPLE Chromium instances
+    # concurrently (now up to 4, since the MAX_CONCURRENT_CHECKS bump)
+    # multiplies that pressure. This exact error message is one of the
+    # most commonly documented Playwright/Puppeteer container failure
+    # modes, and Playwright's own docs recommend this flag (or a larger
+    # /dev/shm mount, which isn't controllable from inside this
+    # Dockerfile) as the standard fix — it makes Chromium fall back to
+    # /tmp instead of crashing when shared memory is exhausted, at a
+    # modest performance cost. NOTE: this is a plausible, code-grounded
+    # candidate fix for the reported symptom, not a confirmed root cause
+    # — nothing in this environment can inspect Railway's actual
+    # container memory/CPU graphs to prove shm exhaustion was what
+    # happened at that specific timestamp; if the error recurs after this
+    # ships, that's real evidence against this hypothesis and against
+    # Xvfb-concurrency as the cause too (a single Xvfb/X11 server
+    # ordinarily handles multiple simultaneous client connections without
+    # issue — that's not a well-documented bottleneck the way shm
+    # exhaustion is), pointing instead toward genuine container-level
+    # memory/CPU exhaustion under this concurrency level.
     browser = pw.chromium.launch(
         headless=headless,
         proxy=_proxy_config(),
-        args=["--disable-blink-features=AutomationControlled"],
+        args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"],
     )
     resolved_user_agent = user_agent(browser) if callable(user_agent) else user_agent
     context = browser.new_context(
