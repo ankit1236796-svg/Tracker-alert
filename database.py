@@ -2085,6 +2085,45 @@ def list_tracked_links_by_store() -> dict[str, list[dict]]:
     return grouped
 
 
+def list_pickup_tracking_links_by_store() -> list[dict]:
+    """
+    Sibling of list_tracked_links_by_store above, for Apple pickup tracking
+    (database.pickup_tracking — /trackpickup) specifically, which lives in
+    its own table entirely separate from `products` and so was invisible
+    on /links-by-store (2026-07-28 gap: the dashboard page and its
+    Telegram /linksbystore counterpart both only ever queried `products`).
+
+    Same [{url, tracker_count, name}, ...] shape as one of
+    list_tracked_links_by_store's per-site lists — most-tracked link
+    first — but returned as a flat list (not grouped by site) since
+    pickup_tracking has no `site` column at all (it's implicitly always
+    Apple pickup). Callers that want it alongside the regular per-site
+    sections attach their own "apple pickup" label.
+
+    Deduplicates by URL only, same as the products-table version — a
+    row's own `pincodes` list (which pincodes THIS user chose) isn't
+    relevant to "how many distinct users track this product", the same
+    way per-user price targets aren't relevant to that same question for
+    regular products.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.url,
+                   COUNT(DISTINCT p.user_id) AS tracker_count,
+                   (
+                       SELECT name FROM pickup_tracking
+                       WHERE pickup_tracking.url = p.url
+                       ORDER BY created_at ASC LIMIT 1
+                   ) AS name
+            FROM pickup_tracking p
+            GROUP BY p.url
+            ORDER BY tracker_count DESC, name ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # Pause/Resume Service — global on/off switch (service_status) + per-user
 # pause (users.checks_paused). See init_db's schema comments for the full
