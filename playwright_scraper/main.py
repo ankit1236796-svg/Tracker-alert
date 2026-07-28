@@ -1552,11 +1552,20 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
 # Continue stays disabled after typing pincode into zipCode
 # (_check_pickup_availability's remaining open bug, 2026-07-28) — the
 # keystroke-simulation fix (press_sequentially instead of fill()) did NOT
-# resolve it, confirmed via a real deploy (git_commit_sha-verified). This
-# tests, in order, stopping at the first checkpoint where Continue
-# actually becomes enabled:
+# resolve it, confirmed via a real deploy (git_commit_sha-verified). A
+# per-keystroke trajectory capture then RULED OUT the typing-truncation
+# theory too: a real run showed all 6 characters landing correctly
+# ("110017" exact), focus staying on the field throughout, and NO visible
+# error text — yet Continue stayed disabled across every blur/timing
+# checkpoint. This tests, in order, stopping at the first checkpoint
+# where Continue actually becomes enabled:
 #   A. immediately after typing (reproduces the confirmed-still-broken
 #      production behavior)
+#   F. a real Enter keypress — NOT yet tested before 2026-07-28 round 2;
+#      the standard way to CONFIRM a typed value in a combobox/
+#      autocomplete-style field, distinct from blur/tab. Tested right
+#      after A since it's the most natural next action a real user takes
+#      after finishing typing.
 #   B. after an extra 500ms dwell with no further interaction (tests
 #      "debounced validation, no blur needed")
 #   E. after a much longer 5s dwell, STILL no blur (isolates "just needs
@@ -1581,13 +1590,23 @@ def _check_pickup_availability(url: str, pincode: str) -> dict:
 # field validation.
 #
 # Every checkpoint's full state is captured (not just enabled/disabled),
-# plus STATIC evidence independent of the sequence: zipCode's own HTML
-# validation attributes (pattern/maxlength/minlength/inputmode/type —
-# rules a format mismatch in vs out) and, where discoverable, React's own
-# attached event-handler prop names on the zipCode element (via its
-# internal __reactProps*/__reactEventHandlers* key — confirms which
-# synthetic events (onBlur/onChange/onInput/onKeyUp) the page actually
-# listens for, without needing to guess).
+# plus STATIC evidence independent of the sequence:
+#   - zipCode's own HTML validation attributes (pattern/maxlength/
+#     minlength/inputmode/type — rules a format mismatch in vs out)
+#   - React's own attached event-handler prop names on the zipCode
+#     element (via its internal __reactProps*/__reactEventHandlers* key —
+#     confirms which synthetic events the page actually listens for)
+#   - combobox/autocomplete evidence (2026-07-28 round 2, after correct,
+#     error-free typing STILL left Continue disabled): zipCode's own
+#     role/aria-autocomplete/aria-expanded/aria-activedescendant/
+#     aria-controls attributes, plus whether any [role="listbox"]/
+#     [role="option"] elements exist anywhere on the page — tests
+#     whether this is actually a combobox requiring a SUGGESTION to be
+#     selected, not free text accepted as typed
+#   - a full inventory of every input/select/button inside the overlay
+#     (tag, type, data-autom, name, value/checked, disabled) — rules out
+#     "something OTHER than zipCode also gates Continue" without having
+#     to guess what to look for
 # ---------------------------------------------------------------------------
 
 _ZIPCODE_VALIDATION_STATE_JS = """(continueSelector) => {
@@ -1617,6 +1636,37 @@ _ZIPCODE_VALIDATION_STATE_JS = """(continueSelector) => {
         }
     }
 
+    // Autocomplete/combobox pattern check (2026-07-28): a real run
+    // showed correctly-typed, validly-formatted, error-free input STILL
+    // leaves Continue disabled — one plausible explanation is the field
+    // is actually a combobox requiring a SUGGESTION to be selected, not
+    // free text accepted as-is. aria-autocomplete/aria-expanded/role on
+    // the input itself, plus any [role="listbox"]/[role="option"]
+    // elements anywhere on the page, would confirm or rule this out.
+    const listboxEl = document.querySelector('[role="listbox"]');
+    const optionEls = listboxEl ? listboxEl.querySelectorAll('[role="option"]') : [];
+
+    // Full form-control inventory (2026-07-28): rules out "something
+    // OTHER than zipCode also gates Continue" (a checkbox, a second
+    // field, a store-selection step) without having to guess what to
+    // look for.
+    const overlay = document.querySelector('[data-autom="plOverlayContainer"]');
+    const formElements = [];
+    if (overlay) {
+        overlay.querySelectorAll('input, select, button').forEach((el) => {
+            if (formElements.length >= 20) return;
+            formElements.push({
+                tag: el.tagName,
+                type: el.getAttribute('type'),
+                data_autom: el.getAttribute('data-autom'),
+                name: el.getAttribute('name'),
+                value: el.tagName === 'SELECT' ? el.value : (el.value !== undefined ? el.value : null),
+                checked: el.checked !== undefined ? el.checked : null,
+                disabled: el.disabled,
+            });
+        });
+    }
+
     return {
         continue_disabled_attr: continueBtn ? continueBtn.disabled : null,
         continue_aria_disabled: continueBtn ? continueBtn.getAttribute('aria-disabled') : null,
@@ -1628,8 +1678,17 @@ _ZIPCODE_VALIDATION_STATE_JS = """(continueSelector) => {
         zip_minlength: zipInput ? zipInput.getAttribute('minlength') : null,
         zip_inputmode: zipInput ? zipInput.getAttribute('inputmode') : null,
         zip_type: zipInput ? zipInput.getAttribute('type') : null,
+        zip_role: zipInput ? zipInput.getAttribute('role') : null,
+        zip_aria_autocomplete: zipInput ? zipInput.getAttribute('aria-autocomplete') : null,
+        zip_aria_expanded: zipInput ? zipInput.getAttribute('aria-expanded') : null,
+        zip_aria_activedescendant: zipInput ? zipInput.getAttribute('aria-activedescendant') : null,
+        zip_aria_controls: zipInput ? zipInput.getAttribute('aria-controls') : null,
         zip_react_handler_keys: reactHandlerKeys(zipInput),
         nearby_error_text: nearbyErrorText,
+        listbox_present: !!listboxEl,
+        listbox_option_count: optionEls.length,
+        listbox_option_texts: Array.from(optionEls).slice(0, 10).map((o) => (o.innerText || '').trim()),
+        overlay_form_elements: formElements,
     };
 }"""
 
@@ -1816,6 +1875,24 @@ def _diagnose_zipcode_validation(url: str, pincode: str) -> dict:
                 state = _capture("A_immediately_after_typing")
                 if state.get("continue_disabled_attr") is False:
                     enabled_at = "A_immediately_after_typing"
+
+                # Checkpoint F: Enter keypress — a real run showed
+                # correctly-typed, error-free, format-valid input still
+                # leaves Continue disabled across every blur/timing
+                # checkpoint tried. Enter is the standard way to CONFIRM a
+                # typed value in a combobox/autocomplete-style field
+                # (distinct from blur/tab, and not yet tested at all) —
+                # tested right after A since it's the most natural next
+                # action a real user takes after finishing typing.
+                if enabled_at is None:
+                    try:
+                        page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(500)
+                    state = _capture("F_after_enter_keypress")
+                    if state.get("continue_disabled_attr") is False:
+                        enabled_at = "F_after_enter_keypress"
 
                 # Checkpoint B: extra dwell, no blur — tests debounce alone.
                 if enabled_at is None:
