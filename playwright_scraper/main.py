@@ -197,7 +197,24 @@ INTERNAL_REFRESH_TOKEN = os.getenv("INTERNAL_REFRESH_TOKEN", "")
 # spawning unbounded browsers. Flag if a different limit was meant (memory
 # ceiling, requests/min, etc.) — Railway's own container limits are separate
 # and unaffected by this.
-MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "2"))
+#
+# Raised 2 -> 4 (2026-07-28, when _check_pickup_availability was wired into
+# check_pickup_row/check_channel_pickup_row's production cycles): each row
+# in a pickup cycle checks its own pincodes SEQUENTIALLY (one in flight per
+# row at a time — see check_pickup_row's own docstring), but DIFFERENT rows
+# run concurrently (bot.py's run_pickup_check_cycle gates on
+# asyncio.Semaphore(10)), so real demand on this slot pool is roughly "one
+# concurrent check per actively-checking row", not per-pincode. At a real
+# tracked scale of 4 products (4 rows), 4 keeps every row's own sequential
+# chain running without queuing for a slot behind another row. NOTE:
+# headful Chromium (required here — see APPLE_PICKUP_HEADLESS above) is
+# heavier than headless; this number was NOT validated against Railway's
+# actual container CPU/RAM under real concurrent load — watch for OOM/
+# crashes after raising this and dial back if the container can't sustain
+# it. If the number of concurrently-checking rows grows well past 4,
+# SLOT_WAIT_TIMEOUT_SECONDS below may also need reconsidering (rows beyond
+# this limit will queue for a slot, up to that timeout, before failing).
+MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "4"))
 # How long an incoming request waits for a free concurrency slot before
 # giving up (returns a "check failed" result rather than queueing forever).
 SLOT_WAIT_TIMEOUT_SECONDS = float(os.getenv("SLOT_WAIT_TIMEOUT_SECONDS", "60"))
@@ -1397,7 +1414,13 @@ def _parse_pickup_stores(
 
     If `path` doesn't resolve to a list (a different response shape than
     the one `path` was written for), falls back to _find_stores_list
-    before giving up — see that function's docstring for why.
+    before giving up — see that function's docstring for why. If THAT
+    also finds nothing, but navigation succeeded all the way to path's
+    second-to-last key (i.e. only the final "stores" key itself was
+    absent from an otherwise-valid parent dict), that's treated the same
+    as an explicit "stores": [] — see the note further below (2026-07-28)
+    for why this specific case is distinguished from an unrecognized
+    shape rather than reported as a parse error.
     """
     try:
         data = json.loads(body_text)
@@ -1406,14 +1429,17 @@ def _parse_pickup_stores(
 
     node = data
     path_error = None
-    for key in path:
+    failed_key_index = None
+    for i, key in enumerate(path):
         if not isinstance(node, dict):
             path_error = f"expected a dict while navigating to {key!r}, got {type(node).__name__}"
+            failed_key_index = i
             node = None
             break
         node = node.get(key)
         if node is None:
             path_error = f"missing key {key!r} in response body"
+            failed_key_index = i
             break
     stores = node if isinstance(node, list) else None
 
@@ -1425,6 +1451,23 @@ def _parse_pickup_stores(
                 f"({path_error}) but a stores-shaped list was found elsewhere in the body via "
                 f"structural fallback — response shape differs from what `path` expected."
             )
+
+    # 2026-07-28: a real run captured a 200 OK fulfillment-messages body
+    # (top-level keys just ['body', 'head'] — a normal-looking envelope)
+    # where navigation walked all the way through to the LAST path key
+    # ("stores") before failing there specifically, and the structural
+    # fallback above found no store-shaped list anywhere else in the body
+    # either. The most defensible reading of that combination — parent
+    # dict present and valid, only the terminal "stores" field itself
+    # absent, and genuinely no store data anywhere — is that this
+    # instance's API response simply omitted an empty "stores" field
+    # rather than including it as "stores": [] (a common JSON convention:
+    # omit empty/absent fields instead of spelling out emptiness). This
+    # is NOT a guess at a new key name — it's confirmed by failed_key_index
+    # itself pointing at the path's last position, meaning every dict
+    # above it resolved exactly as expected.
+    if stores is None and failed_key_index == len(path) - 1:
+        stores = []
 
     if stores is None:
         top_level = sorted(data.keys()) if isinstance(data, dict) else type(data).__name__

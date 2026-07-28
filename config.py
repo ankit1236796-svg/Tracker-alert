@@ -261,6 +261,29 @@ APPLE_PICKUP_STORE_LABELS = {
 # refreshed every APPLE_COOKIE_REFRESH_INTERVAL) rather than relying on one
 # manually-pasted session surviving hours of use — see APPLE_COOKIE_REFRESH_*
 # below and checkers/apple.py's get_apple_session_cookies-based lookup.
+#
+# Briefly raised 180 -> 900 (2026-07-28) when run_pickup_check_cycle/
+# run_channel_forward_check_cycle were first wired to checkers.apple's
+# page-render pickup check (each pincode check launches a real headful
+# Chromium browser via playwright_scraper, up to ~90s worst case per
+# check with retries) — at the time, Apple pickup checking still ran
+# INSIDE bot.py's sequential stock_checker_loop, so a slow pickup cycle
+# would pause every other site's regular checking for its whole duration;
+# 900s was chosen to keep that pause infrequent.
+#
+# Reverted back to 180 the same day once Apple pickup checking (run_
+# pickup_check_cycle, run_apple_official_pickup_cycle, run_channel_
+# forward_pickup_check_cycle) was decoupled into its own fully
+# independent, concurrent task (bot.py's apple_pickup_check_loop, started
+# alongside stock_checker_loop in main()) — see that loop's own module
+# note. A slow pickup cycle can no longer block anything else regardless
+# of this interval's value, so the original fast cadence is safe again.
+# Note this now behaves as a FLOOR, not a guaranteed cadence: apple_
+# pickup_check_loop sleeps this long AFTER each pass finishes (same
+# self-pacing pattern as APPLE_COOKIE_REFRESH_INTERVAL's loop) rather than
+# subtracting elapsed time, so a pass that runs longer than this interval
+# just pushes the next one out further — it never overlaps itself and
+# never affects any other loop's own cadence.
 APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "180"))  # 3 min default
 
 # Croma's own dedicated check interval — same "isolate one site onto its own
