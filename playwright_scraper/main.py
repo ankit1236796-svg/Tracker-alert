@@ -199,22 +199,32 @@ INTERNAL_REFRESH_TOKEN = os.getenv("INTERNAL_REFRESH_TOKEN", "")
 # and unaffected by this.
 #
 # Raised 2 -> 4 (2026-07-28, when _check_pickup_availability was wired into
-# check_pickup_row/check_channel_pickup_row's production cycles): each row
-# in a pickup cycle checks its own pincodes SEQUENTIALLY (one in flight per
-# row at a time — see check_pickup_row's own docstring), but DIFFERENT rows
-# run concurrently (bot.py's run_pickup_check_cycle gates on
-# asyncio.Semaphore(10)), so real demand on this slot pool is roughly "one
-# concurrent check per actively-checking row", not per-pincode. At a real
-# tracked scale of 4 products (4 rows), 4 keeps every row's own sequential
-# chain running without queuing for a slot behind another row. NOTE:
-# headful Chromium (required here — see APPLE_PICKUP_HEADLESS above) is
-# heavier than headless; this number was NOT validated against Railway's
-# actual container CPU/RAM under real concurrent load — watch for OOM/
-# crashes after raising this and dial back if the container can't sustain
-# it. If the number of concurrently-checking rows grows well past 4,
-# SLOT_WAIT_TIMEOUT_SECONDS below may also need reconsidering (rows beyond
-# this limit will queue for a slot, up to that timeout, before failing).
-MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "4"))
+# check_pickup_row/check_channel_pickup_row's production cycles), then
+# REVERTED 4 -> 2 the same day: a real "BrowserType.launch: Target page,
+# context or browser has been closed" 502 surfaced under concurrent load
+# at 4 (a manual /debugpickupavailability check running alongside
+# /mypickups' multi-item check). --disable-dev-shm-usage was added to
+# _new_browser_and_context as a first, standard mitigation (see that
+# function's own note) but did NOT fully resolve it — a real /mypickups
+# run after that fix still showed multiple "⚠️ check failed" results
+# alongside genuine "❌ not available" ones. Since neither this
+# environment nor the person operating it could inspect Railway's actual
+# container CPU/RAM graphs at the failure window to pin down the exact
+# bottleneck (headful Chromium's own memory footprint vs. something
+# else), the conservative move is reducing concurrent resource
+# contention directly rather than continuing to guess at the precise
+# cause. headful Chromium (required here — see APPLE_PICKUP_HEADLESS
+# above) is heavier than headless, so 2 is a real ceiling worth respecting
+# until there's actual evidence (e.g. Railway's dashboard, or a clean
+# multi-run test at a raised value) that this container can sustain more.
+# NOTE: with 2 slots and up to ~4 concurrently-checking rows (see
+# check_pickup_row's own docstring — different rows run concurrently,
+# each checking its own pincodes sequentially), some checks will now
+# genuinely queue for a slot rather than running immediately — up to
+# SLOT_WAIT_TIMEOUT_SECONDS before failing outright if a slot never frees
+# up in time. That's the accepted tradeoff of this drop: less throughput,
+# more headroom per running browser.
+MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "2"))
 # How long an incoming request waits for a free concurrency slot before
 # giving up (returns a "check failed" result rather than queueing forever).
 SLOT_WAIT_TIMEOUT_SECONDS = float(os.getenv("SLOT_WAIT_TIMEOUT_SECONDS", "60"))
