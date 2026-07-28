@@ -4307,29 +4307,28 @@ async def cmd_debugpickupavailability(message: Message, command: CommandObject):
         return
 
     available = data.get("available")
-    hint = data.get("tentative_positive_hint")
     await _debug_send(
         message,
         f"git_commit_sha: {data.get('git_commit_sha')!r} — compare this against "
         f"the commit you expect to be deployed, so a result that looks like an "
         f"old bug can't be mistaken for a fix that didn't work (or vice versa)\n"
         f"available: {available!r}\n"
-        f"tentative_positive_hint: {hint!r}"
-        + ("  ⚠️ seen but NOT auto-confirmed — see raw_text below" if hint else "")
-        + f"\ndiagnostics: {data.get('diagnostics')}",
+        f"diagnostics: {data.get('diagnostics')}",
     )
 
     _CHUNK_SIZE = 3500
-    raw_text = data.get("raw_text")
-    if raw_text:
-        text = f"raw_text ({len(raw_text)} chars):\n{raw_text}"
+    matching_stores = data.get("matching_stores") or []
+    if matching_stores:
+        text = f"matching_stores ({len(matching_stores)}):\n{json.dumps(matching_stores, indent=2)}"
         for i in range(0, len(text), _CHUNK_SIZE):
             await _debug_send(message, text[i:i + _CHUNK_SIZE])
     else:
         await _debug_send(
             message,
-            "⚠️ raw_text is empty — the overlay never appeared or nothing "
-            "could be extracted. Check diagnostics above for which step failed.",
+            "matching_stores: none — either genuinely not available at any "
+            "nearby store, no stores near this pincode at all, or the "
+            "check failed before reaching that point. Check diagnostics "
+            "above (used_endpoint/parse_error/response_wait_timed_out) for which.",
         )
 
 
