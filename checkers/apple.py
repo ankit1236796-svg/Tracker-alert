@@ -623,6 +623,101 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Pincode-specific availability via PAGE-RENDER (playwright_scraper), as an
+# alternative to _fetch_pickup_availability above. Exists because the
+# direct httpx approach is currently 0% successful — every SKU/pincode/
+# param/header/cookie combination tried failed (see this module's PARAM
+# SET / HEADER HISTORY notes above _cookie_auth_fetch) — while reading the
+# rendered DOM directly was confirmed working end-to-end via a real,
+# controlled investigation. See playwright_scraper/main.py's
+# _check_pickup_availability docstring for the full confirmed flow,
+# selectors, and — importantly — its two open caveats (headful-only,
+# conservative classifier), neither of which is silently papered over
+# here either.
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _fetch_pickup_availability_via_page_render(
+    product_url: str, pincode: str,
+) -> tuple[bool | None, str | None]:
+    """
+    Calls playwright_scraper's /check-pickup-availability instead of
+    Apple's fulfillment-messages API directly.
+
+    Returns (available, error):
+      - available: True only for a confirmed positive signal for the
+        iPhone-specific overlay. As of 2026-07-28 no such phrase has
+        actually been confirmed yet (the one positive example captured
+        came from a DIFFERENT, accessory-only overlay this function
+        never touches) — so today this can only ever come back None,
+        never True, until a real capture confirms the phrasing and
+        playwright_scraper's classifier is tightened accordingly. None
+        also covers every other inconclusive case, INCLUDING a genuine
+        "not available" result — never treated as a confirmed False,
+        same reasoning _evaluate_pickup_availability above already uses
+        for the fulfillment-messages signal (India's sparse Apple Store
+        network makes "no pickup nearby" the common case, not proof of
+        no stock).
+      - error: None on a successful call (regardless of the resulting
+        `available` value), else a short human-readable reason (missing
+        PLAYWRIGHT_SCRAPER_URL, network error, non-200, non-JSON) —
+        mirrors _cookie_auth_fetch's (data, error) contract above.
+
+    NOT yet wired into check_pickup_row / check_channel_pickup_row /
+    refine_with_pincode — this is the checker function itself; deciding
+    whether/how it replaces or supplements the (currently broken) direct
+    httpx path in those production call sites is a separate decision, not
+    made here. Also NOT usable as-is on an unmodified Railway deploy —
+    playwright_scraper needs a virtual display (Xvfb) added before this
+    can succeed there; see playwright_scraper/main.py's
+    _check_pickup_availability docstring for why.
+
+    Never raises.
+    """
+    from config import PLAYWRIGHT_SCRAPER_URL
+
+    if not PLAYWRIGHT_SCRAPER_URL:
+        reason = "PLAYWRIGHT_SCRAPER_URL is not configured"
+        logger.warning(f"[apple][page-render] {reason} — skipping pincode={pincode!r}")
+        return None, reason
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                f"{PLAYWRIGHT_SCRAPER_URL}/check-pickup-availability",
+                json={"url": product_url, "pincode": pincode},
+            )
+    except Exception as exc:
+        reason = f"request to playwright_scraper failed: {type(exc).__name__}: {exc}"
+        logger.warning(f"[apple][page-render] {reason}")
+        return None, reason
+
+    if resp.status_code != 200:
+        reason = f"playwright_scraper returned HTTP {resp.status_code}: {resp.text[:300]!r}"
+        logger.warning(f"[apple][page-render] {reason}")
+        return None, reason
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        reason = f"non-JSON response from playwright_scraper: {exc}"
+        logger.warning(f"[apple][page-render] {reason}")
+        return None, reason
+
+    available = data.get("available")
+    if data.get("tentative_positive_hint"):
+        logger.warning(
+            f"[apple][page-render] pincode={pincode!r}: tentative positive hint seen "
+            f"(unconfirmed phrase for this overlay type) — "
+            f"raw_text={(data.get('raw_text') or '')[:500]!r}"
+        )
+    logger.info(
+        f"[apple][page-render] pincode={pincode!r}: available={available} "
+        f"diagnostics={data.get('diagnostics')}"
+    )
+    return available, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Pickup-availability TRACKING (separate from refine_with_pincode above,
 # which only ever CONFIRMS the existing generic in-stock check and never
 # reports store-level detail). Used by /trackpickup + bot.run_pickup_check_cycle
