@@ -7,6 +7,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DB_PATH = os.getenv("DB_PATH", "/app/data/stock_alerts.db")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds (5 min default)
 
+# Railway auto-populates this on every deploy (no manual setup needed) —
+# mirrors playwright_scraper/main.py's own GIT_COMMIT_SHA. Added 2026-07-29
+# so the MAIN bot service can report which commit it's actually running
+# (via /botversion), separate from playwright_scraper's own — previously
+# there was no way to confirm a PR merged to main had actually deployed to
+# this service short of checking Railway's dashboard directly. None locally
+# (RAILWAY_GIT_COMMIT_SHA is only set on Railway).
+GIT_COMMIT_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA")
+
 # ---------------------------------------------------------------------------
 # Admin / monetization
 # ---------------------------------------------------------------------------

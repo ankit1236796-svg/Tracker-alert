@@ -37,6 +37,7 @@ from checkers import (
 from config import (
     ADMIN_USER_ID, REMINDER_HOURS_BEFORE_EXPIRY, get_site_label, SCRAPING_PROVIDER,
     APPLE_PICKUP_PINCODES, APPLE_PICKUP_STORE_LABELS, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
+    GIT_COMMIT_SHA,
 )
 from database import (
     IST,
@@ -108,6 +109,30 @@ from notifications import (
 logger = logging.getLogger(__name__)
 router = Router()
 router.message.filter(F.from_user.id == ADMIN_USER_ID)
+
+# Recorded once, at process import time — combined with GIT_COMMIT_SHA,
+# lets /botversion answer "did a NEW deploy actually happen" (a fresh
+# process-start timestamp after a push means yes) as well as "which commit
+# is this". See config.py's own note on GIT_COMMIT_SHA for why this was
+# added (no prior way to confirm a merged PR had actually deployed to the
+# main bot service, short of Railway's own dashboard).
+_PROCESS_STARTED_AT = now_ist_str()
+
+
+@router.message(Command("botversion"))
+async def cmd_botversion(message: Message):
+    await message.answer(
+        f"🤖 <b>Main bot service</b>\n"
+        f"git_commit_sha: <code>{GIT_COMMIT_SHA!r}</code>\n"
+        f"process started (IST): {_PROCESS_STARTED_AT}\n\n"
+        f"git_commit_sha is <code>None</code> locally (RAILWAY_GIT_COMMIT_SHA is only "
+        f"set on Railway). Note this reports the MAIN BOT's own commit — "
+        f"unrelated to playwright_scraper's own git_commit_sha field surfaced "
+        f"elsewhere (e.g. /debugpickupavailability), which reports THAT "
+        f"separate service's build instead.",
+        parse_mode="HTML",
+    )
+
 
 _STATUS_LABEL = {
     STATUS_TRIAL: "🟢 Trial",
