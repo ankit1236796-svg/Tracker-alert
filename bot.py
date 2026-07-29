@@ -42,6 +42,7 @@ from database import (
     is_forwarding_paused,
     list_channel_forward_pickup,
     get_channel_forward_pincodes,
+    log_pickup_alert_event,
 )
 from handlers import router
 from notifications import (
@@ -585,22 +586,43 @@ async def _check_apple_official_pickup_group(bot: Bot, url: str, rows: list[dict
                 f"[apple][official-stores] {url!r} pincode={pincode!r} "
                 f"({', '.join(s['store_name'] for s in stores)}) transitioned to available"
             )
+            log_pickup_alert_event(
+                "official_stores", None, pincode, "transition_true",
+                f"sku={sku!r} url={url!r} stores={[s.get('store_name') for s in stores]}",
+            )
             if APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED:
                 for row in rows:
                     try:
-                        await send_pickup_alert(bot, row["user_id"], representative_name, pincode, stores)
+                        send_status = await send_pickup_alert(bot, row["user_id"], representative_name, pincode, stores)
                     except Exception as exc:
                         logger.error(
                             f"[apple][official-stores] alert failed for user {row['user_id']} "
                             f"url={url!r} pincode={pincode!r}: {exc}"
+                        )
+                        log_pickup_alert_event("official_stores", None, pincode, "alert_send_exception", str(exc))
+                    else:
+                        event = "alert_sent" if send_status == "sent" else (
+                            "alert_suppressed_locked" if send_status == "suppressed_locked" else "alert_send_error"
+                        )
+                        log_pickup_alert_event(
+                            "official_stores", None, pincode, event,
+                            f"user_id={row['user_id']} status={send_status}",
                         )
             else:
                 logger.info(
                     "[apple][official-stores] alert suppressed — "
                     "config.APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED is False"
                 )
+                log_pickup_alert_event(
+                    "official_stores", None, pincode, "alert_suppressed_config_disabled",
+                    f"url={url!r}",
+                )
 
-    upsert_apple_official_pickup_status(url, sku, new_status)
+    try:
+        upsert_apple_official_pickup_status(url, sku, new_status)
+    except Exception as exc:
+        logger.error(f"[apple][official-stores] error persisting pincode_status for {url!r}: {exc}")
+        log_pickup_alert_event("official_stores", None, None, "status_persist_error", f"url={url!r} {exc}")
 
 
 async def run_apple_official_pickup_cycle(bot: Bot) -> dict:

@@ -89,6 +89,7 @@ from database import (
     set_channel_forward_pincodes,
     get_all_pickup_tracking,
     is_site_locked,
+    get_recent_pickup_alert_events,
 )
 import whatsapp_client
 import zyte_client
@@ -4639,6 +4640,64 @@ async def cmd_debugpickupstatus(message: Message, command: CommandObject):
         )
 
     combined = "\n\n".join(lines)
+    _CHUNK_SIZE = 3500
+    for i in range(0, len(combined), _CHUNK_SIZE):
+        await _debug_send(message, combined[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
+# /debugpickupevents: READ-ONLY dump of database.pickup_alert_log — the
+# durable, DB-persisted record of every transition/alert-attempt/exception
+# in the pickup pipeline (2026-07-29, see that table's own comment in
+# database.py for the full "why"). Unlike /debugpickupstatus, which only
+# shows CURRENT pincode_status (self-erases once availability flips back to
+# False), this shows the actual HISTORY — including alert outcomes
+# (sent/suppressed/error) that never touch pincode_status at all. Purely
+# read-only — never modifies anything, never calls the checker.
+# ---------------------------------------------------------------------------
+_DEBUG_PICKUP_EVENTS_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter.
+
+
+@router.message(Command("debugpickupevents"))
+async def cmd_debugpickupevents(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_PICKUP_EVENTS_ADMIN_ID:
+        return
+
+    args = (command.args or "").strip().split()
+    substring = None
+    limit = 30
+    for arg in args:
+        if arg.isdigit():
+            limit = min(int(arg), 200)
+        else:
+            substring = arg
+
+    events = get_recent_pickup_alert_events(limit=limit, substring=substring)
+
+    if not events:
+        await _debug_send(
+            message,
+            f"No pickup_alert_log events found"
+            + (f" matching {substring!r}" if substring else "")
+            + ".",
+        )
+        return
+
+    lines = [
+        f"🔍 {len(events)} most recent pickup_alert_log event(s)"
+        + (f" matching {substring!r}" if substring else "")
+        + " (newest first):",
+    ]
+    for ev in events:
+        lines.append(
+            f"[{ev['ts']}] source={ev['source']} row_id={ev['row_id']} "
+            f"pincode={ev['pincode']!r} event={ev['event']!r}"
+            + (f"\n  detail: {ev['detail']}" if ev.get("detail") else "")
+        )
+
+    combined = "\n".join(lines)
     _CHUNK_SIZE = 3500
     for i in range(0, len(combined), _CHUNK_SIZE):
         await _debug_send(message, combined[i:i + _CHUNK_SIZE])
