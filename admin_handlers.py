@@ -87,6 +87,8 @@ from database import (
     remove_channel_forward_pickup_by_url,
     get_channel_forward_pincodes,
     set_channel_forward_pincodes,
+    get_all_pickup_tracking,
+    is_site_locked,
 )
 import whatsapp_client
 import zyte_client
@@ -4545,6 +4547,98 @@ async def cmd_debugpickupmessagestress(message: Message, command: CommandObject)
     lines.append(f"consistent behavior throughout: {consistent}")
 
     combined = "\n".join(lines)
+    _CHUNK_SIZE = 3500
+    for i in range(0, len(combined), _CHUNK_SIZE):
+        await _debug_send(message, combined[i:i + _CHUNK_SIZE])
+
+
+# ---------------------------------------------------------------------------
+# /debugpickupstatus: READ-ONLY dump of the actual persisted pickup_tracking
+# / channel_forward_pickup_tracking rows (2026-07-28) — built after a real
+# "zero alerts sent despite genuine availability seen via /debugpickupmessage"
+# report, to check a specific hypothesis found by code review: BOTH
+# check_pickup_row and check_channel_pickup_row persist pincode_status[pincode]
+# = True on a genuine transition BEFORE (or regardless of) whether the alert
+# actually sent — is_site_locked (personal path, checked inside
+# send_pickup_alert) and is_forwarding_paused (channel path, checked inside
+# check_channel_pickup_row itself) can each suppress the alert AFTER that
+# write already happened. If either was active during today's testing at the
+# moment a real transition occurred, the DB now silently believes "already
+# notified" with no alert ever having gone out, and won't re-alert until that
+# pincode is seen False again first. This command surfaces the raw evidence
+# for that theory directly — never modifies anything, never calls the
+# checker, never sends an alert.
+# ---------------------------------------------------------------------------
+_DEBUG_PICKUP_STATUS_ADMIN_ID = 5004721766  # same hardcoded restriction as
+# every other /debug* command above, on top of the router's own
+# ADMIN_USER_ID filter.
+
+
+@router.message(Command("debugpickupstatus"))
+async def cmd_debugpickupstatus(message: Message, command: CommandObject):
+    if message.from_user.id != _DEBUG_PICKUP_STATUS_ADMIN_ID:
+        return
+
+    if not command.args or not command.args.strip():
+        await message.answer(
+            "Usage: <code>/debugpickupstatus &lt;sku_or_url_substring&gt;</code>\n"
+            "Case-insensitive substring match against sku OR url, across both "
+            "personal /trackpickup rows and channel-forward pickup rows.",
+            parse_mode="HTML",
+        )
+        return
+
+    needle = command.args.strip().lower()
+
+    forwarding_paused = get_forwarding_pause_info()["paused"]
+    apple_globally_locked = is_site_locked("apple")
+
+    lines = [
+        f"🔍 Searching pickup_tracking + channel_forward_pickup_tracking for {needle!r} "
+        f"(sku or url substring)…\n"
+        f"[global] apple site-locked (all users): {apple_globally_locked!r}\n"
+        f"[global] channel forwarding paused: {forwarding_paused!r}",
+    ]
+
+    personal_rows = [
+        row for row in get_all_pickup_tracking()
+        if needle in (row.get("sku") or "").lower() or needle in (row.get("url") or "").lower()
+    ]
+    channel_rows = [
+        row for row in list_channel_forward_pickup()
+        if needle in (row.get("sku") or "").lower() or needle in (row.get("url") or "").lower()
+    ]
+
+    if not personal_rows and not channel_rows:
+        lines.append("No matching rows found in either table.")
+        await _debug_send(message, "\n\n".join(lines))
+        return
+
+    for row in personal_rows:
+        user_locked = is_site_locked("apple", row["user_id"])
+        lines.append(
+            f"[personal] id={row['id']} user_id={row['user_id']} name={row['name']!r}\n"
+            f"  url: {row['url']}\n"
+            f"  sku: {row['sku']!r}\n"
+            f"  pincodes: {row['pincodes']}\n"
+            f"  pincode_status: {json.dumps(row['pincode_status'])}\n"
+            f"  created_at: {row.get('created_at')!r}\n"
+            f"  apple site-locked for this user: {user_locked!r} (global: {apple_globally_locked!r})"
+        )
+
+    for row in channel_rows:
+        lines.append(
+            f"[channel] id={row['id']} name={row['name']!r}\n"
+            f"  url: {row['url']}\n"
+            f"  sku: {row.get('sku')!r}\n"
+            f"  pincodes: {row['pincodes']}\n"
+            f"  pincode_status: {json.dumps(row['pincode_status'])}\n"
+            f"  last_checked: {row.get('last_checked')!r}\n"
+            f"  created_at: {row.get('created_at')!r}\n"
+            f"  forwarding paused: {forwarding_paused!r}"
+        )
+
+    combined = "\n\n".join(lines)
     _CHUNK_SIZE = 3500
     for i in range(0, len(combined), _CHUNK_SIZE):
         await _debug_send(message, combined[i:i + _CHUNK_SIZE])
