@@ -146,7 +146,7 @@ async def send_channel_stock_alert(bot: Bot, chat_id: int, row: dict, price: flo
 
 async def send_pickup_alert(
     bot: Bot, user_id: int, product_name: str, pincode: str, stores: list[dict],
-) -> None:
+) -> str:
     """
     Send a pickup-availability notification (see database.pickup_tracking +
     bot.run_pickup_check_cycle) — one call per (tracked product, pincode)
@@ -159,33 +159,51 @@ async def send_pickup_alert(
     should suppress this too, same as the regular stock alert) but has no
     UNRELIABLE_SITES/price-gate/WhatsApp-forward concerns of its own — those
     are specific to the regular stock-alert path this feature doesn't share.
+
+    2026-07-29: returns a short status string instead of None — "sent",
+    "suppressed_locked", "send_failed" (Telegram delivery itself failed —
+    see _safe_send), or "error:<ExceptionType>: <msg>" for anything
+    unexpected (e.g. a DB hiccup in get_user_lang). Built after a real
+    "confirmed available multiple times, zero alerts received" report where
+    a silent failure ANYWHERE in this function (previously returning None
+    unconditionally, with callers unable to tell success from failure) was
+    a live suspect — callers now log this outcome durably via
+    database.log_pickup_alert_event so it's visible without Railway log
+    access. The whole body is wrapped in try/except so this function keeps
+    its pre-existing "never raises" contract explicitly, rather than
+    relying on each individual line inside happening not to fail.
     """
-    if is_site_locked("apple", user_id):
-        logger.info(
-            f"[pickup-alert-suppressed] apple is locked (global or for user "
-            f"{user_id}) — skipping pickup alert."
+    try:
+        if is_site_locked("apple", user_id):
+            logger.info(
+                f"[pickup-alert-suppressed] apple is locked (global or for user "
+                f"{user_id}) — skipping pickup alert."
+            )
+            return "suppressed_locked"
+        lang = get_user_lang(user_id)
+        lines = []
+        for store in stores:
+            name = html.escape(store.get("store_name") or "(unnamed store)")
+            location = store.get("location")
+            if location:
+                lines.append(f"🏬 <b>{name}</b> — {html.escape(location)}")
+            else:
+                lines.append(f"🏬 <b>{name}</b>")
+        stores_block = "\n".join(lines) if lines else "🏬 (store details unavailable)"
+        text = t(
+            "pickup_alert", lang,
+            name=html.escape(product_name), pincode=pincode, stores_block=stores_block,
         )
-        return
-    lang = get_user_lang(user_id)
-    lines = []
-    for store in stores:
-        name = html.escape(store.get("store_name") or "(unnamed store)")
-        location = store.get("location")
-        if location:
-            lines.append(f"🏬 <b>{name}</b> — {html.escape(location)}")
-        else:
-            lines.append(f"🏬 <b>{name}</b>")
-    stores_block = "\n".join(lines) if lines else "🏬 (store details unavailable)"
-    text = t(
-        "pickup_alert", lang,
-        name=html.escape(product_name), pincode=pincode, stores_block=stores_block,
-    )
-    await _safe_send(bot, user_id, text)
+        sent = await _safe_send(bot, user_id, text)
+        return "sent" if sent else "send_failed"
+    except Exception as exc:
+        logger.error(f"[pickup-alert] unexpected error building/sending alert for user {user_id}: {exc}")
+        return f"error:{type(exc).__name__}: {exc}"
 
 
 async def send_channel_pickup_alert(
     bot: Bot, chat_id: int, product_name: str, pincode: str, stores: list[dict],
-) -> None:
+) -> str:
     """
     Channel-forwarding sibling of send_pickup_alert — same message shape
     (see database.channel_forward_pickup_tracking and checkers/apple.py's
@@ -193,31 +211,41 @@ async def send_channel_pickup_alert(
     user_id. Same global-lock-only is_site_locked gate as
     send_channel_stock_alert (no per-user lock concept here — a pickup
     channel-forward row has no owning user).
+
+    2026-07-29: returns a status string ("sent", "suppressed_locked",
+    "send_failed") instead of None — see send_pickup_alert's own docstring
+    for why. Whole body wrapped in try/except for the same reason.
     """
-    if is_site_locked("apple"):
-        logger.info(
-            "[channel-forward][pickup-alert-suppressed] apple is globally "
-            "locked — skipping channel pickup alert."
-        )
-        return
-    lines = []
-    for store in stores:
-        name = html.escape(store.get("store_name") or "(unnamed store)")
-        location = store.get("location")
-        if location:
-            lines.append(f"🏬 <b>{name}</b> — {html.escape(location)}")
-        else:
-            lines.append(f"🏬 <b>{name}</b>")
-    stores_block = "\n".join(lines) if lines else "🏬 (store details unavailable)"
-    text = t(
-        "pickup_alert", "en",
-        name=html.escape(product_name), pincode=pincode, stores_block=stores_block,
-    )
     try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        logger.info(f"[channel-forward][pickup] alert sent to channel {chat_id} for {product_name!r} pincode={pincode!r}")
+        if is_site_locked("apple"):
+            logger.info(
+                "[channel-forward][pickup-alert-suppressed] apple is globally "
+                "locked — skipping channel pickup alert."
+            )
+            return "suppressed_locked"
+        lines = []
+        for store in stores:
+            name = html.escape(store.get("store_name") or "(unnamed store)")
+            location = store.get("location")
+            if location:
+                lines.append(f"🏬 <b>{name}</b> — {html.escape(location)}")
+            else:
+                lines.append(f"🏬 <b>{name}</b>")
+        stores_block = "\n".join(lines) if lines else "🏬 (store details unavailable)"
+        text = t(
+            "pickup_alert", "en",
+            name=html.escape(product_name), pincode=pincode, stores_block=stores_block,
+        )
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            logger.info(f"[channel-forward][pickup] alert sent to channel {chat_id} for {product_name!r} pincode={pincode!r}")
+            return "sent"
+        except Exception as exc:
+            logger.error(f"[channel-forward][pickup] failed to send alert to channel {chat_id}: {exc}")
+            return "send_failed"
     except Exception as exc:
-        logger.error(f"[channel-forward][pickup] failed to send alert to channel {chat_id}: {exc}")
+        logger.error(f"[channel-forward][pickup] unexpected error building/sending alert to channel {chat_id}: {exc}")
+        return f"error:{type(exc).__name__}: {exc}"
 
 
 async def _safe_send(bot: Bot, user_id: int, text: str) -> bool:

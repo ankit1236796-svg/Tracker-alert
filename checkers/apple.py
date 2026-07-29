@@ -1285,7 +1285,7 @@ async def check_pickup_row(bot, row: dict) -> dict:
     # established caution around cross-module imports (see
     # checkers/flipkart_api.py's check_stock_with_fallback for the same
     # pattern).
-    from database import update_pickup_status
+    from database import update_pickup_status, log_pickup_alert_event
     from notifications import send_pickup_alert
 
     status = dict(row["pincode_status"])
@@ -1300,6 +1300,7 @@ async def check_pickup_row(bot, row: dict) -> dict:
             logger.error(
                 f"[apple][pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
             )
+            log_pickup_alert_event("personal", row["id"], pincode, "fetch_error", str(exc))
             continue
         if available is None:
             continue  # inconclusive this call — leave prior status untouched
@@ -1313,16 +1314,32 @@ async def check_pickup_row(bot, row: dict) -> dict:
             changed = True
 
         if now_available and not was_available:
+            log_pickup_alert_event(
+                "personal", row["id"], pincode, "transition_true",
+                f"sku={row.get('sku')!r} url={row['url']!r} stores={[s.get('store_name') for s in stores]}",
+            )
             try:
-                await send_pickup_alert(bot, row["user_id"], row["name"], pincode, stores)
+                send_status = await send_pickup_alert(bot, row["user_id"], row["name"], pincode, stores)
             except Exception as exc:
                 logger.error(
                     f"[apple][pickup] error sending alert for tracking #{row['id']} "
                     f"pincode={pincode!r}: {exc}"
                 )
+                log_pickup_alert_event("personal", row["id"], pincode, "alert_send_exception", str(exc))
+            else:
+                event = "alert_sent" if send_status == "sent" else (
+                    "alert_suppressed_locked" if send_status == "suppressed_locked" else "alert_send_error"
+                )
+                log_pickup_alert_event("personal", row["id"], pincode, event, send_status)
 
     if changed:
-        update_pickup_status(row["id"], status)
+        try:
+            update_pickup_status(row["id"], status)
+        except Exception as exc:
+            logger.error(
+                f"[apple][pickup] error persisting pincode_status for tracking #{row['id']}: {exc}"
+            )
+            log_pickup_alert_event("personal", row["id"], None, "status_persist_error", str(exc))
 
     return results
 
@@ -1374,7 +1391,10 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     it's no longer passed into the availability check itself.
     """
     # Deferred imports — see check_pickup_row's own note above for why.
-    from database import update_channel_forward_pickup_status, is_forwarding_paused, get_forward_channel
+    from database import (
+        update_channel_forward_pickup_status, is_forwarding_paused, get_forward_channel,
+        log_pickup_alert_event,
+    )
     from notifications import send_channel_pickup_alert
 
     sku = row.get("sku")
@@ -1409,6 +1429,7 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
             logger.error(
                 f"[apple][channel-pickup] error checking #{row['id']} pincode={pincode!r}: {exc}"
             )
+            log_pickup_alert_event("channel", row["id"], pincode, "fetch_error", str(exc))
             continue
         if available is None:
             continue  # inconclusive this call — leave prior status untouched
@@ -1419,12 +1440,17 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
         status[pincode] = now_available
 
         if now_available and not was_available:
+            log_pickup_alert_event(
+                "channel", row["id"], pincode, "transition_true",
+                f"sku={sku!r} url={row['url']!r} stores={[s.get('store_name') for s in stores]}",
+            )
             if is_forwarding_paused():
                 logger.info(
                     f"[apple][channel-pickup] #{row['id']} pincode={pincode!r} "
                     f"transitioned to available but forwarding is paused — "
                     f"alert suppressed."
                 )
+                log_pickup_alert_event("channel", row["id"], pincode, "alert_suppressed_paused")
             else:
                 if channel is None:
                     channel = get_forward_channel() or {}
@@ -1434,16 +1460,27 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
                         f"transitioned to available but no channel is "
                         f"registered — alert skipped."
                     )
+                    log_pickup_alert_event("channel", row["id"], pincode, "alert_no_channel_registered")
                 else:
                     try:
-                        await send_channel_pickup_alert(bot, channel["chat_id"], row["name"], pincode, stores)
+                        send_status = await send_channel_pickup_alert(bot, channel["chat_id"], row["name"], pincode, stores)
                     except Exception as exc:
                         logger.error(
                             f"[apple][channel-pickup] alert failed for #{row['id']} "
                             f"pincode={pincode!r}: {exc}"
                         )
+                        log_pickup_alert_event("channel", row["id"], pincode, "alert_send_exception", str(exc))
+                    else:
+                        event = "alert_sent" if send_status == "sent" else "alert_send_error"
+                        log_pickup_alert_event("channel", row["id"], pincode, event, send_status)
 
-    update_channel_forward_pickup_status(row["id"], status, sku=sku)
+    try:
+        update_channel_forward_pickup_status(row["id"], status, sku=sku)
+    except Exception as exc:
+        logger.error(
+            f"[apple][channel-pickup] error persisting pincode_status for #{row['id']}: {exc}"
+        )
+        log_pickup_alert_event("channel", row["id"], None, "status_persist_error", str(exc))
 
     return results
 

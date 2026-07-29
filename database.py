@@ -386,6 +386,38 @@ def init_db():
         """)
         conn.commit()
 
+        # ── Durable pickup-alert event log (2026-07-29) ────────────────────────
+        # Built after a real "genuine availability confirmed multiple times,
+        # zero alerts received" report where every candidate root cause
+        # (silent exception in send_pickup_alert, is_site_locked/
+        # is_forwarding_paused suppression persisting pincode_status=True
+        # regardless of whether the alert sent, an unguarded update_pickup_
+        # status write) was invisible from the outside — Railway logs aren't
+        # accessible, and a DB-status snapshot (/debugpickupstatus) only shows
+        # CURRENT state, which self-erases if a pincode's availability later
+        # flips back to False. This table is the durable record of what
+        # actually happened at each step, independent of both: every True
+        # transition, every alert attempt's outcome (sent/suppressed/error),
+        # and every fetch/persist exception in check_pickup_row/check_
+        # channel_pickup_row/the official-store pickup cycle gets a row here,
+        # queryable later via /debugpickupevents even after the moment (and
+        # any transient DB-status evidence of it) has passed.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pickup_alert_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts         TEXT    NOT NULL DEFAULT (datetime('now')),
+                source     TEXT    NOT NULL,
+                row_id     INTEGER,
+                pincode    TEXT,
+                event      TEXT    NOT NULL,
+                detail     TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pickup_alert_log_ts ON pickup_alert_log(ts)
+        """)
+        conn.commit()
+
         # ── Apple official-store pickup auto-check (separate feature/table
         # from pickup_tracking above — see checkers/apple.py's "official-
         # store pickup checker" module note + bot.run_apple_official_
@@ -1555,6 +1587,57 @@ def update_pickup_status(tracking_id: int, pincode_status: dict) -> None:
             (json.dumps(pincode_status), tracking_id),
         )
         conn.commit()
+
+
+def log_pickup_alert_event(
+    source: str, row_id: int | None, pincode: str | None, event: str, detail: str | None = None,
+) -> None:
+    """
+    Durable, DB-persisted record of one step in the pickup-alert pipeline —
+    see pickup_alert_log's own table comment for why this exists (Railway
+    logs aren't accessible, and pincode_status snapshots self-erase once
+    availability flips back). `source` is 'personal' | 'channel' |
+    'official_stores'; `event` is a short fixed tag (e.g.
+    'transition_true', 'alert_sent', 'alert_suppressed_locked',
+    'alert_suppressed_paused', 'alert_send_error', 'fetch_error',
+    'status_persist_error') — free text in `detail` only, never used for
+    filtering logic, so new event tags can be added without a schema
+    change.
+
+    MUST NEVER RAISE: every call site is inside (or immediately after) an
+    exception handler for the ACTUAL failure being recorded — an exception
+    here must never replace or mask that original error, or interrupt the
+    check cycle over a logging failure. Swallows and logs any DB error via
+    the standard logger instead (Railway-log-only in that one edge case,
+    same as before this table existed)."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO pickup_alert_log (ts, source, row_id, pincode, event, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (now_ist_str(), source, row_id, pincode, event, detail),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.error(f"[pickup-alert-log] failed to record event source={source!r} event={event!r}: {exc}")
+
+
+def get_recent_pickup_alert_events(limit: int = 30, substring: str | None = None) -> list[dict]:
+    """Most recent pickup_alert_log rows, newest first. `substring` (if
+    given) case-insensitively matches against `detail` OR `pincode` —
+    detail includes sku/url text at every call site below, so a sku/url
+    substring search works the same way /debugpickupstatus's does."""
+    query = "SELECT * FROM pickup_alert_log"
+    params: list = []
+    if substring:
+        query += " WHERE detail LIKE ? OR pincode LIKE ?"
+        like = f"%{substring}%"
+        params.extend([like, like])
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 def remove_pickup_tracking(user_id: int, tracking_id: int) -> bool:
