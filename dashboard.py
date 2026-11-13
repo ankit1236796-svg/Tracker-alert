@@ -87,6 +87,7 @@ from database import (
     list_paused_user_ids,
     set_users_checks_paused,
 )
+import provider_control
 import whatsapp_client
 from notifications import (
     approval_notice_text,
@@ -996,6 +997,32 @@ def create_app() -> Flask:
         if pickup_links:
             sections.append({"site": "apple pickup", "links": pickup_links})
         return render_template("links_by_store.html", sections=sections)
+
+    # ── Fetch provider (Amazon & Flipkart only) ───────────────────────────
+    # Same rules as the Telegram /provider command — both call
+    # provider_control, so validation, cache clearing and logging exist once.
+    # The POST routes are covered by the global CSRF check in _csrf_protect
+    # (every POST except /login must carry the session's csrf token).
+    @app.route("/provider")
+    @login_required
+    def provider():
+        return render_template("provider.html", state=provider_control.get_state())
+
+    @app.route("/provider/set", methods=["POST"])
+    @login_required
+    def provider_set():
+        name = (request.form.get("provider") or "").strip().lower()
+        ok, msg = provider_control.set_active_provider(name, source="dashboard")
+        flash(msg, "ok" if ok else "bad")
+        return redirect(url_for("provider"))
+
+    @app.route("/provider/fallback", methods=["POST"])
+    @login_required
+    def provider_fallback():
+        enabled = request.form.get("enabled") == "1"
+        ok, msg = provider_control.set_fallback_enabled(enabled, source="dashboard")
+        flash(msg, "ok" if ok else "bad")
+        return redirect(url_for("provider"))
 
     # ── Pause/Resume Service ───────────────────────────────────────────────
     # GLOBAL switch (service_status) stops the entire background check cycle

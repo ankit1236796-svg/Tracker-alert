@@ -91,6 +91,9 @@ from database import (
     is_site_locked,
     get_recent_pickup_alert_events,
 )
+import fetch_guard
+import provider_control
+import proxy_client
 import whatsapp_client
 import zyte_client
 from states import AdminBulkStates
@@ -4830,3 +4833,157 @@ async def cmd_debugzipcodevalidation(message: Message, command: CommandObject):
             "either nothing availability-related fired, or it fired under a "
             "URL that doesn't contain any of those keywords.",
         )
+
+
+# ---------------------------------------------------------------------------
+# /provider — switch the fetch provider used for AMAZON and FLIPKART (every
+# other store keeps using config.SCRAPING_PROVIDER, untouched). The active
+# provider + the "if proxy fails, use Scrape.do" toggle are stored in the
+# database (provider_control.py), so the choice survives restarts and is the
+# same one the web dashboard's /provider page shows. The router-level filter
+# only covers MESSAGES; callback queries are not filtered, so the button
+# handler below checks the admin ID itself.
+# ---------------------------------------------------------------------------
+
+def _provider_status_text() -> str:
+    state = provider_control.get_state()
+    labels = state["labels"]
+    stored = labels.get(state["stored"], None) if state["stored"] else None
+    lines = [
+        "🔌 <b>Fetch provider</b> (Amazon &amp; Flipkart only — other stores unchanged)",
+        "",
+        f"Active: <b>{html.escape(labels[state['active']])}</b>"
+        + ("" if stored else " <i>(default from SCRAPING_PROVIDER; nothing stored)</i>"),
+    ]
+    if state["stored"] and state["stored"] != state["active"]:
+        lines.append(
+            f"⚠️ Stored choice <b>{html.escape(stored)}</b> is not configured — "
+            f"running on the default instead."
+        )
+    lines.append("")
+    for name in provider_control.PROVIDERS:
+        lines.append(f"• {html.escape(labels[name])}: {'configured' if state['configured'][name] else 'not configured'}")
+    lines.append("")
+    lines.append(
+        f"Fallback (if proxy fails → Scrape.do): <b>{'ON' if state['fallback'] else 'OFF'}</b>"
+        + ("" if state["fallback_usable"] else " <i>(SCRAPEDO_KEY not set — unusable)</i>")
+    )
+    lines.append("")
+    lines.append(
+        "A failed or blocked fetch (incl. Robot Check pages) is saved as "
+        "<i>inconclusive</i>, never as out of stock."
+    )
+    return "\n".join(lines)
+
+
+def _provider_keyboard() -> InlineKeyboardMarkup:
+    state = provider_control.get_state()
+    row = []
+    for name in provider_control.PROVIDERS:
+        label = state["labels"][name]
+        if not state["configured"][name]:
+            text = f"{label} (not configured)"
+        elif name == state["active"]:
+            text = f"✅ {label}"
+        else:
+            text = label
+        row.append(InlineKeyboardButton(text=text, callback_data=f"prov:set:{name}"))
+    fallback_text = f"{'✅' if state['fallback'] else '⬜'} If proxy fails → use Scrape.do"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text=fallback_text, callback_data="prov:fb")],
+    ])
+
+
+@router.message(Command("provider"))
+async def cmd_provider(message: Message):
+    await message.answer(
+        _provider_status_text(), parse_mode="HTML", reply_markup=_provider_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("prov:"))
+async def callback_provider(call: CallbackQuery):
+    # The router filter does not apply to callbacks — check explicitly.
+    if call.from_user.id != ADMIN_USER_ID:
+        await call.answer("Admins only.", show_alert=True)
+        return
+
+    source = f"telegram:{call.from_user.id}"
+    parts = call.data.split(":")
+    if len(parts) == 3 and parts[1] == "set":
+        ok, msg = provider_control.set_active_provider(parts[2], source=source)
+    elif len(parts) == 2 and parts[1] == "fb":
+        ok, msg = provider_control.set_fallback_enabled(not provider_control.get_fallback_enabled(), source=source)
+    else:
+        await call.answer("Unknown action.", show_alert=True)
+        return
+
+    if call.message is not None:
+        try:
+            await call.message.edit_text(
+                _provider_status_text(), parse_mode="HTML", reply_markup=_provider_keyboard(),
+            )
+        except Exception as exc:
+            # "message is not modified" when nothing changed — harmless.
+            logger.info(f"[provider] status message not re-rendered: {exc}")
+    await call.answer(msg, show_alert=not ok)
+
+
+# ---------------------------------------------------------------------------
+# /debugprovider <url> — fetch ONE url through each configured provider and
+# report status, size, time and whether the page looks blocked, so a new
+# proxy can be judged before switching to it. Spends one request per
+# configured provider. Output is plain text and goes through
+# proxy_client.redact, so no proxy URL/credentials can appear in it.
+# ---------------------------------------------------------------------------
+
+@router.message(Command("debugprovider"))
+async def cmd_debugprovider(message: Message, command: CommandObject):
+    args = (command.args or "").split()
+    url = args[0] if args else ""
+    if not url.startswith(("http://", "https://")):
+        await message.answer(
+            "Usage: <code>/debugprovider &lt;amazon-or-flipkart-product-url&gt;</code>\n"
+            "Fetches the URL once through each configured provider "
+            "(Scrape.do, Zyte, Proxy) and reports status, size, time and "
+            "whether the page looks blocked. Spends one request per provider.",
+            parse_mode="HTML",
+        )
+        return
+
+    site = stock_checker.detect_site(url)
+    await _debug_send(
+        message,
+        f"🔍 Fetching {url}\nsite detected: {site or 'unknown'} "
+        f"(block check uses the {site if site in provider_control.SWITCHABLE_SITES else 'generic'} rules)",
+    )
+
+    state = provider_control.get_state()
+    lines = [f"active provider for Amazon/Flipkart: {provider_control.LABELS[state['active']]}", ""]
+    for name in provider_control.PROVIDERS:
+        label = provider_control.LABELS[name]
+        if not provider_control.is_configured(name):
+            lines.append(f"— {label}: not configured, skipped")
+            continue
+        started = time.monotonic()
+        try:
+            resp = await fetch_page(url, render_js=False, timeout=60.0, provider=name)
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            lines.append(
+                f"— {label}: FAILED after {elapsed:.1f}s — "
+                f"{type(exc).__name__}: {proxy_client.redact(exc)[:200]}"
+            )
+            continue
+        elapsed = time.monotonic() - started
+        body = resp.text
+        blocked, reason = fetch_guard.looks_blocked(site, body)
+        lines.append(
+            f"— {label}: HTTP {resp.status_code} | {len(resp.content)} bytes "
+            f"({len(body)} chars) | {elapsed:.1f}s\n"
+            f"    title: {fetch_guard.extract_title(body) or '(none)'}\n"
+            f"    blocked/unusable: {'YES — ' + reason if blocked else 'no (looks like a real page)'}"
+            + ("" if 200 <= resp.status_code < 300 else "\n    note: non-2xx status — would count as a failed fetch")
+        )
+    await _debug_send(message, proxy_client.redact("\n".join(lines)))

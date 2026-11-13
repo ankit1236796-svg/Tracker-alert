@@ -631,6 +631,19 @@ def init_db():
         """)
         conn.commit()
 
+        # Generic key/value runtime settings (admin-changeable without a
+        # redeploy). Currently holds the active fetch provider for Amazon/
+        # Flipkart and the proxy->Scrape.do fallback toggle — see
+        # provider_control.py. Absent key = "use the code/env default".
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
         # Migration: every pre-existing user (found via products/pin_codes) who
         # doesn't yet have a `users` row is switched into the access-control
         # system "as if their trial just ended" — access_until = now, giving
@@ -1749,6 +1762,41 @@ def set_apple_session_cookies(cookies: str, user_agent: str) -> None:
             (cookies, user_agent),
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Runtime settings (app_settings key/value table)
+# ---------------------------------------------------------------------------
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    """Stored value for `key`, or `default` if unset. NEVER raises: it is read
+    on the hot fetch path, and a settings hiccup must degrade to the default
+    rather than break stock checking."""
+    try:
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        finally:
+            conn.close()
+        return row["value"] if row else default
+    except Exception as exc:
+        logger.warning(f"get_setting({key!r}) failed, using default: {exc}")
+        return default
+
+
+def set_setting(key: str, value: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, str(value), now_ist_str()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

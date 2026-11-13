@@ -8,6 +8,8 @@ from urllib.parse import urlparse, urlencode
 
 import httpx
 
+import provider_control
+import proxy_client
 import zyte_client
 from config import SUPPORTED_SITES, SCRAPING_PROVIDER
 
@@ -106,6 +108,7 @@ async def fetch_page(
     play_with_browser: list[dict] | None = None,
     timeout: float = 60.0,
     site: str | None = None,
+    provider: str | None = None,
 ) -> httpx.Response:
     """
     THE central fetch function every checker and /debug* command routes
@@ -135,8 +138,37 @@ async def fetch_page(
     messages API call. Only recorded on the zyte path; Scrape.do usage has
     its own separate dashboard the admin already monitors directly, so
     there's no matching tracking on that path.
+
+    Provider selection (`provider` = "scrapedo" | "zyte" | "proxy"):
+      - explicit `provider` argument wins (used by the Scrape.do fallback in
+        stock_checker and by /debugprovider);
+      - Amazon and Flipkart (provider_control.SWITCHABLE_SITES) use the
+        provider stored in the database (admin-switchable via /provider or
+        the dashboard; SCRAPING_PROVIDER is only the default);
+      - EVERY OTHER site is unchanged: config.SCRAPING_PROVIDER, "zyte" or
+        else Scrape.do — it never uses the proxy.
     """
-    if SCRAPING_PROVIDER == "zyte":
+    if provider is None:
+        if site in provider_control.SWITCHABLE_SITES:
+            provider = provider_control.get_active_provider()
+        else:
+            provider = "zyte" if SCRAPING_PROVIDER == "zyte" else "scrapedo"
+
+    if provider == "proxy":
+        return await proxy_client.fetch_page(
+            url,
+            render_js=render_js,
+            set_cookies=set_cookies,
+            custom_headers=custom_headers,
+            wait_until=wait_until,
+            custom_wait_ms=custom_wait_ms,
+            super_proxy=super_proxy,
+            play_with_browser=play_with_browser,
+            timeout=timeout,
+            site=site,
+        )
+
+    if provider == "zyte":
         return await zyte_client.fetch_page(
             url,
             render_js=render_js,

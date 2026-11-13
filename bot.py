@@ -1092,6 +1092,8 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="forwardingtoggle", description="[admin] Turn channel forwarding on/off"),
         BotCommand(command="testforwarding",   description="[admin] Send a test message to the channel"),
         BotCommand(command="checkforwarding",  description="[admin] Check every forwarded item right now"),
+        BotCommand(command="provider",         description="[admin] Switch Amazon/Flipkart fetch provider"),
+        BotCommand(command="debugprovider",    description="[admin] Test a URL through every fetch provider"),
     ]
     # Scoped ONLY to the admin's own chat — regular users never see these in
     # their Telegram "/" menu, on top of being functionally unreachable to

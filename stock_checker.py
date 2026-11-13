@@ -19,6 +19,9 @@ from checkers import shopatsc as shopatsc_checker
 from checkers import croma as croma_checker
 from checkers import reliancedigital as reliancedigital_checker
 from database import get_reliance_article_id_for_url
+import fetch_guard
+import provider_control
+import proxy_client
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,30 @@ _FETCH_CACHE_TTL_SECONDS = 240  # 4 min — inside the 3-5 min window requested;
 _fetch_cache: dict[str, tuple[float, str]] = {}
 _fetch_locks: dict[str, asyncio.Lock] = {}
 _locks_guard = asyncio.Lock()
+
+# Cache clearing on a provider switch. The dashboard calls
+# clear_fetch_cache() from its own Flask thread while the event loop may be
+# iterating _fetch_cache, so the request is only recorded here (an atomic
+# integer bump) and the actual clear happens on the event-loop thread at the
+# start of the next _fetch_html call — i.e. before any further fetch can be
+# served a page fetched through the previous provider.
+_cache_clear_requests = 0
+_cache_clear_applied = 0
+
+
+def clear_fetch_cache() -> None:
+    """Thread-safe: ask for the 4-minute fetch cache to be emptied."""
+    global _cache_clear_requests
+    _cache_clear_requests += 1
+
+
+def _apply_pending_cache_clear() -> None:
+    global _cache_clear_applied
+    if _cache_clear_applied != _cache_clear_requests:
+        _cache_clear_applied = _cache_clear_requests
+        dropped = len(_fetch_cache)
+        _fetch_cache.clear()
+        logger.info(f"[fetch-cache] cleared {dropped} cached page(s) (provider changed)")
 
 
 def _cache_key(
@@ -103,6 +130,7 @@ async def _fetch_html(
     launch their own provider request before the first one has a chance to
     populate the cache.
     """
+    _apply_pending_cache_clear()
     key = _cache_key(url, render_js, set_cookies, wait_until, custom_wait_ms, super_proxy)
     now = time.monotonic()
     _prune_fetch_cache(now)
@@ -122,16 +150,86 @@ async def _fetch_html(
             logger.info(f"[{site}] fetch cache hit post-lock (age={now - cached[0]:.0f}s) — provider request skipped")
             return cached[1]
 
-        response = await fetch_page(
-            url, render_js=render_js, set_cookies=set_cookies,
-            wait_until=wait_until, custom_wait_ms=custom_wait_ms,
-            super_proxy=super_proxy, timeout=60.0, site=site,
-        )
-        response.raise_for_status()
+        clear_epoch = _cache_clear_requests
+        if site in provider_control.SWITCHABLE_SITES:
+            # Amazon/Flipkart: provider-switchable, with blocked-page
+            # detection and the optional Scrape.do retry. Raises on any
+            # failure, so a failed/blocked page is never cached.
+            html = await _fetch_validated(
+                url, site, render_js=render_js, set_cookies=set_cookies,
+                wait_until=wait_until, custom_wait_ms=custom_wait_ms,
+                super_proxy=super_proxy,
+            )
+        else:
+            response = await fetch_page(
+                url, render_js=render_js, set_cookies=set_cookies,
+                wait_until=wait_until, custom_wait_ms=custom_wait_ms,
+                super_proxy=super_proxy, timeout=60.0, site=site,
+            )
+            response.raise_for_status()
+            html = response.text
 
-        html = response.text
-        _fetch_cache[key] = (time.monotonic(), html)
+        # If the provider was switched while this fetch was in flight, the
+        # page came from the OLD provider — return it, but don't cache it.
+        if clear_epoch == _cache_clear_requests:
+            _fetch_cache[key] = (time.monotonic(), html)
         return html
+
+
+async def _fetch_validated(
+    url: str,
+    site: str,
+    render_js: bool = False,
+    set_cookies: str | None = None,
+    wait_until: str | None = None,
+    custom_wait_ms: int | None = None,
+    super_proxy: bool = False,
+) -> str:
+    """
+    Fetch for the provider-switchable stores (Amazon, Flipkart) and return
+    HTML that has been validated as a real page.
+
+    A fetch FAILS if it raises, returns a non-2xx status, or returns a 200
+    page that fetch_guard recognises as a Robot-Check/captcha/error page.
+    When the active provider is "proxy" and the fallback toggle is on, a
+    failed attempt is retried ONCE through Scrape.do; the fallback page is
+    validated the same way. If every attempt fails the last exception is
+    re-raised and check_stock() turns it into an INCONCLUSIVE (None)
+    result — never out-of-stock.
+    """
+    primary = provider_control.get_active_provider()
+    attempts = [primary]
+    if primary == "proxy" and provider_control.fallback_effective():
+        attempts.append("scrapedo")
+
+    last_exc: Exception | None = None
+    for index, provider in enumerate(attempts):
+        try:
+            response = await fetch_page(
+                url, render_js=render_js, set_cookies=set_cookies,
+                wait_until=wait_until, custom_wait_ms=custom_wait_ms,
+                super_proxy=super_proxy, timeout=60.0, site=site, provider=provider,
+            )
+            response.raise_for_status()
+            html = response.text
+            blocked, reason = fetch_guard.looks_blocked(site, html)
+            if blocked:
+                raise fetch_guard.BlockedPageError(reason)
+            if index > 0:
+                logger.info(f"[{site}] fallback fetch via {provider} succeeded after {attempts[0]} failed")
+            return html
+        except Exception as exc:  # noqa: BLE001 — any failure => try fallback / inconclusive
+            last_exc = exc
+            outcome = (
+                f"retrying once via {attempts[index + 1]}"
+                if index + 1 < len(attempts) else "result will be inconclusive"
+            )
+            logger.warning(
+                f"[{site}] fetch via {provider} failed "
+                f"({type(exc).__name__}: {proxy_client.redact(exc)[:300]}) — {outcome}"
+            )
+    assert last_exc is not None
+    raise last_exc
 
 
 async def _fetch_direct(
@@ -395,11 +493,15 @@ async def check_stock(
     current_price is only populated for sites in PRICE_EXTRACTOR_MAP (currently Amazon);
     it is None for all other sites and when extraction fails.
 
-    in_stock is normally a definite bool. It is None ONLY for sites in
+    in_stock is normally a definite bool. It is None for sites in
     _EXTRA_RETRY_ON_INCOMPLETE_SITES (currently just inventstore) when the
-    fetched page still looks blocked/incomplete after every retry tier —
-    an explicit "check was inconclusive" result, distinct from a
-    confirmed False (out of stock) verdict. Every caller of check_stock()
+    fetched page still looks blocked/incomplete after every retry tier,
+    and for Amazon/Flipkart (provider_control.SWITCHABLE_SITES) whenever the
+    fetch fails, is rejected by the provider, or returns a 200 page that
+    fetch_guard recognises as a Robot-Check/captcha/error page (after the
+    optional one-shot Scrape.do fallback) — an explicit "check was
+    inconclusive" result, distinct from a confirmed False (out of stock)
+    verdict. Every caller of check_stock()
     must treat in_stock is None as "skip this update" (no database write,
     no stock-transition alert), not as a falsy OOS result.
 
@@ -661,9 +763,15 @@ async def check_stock(
 
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error {e.response.status_code} for {url}")
+        if site in provider_control.SWITCHABLE_SITES:
+            # Amazon/Flipkart: a failed fetch is INCONCLUSIVE, never "out of
+            # stock" — callers skip the DB write and any alert on None.
+            return None, None
         return False, None
     except Exception as exc:
-        logger.error(f"Error checking {url}: {exc}")
+        logger.error(f"Error checking {url}: {proxy_client.redact(exc)}")
+        if site in provider_control.SWITCHABLE_SITES:
+            return None, None
         return False, None
 
 

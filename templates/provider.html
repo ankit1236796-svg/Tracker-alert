@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% set active = 'provider' %}
+{% block title %}Fetch provider{% endblock %}
+{% block body %}
+<h1>Fetch provider — Amazon &amp; Flipkart</h1>
+<p class="note" style="margin-top:0;">
+  Chooses how the stock checker downloads <b>{{ state.sites|map('capitalize')|join(' and ') }}</b> pages.
+  Every other store is unchanged and keeps using the server's
+  <code>SCRAPING_PROVIDER</code> setting. A failed or blocked fetch
+  (including 200 "Robot Check" pages) is saved as <b>inconclusive</b>,
+  never as out of stock. Switching clears the 4-minute page cache.
+</p>
+
+<div class="tablewrap">
+  <table>
+    <thead>
+      <tr><th>Provider</th><th>Status</th><th>Active</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for name in ['scrapedo', 'zyte', 'proxy'] %}
+      <tr>
+        <td>{{ state.labels[name] }}</td>
+        <td>
+          {% if state.configured[name] %}<span class="pill ok">Configured</span>
+          {% else %}<span class="pill warn">Not configured</span>{% endif %}
+        </td>
+        <td>{% if state.active == name %}<span class="pill ok">Active</span>{% else %}—{% endif %}</td>
+        <td>
+          <form class="inline" method="post" action="{{ url_for('provider_set') }}">
+            <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+            <input type="hidden" name="provider" value="{{ name }}">
+            {% if not state.configured[name] %}
+              <button class="btn" type="submit" disabled>not configured</button>
+            {% elif state.active == name %}
+              <button class="btn" type="submit" disabled>in use</button>
+            {% else %}
+              <button class="btn primary" type="submit">Use {{ state.labels[name] }}</button>
+            {% endif %}
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<p class="note">
+  {% if state.stored %}
+    Stored choice: <b>{{ state.labels[state.stored] }}</b>{% if state.stored != state.active %}
+    — not configured at the moment, so the default (<b>{{ state.labels[state.default] }}</b>) is running instead{% endif %}.
+  {% else %}
+    Nothing stored yet — running the default from <code>SCRAPING_PROVIDER</code>
+    (<b>{{ state.labels[state.default] }}</b>).
+  {% endif %}
+</p>
+
+<h1 style="margin-top:28px;">Fallback</h1>
+<div class="card" style="max-width:560px;">
+  <p style="margin-top:0;">
+    If the <b>Proxy</b> fetch fails or returns a blocked page, retry once
+    through <b>Scrape.do</b> before giving up.
+    Currently: {% if state.fallback %}<span class="pill ok">ON</span>{% else %}<span class="pill warn">OFF</span>{% endif %}
+    {% if not state.fallback_usable %}<span class="pill bad">SCRAPEDO_KEY not set — unusable</span>{% endif %}
+  </p>
+  <form method="post" action="{{ url_for('provider_fallback') }}">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    {% if state.fallback %}
+      <input type="hidden" name="enabled" value="0">
+      <button class="btn" type="submit">Turn fallback OFF</button>
+    {% else %}
+      <input type="hidden" name="enabled" value="1">
+      <button class="btn primary" type="submit">Turn fallback ON</button>
+    {% endif %}
+  </form>
+</div>
+<p class="note">
+  The same controls exist in Telegram: <code>/provider</code>. Test a URL
+  through every provider with <code>/debugprovider &lt;url&gt;</code>.
+</p>
+{% endblock %}
